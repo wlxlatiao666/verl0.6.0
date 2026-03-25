@@ -158,6 +158,12 @@ class RolloutConfig(BaseConfig):
 
     skip_rollout: bool = False
 
+    # Tree decoding config
+    tree_decoding: bool = False
+    tree_entropy_threshold: float = 1.0
+    tree_branching_factor: int = 3
+    tree_max_depth: int = 3
+
     skip_dump_dir: str = "/tmp/rollout_dump"
 
     profiler: Optional[ProfilerConfig] = None

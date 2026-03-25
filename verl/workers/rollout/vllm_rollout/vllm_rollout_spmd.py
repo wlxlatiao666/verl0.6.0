@@ -617,3 +617,135 @@ class vLLMAsyncRollout(BaseRollout):
 
     def get_zeromq_address(self):
         return self.address
+
+
+class vLLMTreeRollout(vLLMRollout):
+    """vLLM rollout using tree decoding. Each prompt generates a tree of sequences;
+    leaf nodes are collected and returned as a flat batch of size (B * n_leaves).
+    The ray_trainer should NOT repeat prompts before calling this rollout.
+    """
+
+    def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
+        from vllm.sampling_params import TreeSearchParams
+
+        idx = prompts.batch["input_ids"]  # (B, prompt_length)
+        attention_mask = prompts.batch["attention_mask"]
+        position_ids = prompts.batch["position_ids"]
+        eos_token_id = prompts.meta_info["eos_token_id"]
+        batch_size = idx.size(0)
+
+        non_tensor_batch = prompts.non_tensor_batch
+        if "raw_prompt_ids" not in non_tensor_batch:
+            non_tensor_batch["raw_prompt_ids"] = np.array(
+                [_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)], dtype=object
+            )
+
+        if "multi_modal_data" in non_tensor_batch:
+            vllm_inputs = [
+                {"prompt_token_ids": list(raw_ids), "multi_modal_data": mm}
+                for raw_ids, mm in zip(
+                    non_tensor_batch.pop("raw_prompt_ids"), non_tensor_batch.pop("multi_modal_data"), strict=True
+                )
+            ]
+        else:
+            vllm_inputs = [
+                {"prompt_token_ids": list(raw_ids)} for raw_ids in non_tensor_batch.pop("raw_prompt_ids")
+            ]
+
+        tree_config = TreeSearchParams(
+            enable_tree_search=True,
+            entropy_threshold=self.config.tree_entropy_threshold,
+            branching_factor=self.config.tree_branching_factor,
+            max_tree_depth=self.config.tree_max_depth,
+        )
+        tree_sampling_params = SamplingParams(
+            temperature=self.sampling_params.temperature,
+            top_p=self.sampling_params.top_p,
+            top_k=self.sampling_params.top_k,
+            max_tokens=self.config.response_length,
+            logprobs=self.sampling_params.logprobs,
+            detokenize=False,
+            tree_search_params=tree_config,
+        )
+
+        outputs = self.inference_engine.generate(
+            prompts=vllm_inputs,
+            sampling_params=tree_sampling_params,
+            use_tqdm=False,
+        )
+
+        # Collect leaf token_ids for each prompt by traversing root→leaf paths
+        all_responses = []  # flat list of token_id lists, length = B * n_leaves_per_prompt
+        leaves_per_prompt = []
+
+        for output in outputs:
+            seq_map = {o.seq_id: o for o in output.outputs}
+            leaves = [o for o in output.outputs if o.is_leaf]
+            leaves_per_prompt.append(len(leaves))
+
+            for leaf in leaves:
+                # Collect segments from leaf to root, then reverse
+                segments = []
+                cur = leaf
+                while cur is not None:
+                    segments.append(list(cur.tree_ids))
+                    parent_id = cur.parent_seq_id
+                    cur = seq_map.get(parent_id) if parent_id is not None else None
+                full_ids = []
+                for seg in reversed(segments):
+                    full_ids.extend(seg)
+                all_responses.append(full_ids)
+
+        total = sum(leaves_per_prompt)  # B * n_leaves (may vary per prompt)
+
+        response = pad_2d_list_to_length(all_responses, self.pad_token_id, max_length=self.config.response_length).to(
+            idx.device
+        )
+
+        # Expand prompt tensors to match flat leaf count (interleave style)
+        # e.g. prompt 0 repeated leaves_per_prompt[0] times, then prompt 1, etc.
+        repeat_counts = torch.tensor(leaves_per_prompt, dtype=torch.long)
+        expand_idx = torch.repeat_interleave(torch.arange(batch_size, device=idx.device), repeat_counts)
+
+        idx_expanded = idx[expand_idx]  # (total, prompt_length)
+        attention_mask_expanded = attention_mask[expand_idx]
+        position_ids_expanded = position_ids[expand_idx]
+
+        seq = torch.cat([idx_expanded, response], dim=-1)
+
+        response_length = response.size(1)
+        delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
+        delta_position_id = delta_position_id.unsqueeze(0).expand(total, -1)
+        if position_ids_expanded.dim() == 3:
+            delta_position_id = delta_position_id.view(total, 1, -1).expand(
+                total, position_ids_expanded.size(1), -1
+            )
+
+        response_position_ids = position_ids_expanded[..., -1:] + delta_position_id
+        position_ids_out = torch.cat([position_ids_expanded, response_position_ids], dim=-1)
+        response_attention_mask = get_response_mask(
+            response_id=response, eos_token=eos_token_id, dtype=attention_mask_expanded.dtype
+        )
+        attention_mask_out = torch.cat([attention_mask_expanded, response_attention_mask], dim=-1)
+
+        # Expand non_tensor_batch fields to match total leaves
+        expand_idx_np = expand_idx.cpu().numpy()
+        expanded_non_tensor = {}
+        for k, v in non_tensor_batch.items():
+            if isinstance(v, np.ndarray) and len(v) == batch_size:
+                expanded_non_tensor[k] = v[expand_idx_np]
+            else:
+                expanded_non_tensor[k] = v
+
+        batch = TensorDict(
+            {
+                "prompts": idx_expanded,
+                "responses": response,
+                "input_ids": seq,
+                "attention_mask": attention_mask_out,
+                "position_ids": position_ids_out,
+            },
+            batch_size=total,
+        )
+
+        return DataProto(batch=batch, non_tensor_batch=expanded_non_tensor)
