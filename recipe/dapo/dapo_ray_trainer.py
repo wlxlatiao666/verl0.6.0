@@ -43,6 +43,26 @@ from verl.trainer.ppo.ray_trainer import (
 )
 from verl.utils.profiler import marked_timer
 from verl.utils.rollout_skip import RolloutSkip
+from tensordict import TensorDict
+
+
+def _expand_by_leaves(data: DataProto, leaves_per_prompt: list[int]) -> DataProto:
+    """Expand each row i of data by leaves_per_prompt[i] times (variable-length interleave)."""
+    repeat_counts = torch.tensor(leaves_per_prompt, dtype=torch.long)
+    expand_idx = torch.repeat_interleave(torch.arange(len(leaves_per_prompt)), repeat_counts)
+    expand_idx_np = expand_idx.numpy()
+
+    new_tensors = {k: v[expand_idx] for k, v in data.batch.items()}
+    new_batch = TensorDict(source=new_tensors, batch_size=(int(expand_idx.shape[0]),))
+
+    new_non_tensor = {}
+    for k, v in data.non_tensor_batch.items():
+        if isinstance(v, np.ndarray) and len(v) == len(leaves_per_prompt):
+            new_non_tensor[k] = v[expand_idx_np]
+        else:
+            new_non_tensor[k] = v
+
+    return DataProto(batch=new_batch, non_tensor_batch=new_non_tensor, meta_info=data.meta_info)
 
 
 class RayDAPOTrainer(RayPPOTrainer):
@@ -163,7 +183,11 @@ class RayDAPOTrainer(RayPPOTrainer):
                         [str(uuid.uuid4()) for _ in range(len(new_batch.batch))], dtype=object
                     )
                     # repeat to align with repeated responses in rollout
-                    new_batch = new_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    if self.config.actor_rollout_ref.rollout.get("tree_decoding", False):
+                        leaves_per_prompt = gen_batch_output.meta_info.pop("leaves_per_prompt")
+                        new_batch = _expand_by_leaves(new_batch, leaves_per_prompt)
+                    else:
+                        new_batch = new_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     new_batch = new_batch.union(gen_batch_output)
 
                     with marked_timer("reward", timing_raw, "yellow"):

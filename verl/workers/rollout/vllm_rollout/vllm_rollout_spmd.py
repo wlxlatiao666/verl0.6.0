@@ -748,4 +748,4 @@ class vLLMTreeRollout(vLLMRollout):
             batch_size=total,
         )
 
-        return DataProto(batch=batch, non_tensor_batch=expanded_non_tensor)
+        return DataProto(batch=batch, non_tensor_batch=expanded_non_tensor, meta_info={"leaves_per_prompt": leaves_per_prompt})
