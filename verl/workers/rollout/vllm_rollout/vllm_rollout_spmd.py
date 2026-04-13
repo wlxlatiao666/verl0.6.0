@@ -373,14 +373,27 @@ class vLLMRollout(BaseRollout):
                 # For tree search: only collect leaf node responses
                 has_tree = any(getattr(s, 'is_leaf', None) is not None for s in output.outputs)
                 if has_tree:
-                    leaves = [s for s in output.outputs if getattr(s, 'is_leaf', True)]
+                    leaves = [s for s in output.outputs if getattr(s, 'is_leaf', False)]
                     if not leaves:
                         leaves = output.outputs  # fallback
+                        seq_map = {output.seq_id: output for output in leaves}
                     samples_to_collect = leaves
                 else:
                     samples_to_collect = output.outputs
                 for sample in samples_to_collect:
-                    response_ids = sample.token_ids
+                    if getattr(sample, 'is_leaf', False):
+                        response_ids = []
+                        current = sample
+                        while current is not None:
+                            response_ids.append(current.tree_ids)
+                            if current.parent_seq_id is not None and current.parent_seq_id in seq_map:
+                                current = seq_map[current.parent_seq_id]
+                            else:
+                                current = None
+                        response_ids.reverse()
+                        response_ids = sum(response_ids, [])
+                    else:
+                        response_ids = sample.token_ids
                     response.append(response_ids)
                     prompt_indices.append(out_idx)
                     if self.config.calculate_log_probs:
