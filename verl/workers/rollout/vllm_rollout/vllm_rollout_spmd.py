@@ -371,12 +371,12 @@ class vLLMRollout(BaseRollout):
             prompt_indices = []  # Track which prompt each response belongs to
             for out_idx, output in enumerate(outputs):
                 # For tree search: only collect leaf node responses
+                seq_map = {out.seq_id: out for out in output.outputs}
                 has_tree = any(getattr(s, 'is_leaf', None) is not None for s in output.outputs)
                 if has_tree:
                     leaves = [s for s in output.outputs if getattr(s, 'is_leaf', False)]
                     if not leaves:
                         leaves = output.outputs  # fallback
-                        seq_map = {output.seq_id: output for output in leaves}
                     samples_to_collect = leaves
                 else:
                     samples_to_collect = output.outputs
