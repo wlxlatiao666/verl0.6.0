@@ -5,10 +5,10 @@ _ORIG_HOME="${HOME}"
 export PYTHONUNBUFFERED=1
 export VLLM_USE_V1=0
 export VERL_LOGGING_LEVEL="${VERL_LOGGING_LEVEL:-INFO}"
-export VERL_DEBUG_LOG_PATH=/inspire/hdd/project/project-public/zhangshenao-CZXS25250096
+export VERL_DEBUG_LOG_PATH=/inspire/hdd/global_user/weilongxuan-253108120168
 export NCCL_SHM_DISABLE=1
 export NCCL_DEBUG=INFO
-HOME=/inspire/hdd/project/project-public/zhangshenao-CZXS25250096
+HOME=/inspire/hdd/global_user/weilongxuan-253108120168
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl0.6.0"}
 
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
@@ -36,7 +36,7 @@ fi
 # Local testing only: put your key here if you do not use env / ~/.wandb_api_key.
 # Priority: shell export > key files above > this line (empty = skip).
 # Do not commit real keys to shared repos.
-_WANDB_API_KEY_INLINE="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"
+_WANDB_API_KEY_INLINE="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"
 if [[ -z "${WANDB_API_KEY:-}" ]] && [[ -n "${_WANDB_API_KEY_INLINE}" ]]; then
   export WANDB_API_KEY="${_WANDB_API_KEY_INLINE}"
 fi
