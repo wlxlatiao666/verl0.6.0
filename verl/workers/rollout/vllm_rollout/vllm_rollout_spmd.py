@@ -238,12 +238,22 @@ class vLLMRollout(BaseRollout):
             self.sampling_params.tree_search_params = TreeSearchParams(
                 enable_tree_search=True,
                 entropy_threshold=float(_tree_cfg.get("entropy_threshold", 1.0)),
-                branching_factor=int(_tree_cfg.get("branching_factor", 3)),
+                branching_factor=int(_tree_cfg.get("branching_factor", 2)),
                 max_tree_depth=int(_tree_cfg.get("max_tree_depth", 3)),
             )
             logger.info(f"[TreeRollout] TreeSearchParams enabled: {self.sampling_params.tree_search_params}")
 
         self.pad_token_id = tokenizer.pad_token_id
+
+    def update_entropy_threshold(self, threshold: float):
+        """Dynamically update the entropy_threshold for tree search.
+
+        Called by the trainer at the start of each rollout step with the
+        p80 entropy computed from the previous step.
+        """
+        if self.sampling_params.tree_search_params is not None:
+            self.sampling_params.tree_search_params.entropy_threshold = threshold
+            logger.info(f"[TreeRollout] entropy_threshold updated to {threshold:.4f}")
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
