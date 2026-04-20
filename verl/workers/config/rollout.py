@@ -100,6 +100,10 @@ class TreeSearchConfig(BaseConfig):
     entropy_threshold: float = 1.0
     branching_factor: int = 3
     max_tree_depth: int = 3
+    # When True, collect all tree nodes (not just leaves) and compute
+    # process reward: non-leaf reward = mean(children rewards),
+    # advantage = node_reward - parent_reward (root advantage = 0).
+    tree_process_reward: bool = False
 
 
 @dataclass

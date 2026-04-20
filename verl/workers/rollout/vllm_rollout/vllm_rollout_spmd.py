@@ -335,6 +335,13 @@ class vLLMRollout(BaseRollout):
 
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
+        _tree_cfg = self.config.get("tree_search", None)
+        _tree_process_reward = (
+            _tree_cfg is not None
+            and _tree_cfg.get("enable", False)
+            and _tree_cfg.get("tree_process_reward", False)
+            and not is_validate
+        )
         if not do_sample:
             kwargs = {
                 "best_of": 1,
@@ -379,38 +386,69 @@ class vLLMRollout(BaseRollout):
             response = []
             rollout_log_probs = []
             prompt_indices = []  # Track which prompt each response belongs to
+            # Extra fields for tree process reward mode
+            tree_node_is_leaf: list[bool] = []
+            tree_node_depth: list[int] = []
+            # global index into the response list for each node's parent (-1 = root)
+            tree_node_parent_offset: list[int] = []
+
             for out_idx, output in enumerate(outputs):
-                # For tree search: only collect leaf node responses
                 seq_map = {out.seq_id: out for out in output.outputs}
                 has_tree = any(getattr(s, 'is_leaf', None) is not None for s in output.outputs)
-                if has_tree:
-                    leaves = [s for s in output.outputs if getattr(s, 'is_leaf', False)]
-                    if not leaves:
-                        leaves = output.outputs  # fallback
-                    samples_to_collect = leaves
+
+                if _tree_process_reward and has_tree:
+                    # Collect ALL nodes; each node's response = its own segment (tree_ids only)
+                    # Build seq_id -> future global index mapping first
+                    seq_id_to_global: dict = {}
+                    for sample in output.outputs:
+                        seq_id_to_global[sample.seq_id] = len(response) + len(seq_id_to_global)
+
+                    for sample in output.outputs:
+                        response_ids = sample.tree_ids
+                        response.append(response_ids)
+                        prompt_indices.append(out_idx)
+                        tree_node_is_leaf.append(bool(getattr(sample, 'is_leaf', True)))
+                        tree_node_depth.append(int(getattr(sample, 'tree_depth', 0)))
+                        parent_sid = getattr(sample, 'parent_seq_id', None)
+                        if parent_sid is not None and parent_sid in seq_id_to_global:
+                            tree_node_parent_offset.append(seq_id_to_global[parent_sid])
+                        else:
+                            tree_node_parent_offset.append(-1)
+                        if self.config.calculate_log_probs:
+                            curr_log_prob = []
+                            for i, logprob in enumerate(sample.logprobs):
+                                curr_log_prob.append(logprob[response_ids[i]].logprob)
+                            rollout_log_probs.append(curr_log_prob)
                 else:
-                    samples_to_collect = output.outputs
-                for sample in samples_to_collect:
-                    if getattr(sample, 'is_leaf', False):
-                        response_ids = []
-                        current = sample
-                        while current is not None:
-                            response_ids.append(current.tree_ids)
-                            if current.parent_seq_id is not None and current.parent_seq_id in seq_map:
-                                current = seq_map[current.parent_seq_id]
-                            else:
-                                current = None
-                        response_ids.reverse()
-                        response_ids = sum(response_ids, [])
+                    # Original behaviour: collect leaf responses (full path concatenated)
+                    if has_tree:
+                        leaves = [s for s in output.outputs if getattr(s, 'is_leaf', False)]
+                        if not leaves:
+                            leaves = output.outputs  # fallback
+                        samples_to_collect = leaves
                     else:
-                        response_ids = sample.token_ids
-                    response.append(response_ids)
-                    prompt_indices.append(out_idx)
-                    if self.config.calculate_log_probs:
-                        curr_log_prob = []
-                        for i, logprob in enumerate(sample.logprobs):
-                            curr_log_prob.append(logprob[response_ids[i]].logprob)
-                        rollout_log_probs.append(curr_log_prob)
+                        samples_to_collect = output.outputs
+                    for sample in samples_to_collect:
+                        if getattr(sample, 'is_leaf', False):
+                            response_ids = []
+                            current = sample
+                            while current is not None:
+                                response_ids.append(current.tree_ids)
+                                if current.parent_seq_id is not None and current.parent_seq_id in seq_map:
+                                    current = seq_map[current.parent_seq_id]
+                                else:
+                                    current = None
+                            response_ids.reverse()
+                            response_ids = sum(response_ids, [])
+                        else:
+                            response_ids = sample.token_ids
+                        response.append(response_ids)
+                        prompt_indices.append(out_idx)
+                        if self.config.calculate_log_probs:
+                            curr_log_prob = []
+                            for i, logprob in enumerate(sample.logprobs):
+                                curr_log_prob.append(logprob[response_ids[i]].logprob)
+                            rollout_log_probs.append(curr_log_prob)
 
             # When tree search produces more responses than prompts,
             # expand prompt tensors and non_tensor_batch to match
@@ -431,6 +469,12 @@ class vLLMRollout(BaseRollout):
                 non_tensor_batch["tree_num_prompts"] = np.array([len(outputs)] * len(response))
                 batch_size = len(response)
                 logger.info(f"[TreeRollout] Expanded batch: {len(outputs)} prompts -> {batch_size} leaf responses")
+
+            # Store tree process reward node metadata when enabled
+            if _tree_process_reward and tree_node_is_leaf:
+                non_tensor_batch["tree_node_is_leaf"] = np.array(tree_node_is_leaf, dtype=bool)
+                non_tensor_batch["tree_node_depth"] = np.array(tree_node_depth, dtype=np.int32)
+                non_tensor_batch["tree_node_parent_offset"] = np.array(tree_node_parent_offset, dtype=np.int64)
 
             # ── Compute tree search metrics ──
             _tree_total, _tree_leaves = 0, 0

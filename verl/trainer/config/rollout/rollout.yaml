@@ -289,6 +289,10 @@ tree_search:
   # Maximum depth of the tree
   max_tree_depth: 3
 
+  # When True, collect all tree nodes (not just leaves) and compute process reward.
+  # Non-leaf reward = mean(children rewards); advantage = node_reward - parent_reward.
+  tree_process_reward: False
+
 # profile the rollout model in `generate_sequence` 
 profiler:
 

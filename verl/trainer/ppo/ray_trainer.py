@@ -260,6 +260,60 @@ def compute_advantage(
     return data
 
 
+def compute_tree_process_advantage(data: DataProto) -> DataProto:
+    """Compute per-node advantages for tree process reward.
+
+    Reward propagation (bottom-up, by depth descending):
+        non-leaf reward = mean(children rewards)
+
+    Advantage:
+        root node  -> 0
+        other node -> node_reward - parent_reward
+
+    The scalar advantage is broadcast across the node's response tokens
+    (multiplied by response_mask).
+    """
+    if "response_mask" not in data.batch.keys():
+        data.batch["response_mask"] = compute_response_mask(data)
+
+    is_leaf = data.non_tensor_batch["tree_node_is_leaf"]          # (N,) bool
+    depth = data.non_tensor_batch["tree_node_depth"]              # (N,) int
+    parent_offset = data.non_tensor_batch["tree_node_parent_offset"]  # (N,) int64
+
+    # Outcome reward: sum token-level rewards -> scalar per node
+    scores = data.batch["token_level_rewards"].sum(dim=-1).float()  # (N,)
+    node_scores = scores.clone()
+
+    # Bottom-up propagation: process nodes from deepest to shallowest
+    N = len(node_scores)
+    order = np.argsort(-depth)  # descending depth
+    children_sum = torch.zeros(N, dtype=torch.float32, device=node_scores.device)
+    children_count = torch.zeros(N, dtype=torch.float32, device=node_scores.device)
+
+    for i in order:
+        p = int(parent_offset[i])
+        if p >= 0:
+            children_sum[p] += node_scores[i]
+            children_count[p] += 1
+
+    # Overwrite non-leaf scores with mean of children
+    has_children = children_count > 0
+    node_scores[has_children] = children_sum[has_children] / children_count[has_children]
+
+    # Advantage = node_score - parent_score (root -> 0)
+    advantages_scalar = torch.zeros(N, dtype=torch.float32, device=node_scores.device)
+    for i in range(N):
+        p = int(parent_offset[i])
+        if p >= 0:
+            advantages_scalar[i] = node_scores[i] - node_scores[p]
+
+    response_mask = data.batch["response_mask"]
+    advantages = advantages_scalar.unsqueeze(-1) * response_mask
+    data.batch["advantages"] = advantages
+    data.batch["returns"] = advantages  # returns not used downstream in GRPO path
+    return data
+
+
 class RayPPOTrainer:
     """Distributed PPO trainer using Ray for scalable reinforcement learning.
 
@@ -1212,20 +1266,26 @@ class RayPPOTrainer:
                         # IS and mismatch metrics already have mismatch/ prefix
                         metrics.update(is_metrics)
 
-                        # compute advantages, executed on the driver process
-                        norm_adv_by_std_in_grpo = self.config.algorithm.get(
-                            "norm_adv_by_std_in_grpo", True
-                        )  # GRPO adv normalization factor
+                        # Tree process reward: propagate rewards bottom-up and compute
+                        # per-node advantage = node_reward - parent_reward.
+                        # This bypasses the normal advantage estimator for tree nodes.
+                        if "tree_node_is_leaf" in batch.non_tensor_batch:
+                            batch = compute_tree_process_advantage(batch)
+                        else:
+                            # compute advantages, executed on the driver process
+                            norm_adv_by_std_in_grpo = self.config.algorithm.get(
+                                "norm_adv_by_std_in_grpo", True
+                            )  # GRPO adv normalization factor
 
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config.algorithm,
-                        )
+                            batch = compute_advantage(
+                                batch,
+                                adv_estimator=self.config.algorithm.adv_estimator,
+                                gamma=self.config.algorithm.gamma,
+                                lam=self.config.algorithm.lam,
+                                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                config=self.config.algorithm,
+                            )
 
                     # update critic
                     if self.use_critic:
