@@ -82,9 +82,10 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.n=1 \
     actor_rollout_ref.rollout.tree_search.enable=True \
-    actor_rollout_ref.rollout.tree_search.entropy_threshold=0 \
-    actor_rollout_ref.rollout.tree_search.branching_factor=3 \
+    actor_rollout_ref.rollout.tree_search.entropy_threshold=0.8 \
+    actor_rollout_ref.rollout.tree_search.branching_factor=2 \
     actor_rollout_ref.rollout.tree_search.max_tree_depth=3 \
+    actor_rollout_ref.rollout.tree_search.tree_process_reward=True \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     reward_model.reward_manager=dapo \
@@ -97,7 +98,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb","tensorboard"]' \
     trainer.project_name='verl_grpo_treerollout' \
-    trainer.experiment_name='qwen3_8b_tree_v0' \
+    trainer.experiment_name='qwen2.5_math7b_tree_pr' \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
