@@ -1299,7 +1299,7 @@ class RayPPOTrainer:
                         # Tree process reward: propagate rewards bottom-up and compute
                         # per-node advantage = node_reward - parent_reward.
                         # This bypasses the normal advantage estimator for tree nodes.
-                        if "tree_node_is_leaf" in batch.non_tensor_batch:
+                        if "unique_segments" in batch.non_tensor_batch:
                             batch = compute_tree_process_advantage(batch)
                         else:
                             # compute advantages, executed on the driver process

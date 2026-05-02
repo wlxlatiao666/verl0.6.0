@@ -394,11 +394,6 @@ class vLLMRollout(BaseRollout):
             leaf_segment_indices: list[list[int]] = []
             rollout_log_probs = []
             prompt_indices = []  # Track which prompt each response belongs to
-            # Extra fields for tree process reward mode
-            tree_node_is_leaf: list[bool] = []
-            tree_node_depth: list[int] = []
-            # global index into the response list for each node's parent (-1 = root)
-            tree_node_parent_offset: list[int] = []
 
             for out_idx, output in enumerate(outputs):
                 seq_map = {out.seq_id: out for out in output.outputs}
@@ -448,14 +443,15 @@ class vLLMRollout(BaseRollout):
                             response_ids = sum([seg for _, seg in path_nodes], [])
 
                             # Register each node in unique_segments (dedup by seq_id)
-                            path_indices: list[int] = []
-                            for seq_id, seg in path_nodes:
-                                if seq_id not in seq_id_to_segment_idx:
-                                    seq_id_to_segment_idx[seq_id] = len(unique_segments)
-                                    unique_segments.append(seg)
-                                    unique_segment_seq_ids.append(seq_id)
-                                path_indices.append(seq_id_to_segment_idx[seq_id])
-                            leaf_segment_indices.append(path_indices)
+                            if _tree_process_reward:
+                                path_indices: list[int] = []
+                                for seq_id, seg in path_nodes:
+                                    if seq_id not in seq_id_to_segment_idx:
+                                        seq_id_to_segment_idx[seq_id] = len(unique_segments)
+                                        unique_segments.append(seg)
+                                        unique_segment_seq_ids.append(seq_id)
+                                    path_indices.append(seq_id_to_segment_idx[seq_id])
+                                leaf_segment_indices.append(path_indices)
                     elif not has_tree:
                         response_ids = sample.token_ids
                     if response_ids:
@@ -489,18 +485,12 @@ class vLLMRollout(BaseRollout):
                 non_tensor_batch["tree_num_leaves"] = np.array([len(response)] * len(response))
                 non_tensor_batch["tree_num_prompts"] = np.array([len(outputs)] * len(response))
 
-            # Store tree process reward node metadata when enabled
-            if _tree_process_reward and tree_node_is_leaf:
-                non_tensor_batch["tree_node_is_leaf"] = np.array(tree_node_is_leaf, dtype=bool)
-                non_tensor_batch["tree_node_depth"] = np.array(tree_node_depth, dtype=np.int32)
-                non_tensor_batch["tree_node_parent_offset"] = np.array(tree_node_parent_offset, dtype=np.int64)
-
             # Store segment-level data for tree responses.
             # unique_segments: token list per unique tree node (deduped by seq_id), shape (n_unique_nodes,)
             # unique_segment_seq_ids: seq_id for each entry in unique_segments, shape (n_unique_nodes,)
             # leaf_segment_indices: for each leaf, ordered indices into unique_segments for its root→leaf path
             #                       shape (n_leaves,) of variable-len index arrays
-            if unique_segments:
+            if _tree_process_reward and unique_segments:
                 non_tensor_batch["unique_segments"] = np.array(unique_segments, dtype=object)
                 non_tensor_batch["unique_segment_seq_ids"] = np.array(unique_segment_seq_ids, dtype=np.int64)
                 # leaf_segment_indices aligns with batch dimension (one entry per leaf response)
