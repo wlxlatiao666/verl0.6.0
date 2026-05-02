@@ -491,8 +491,11 @@ class vLLMRollout(BaseRollout):
             # leaf_segment_indices: for each leaf, ordered indices into unique_segments for its root→leaf path
             #                       shape (n_leaves,) of variable-len index arrays
             if _tree_process_reward and unique_segments:
-                non_tensor_batch["unique_segments"] = np.array(unique_segments, dtype=object)
-                non_tensor_batch["unique_segment_seq_ids"] = np.array(unique_segment_seq_ids, dtype=np.int64)
+                # unique_segments / unique_segment_seq_ids are node-level (not leaf-level) so they
+                # cannot live in non_tensor_batch (which must match batch_size).  Store them in
+                # meta_info instead; leaf_segment_indices is leaf-aligned and stays in non_tensor_batch.
+                _tree_metrics["unique_segments"] = np.array(unique_segments, dtype=object)
+                _tree_metrics["unique_segment_seq_ids"] = np.array(unique_segment_seq_ids, dtype=np.int64)
                 # leaf_segment_indices aligns with batch dimension (one entry per leaf response)
                 non_tensor_batch["leaf_segment_indices"] = np.array(leaf_segment_indices, dtype=object)
 
