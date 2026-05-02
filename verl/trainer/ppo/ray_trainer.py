@@ -261,56 +261,86 @@ def compute_advantage(
 
 
 def compute_tree_process_advantage(data: DataProto) -> DataProto:
-    """Compute per-node advantages for tree process reward.
+    """Compute per-segment advantages for tree process reward.
 
-    Reward propagation (bottom-up, by depth descending):
-        non-leaf reward = mean(children rewards)
+    Step 1 — Back-propagate leaf scores to all nodes (bottom-up):
+        non-leaf score = mean(children scores)
+        leaf score = sum of token_level_rewards for that leaf
 
-    Advantage:
-        root node  -> 0
-        other node -> node_reward - parent_reward
+    Step 2 — GRPO-style normalisation across all unique segments (equal weight per segment):
+        adv(s) = (score(s) - mean_s(score)) / (std_s(score) + eps)
 
-    The scalar advantage is broadcast across the node's response tokens
-    (multiplied by response_mask).
+    Step 3 — Assemble token-level advantages per leaf sequence:
+        Each leaf's response tokens are filled with the advantage of the segment
+        they belong to, then multiplied by response_mask to zero out padding.
+        Segments shared across multiple leaves use the same pre-computed advantage.
     """
     if "response_mask" not in data.batch.keys():
         data.batch["response_mask"] = compute_response_mask(data)
 
-    is_leaf = data.non_tensor_batch["tree_node_is_leaf"]          # (N,) bool
-    depth = data.non_tensor_batch["tree_node_depth"]              # (N,) int
-    parent_offset = data.non_tensor_batch["tree_node_parent_offset"]  # (N,) int64
+    response_mask = data.batch["response_mask"]          # (n_leaves, resp_len)
+    n_leaves, resp_len = response_mask.shape
+    device = response_mask.device
 
-    # Outcome reward: sum token-level rewards -> scalar per node
-    scores = data.batch["token_level_rewards"].sum(dim=-1).float()  # (N,)
-    node_scores = scores.clone()
+    # ── Step 1: back-propagate leaf scores to all nodes ──────────────────────
+    leaf_scores = data.batch["token_level_rewards"].sum(dim=-1).float()  # (n_leaves,)
 
-    # Bottom-up propagation: process nodes from deepest to shallowest
-    N = len(node_scores)
-    order = np.argsort(-depth)  # descending depth
-    children_sum = torch.zeros(N, dtype=torch.float32, device=node_scores.device)
-    children_count = torch.zeros(N, dtype=torch.float32, device=node_scores.device)
+    unique_segments = data.non_tensor_batch["unique_segments"]       # (n_unique,) of lists
+    leaf_segment_indices = data.non_tensor_batch["leaf_segment_indices"]  # (n_leaves,) of lists
 
-    for i in order:
-        p = int(parent_offset[i])
+    n_unique = len(unique_segments)
+
+    # Map leaf segment -> leaf row index; build parent map in one pass
+    leaf_seg_to_leaf_idx: dict[int, int] = {}
+    parent_of = np.full(n_unique, -1, dtype=np.int64)
+    seg_depth = np.zeros(n_unique, dtype=np.int64)
+    for j, path in enumerate(leaf_segment_indices):
+        if len(path) > 0:
+            leaf_seg_to_leaf_idx[path[-1]] = j
+        for depth, seg_idx in enumerate(path):
+            seg_depth[seg_idx] = depth
+            if depth > 0:
+                parent_of[seg_idx] = path[depth - 1]
+
+    # Assign leaf scores; propagate bottom-up by depth
+    node_scores = torch.zeros(n_unique, dtype=torch.float32, device=device)
+    for seg_idx, leaf_j in leaf_seg_to_leaf_idx.items():
+        node_scores[seg_idx] = leaf_scores[leaf_j]
+
+    children_sum = torch.zeros(n_unique, dtype=torch.float32, device=device)
+    children_count = torch.zeros(n_unique, dtype=torch.float32, device=device)
+    for i in np.argsort(-seg_depth):  # deepest first
+        p = int(parent_of[i])
         if p >= 0:
             children_sum[p] += node_scores[i]
             children_count[p] += 1
 
-    # Overwrite non-leaf scores with mean of children
     has_children = children_count > 0
     node_scores[has_children] = children_sum[has_children] / children_count[has_children]
 
-    # Advantage = node_score - parent_score (root -> 0)
-    advantages_scalar = torch.zeros(N, dtype=torch.float32, device=node_scores.device)
-    for i in range(N):
-        p = int(parent_offset[i])
-        if p >= 0:
-            advantages_scalar[i] = node_scores[i] - node_scores[p]
+    # ── Step 2: GRPO-style normalisation (equal weight per unique segment) ──────
+    seg_mean = node_scores.mean()
+    seg_std = node_scores.std()
+    seg_advantages = (node_scores - seg_mean) / (seg_std + 1e-6)  # (n_unique,)
 
-    response_mask = data.batch["response_mask"]
-    advantages = advantages_scalar.unsqueeze(-1) * response_mask
-    data.batch["advantages"] = advantages
-    data.batch["returns"] = advantages  # returns not used downstream in GRPO path
+    # ── Step 3: assemble token-level advantages per leaf ─────────────────────
+    # Each leaf's response is the concatenation of its path segments in order.
+    # We fill token positions with the advantage of the segment they belong to.
+    # Segments shared across leaves use the same pre-computed advantage (no duplication).
+    token_advantages = torch.zeros(n_leaves, resp_len, dtype=torch.float32, device=device)
+    for j, path in enumerate(leaf_segment_indices):
+        pos = 0
+        for seg_idx in path:
+            seg_len = len(unique_segments[seg_idx])
+            end = min(pos + seg_len, resp_len)
+            token_advantages[j, pos:end] = seg_advantages[seg_idx]
+            pos += seg_len
+            if pos >= resp_len:
+                break
+
+    token_advantages = token_advantages * response_mask
+    data.batch["advantages"] = token_advantages
+    data.batch["returns"] = token_advantages  # returns not used downstream in this path
     return data
 
 
