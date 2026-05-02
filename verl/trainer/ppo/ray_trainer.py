@@ -285,7 +285,7 @@ def compute_tree_process_advantage(data: DataProto) -> DataProto:
     # ── Step 1: back-propagate leaf scores to all nodes ──────────────────────
     leaf_scores = data.batch["token_level_rewards"].sum(dim=-1).float()  # (n_leaves,)
 
-    unique_segments = data.non_tensor_batch["unique_segments"]       # (n_unique,) of lists
+    unique_segments = data.meta_info["metrics"]["unique_segments"]       # (n_unique,) of lists
     leaf_segment_indices = data.non_tensor_batch["leaf_segment_indices"]  # (n_leaves,) of lists
 
     n_unique = len(unique_segments)
@@ -1299,7 +1299,7 @@ class RayPPOTrainer:
                         # Tree process reward: propagate rewards bottom-up and compute
                         # per-node advantage = node_reward - parent_reward.
                         # This bypasses the normal advantage estimator for tree nodes.
-                        if "unique_segments" in batch.non_tensor_batch:
+                        if "unique_segments" in batch.meta_info.get("metrics", {}):
                             batch = compute_tree_process_advantage(batch)
                         else:
                             # compute advantages, executed on the driver process
