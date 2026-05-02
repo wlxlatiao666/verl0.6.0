@@ -456,7 +456,8 @@ class vLLMRollout(BaseRollout):
                         response_ids = sample.token_ids
                     if response_ids:
                         response.append(response_ids)
-                        prompt_indices.append(out_idx)
+                        if has_tree:
+                            prompt_indices.append(out_idx)
                         if self.config.calculate_log_probs:
                             curr_log_prob = []
                             for i, logprob in enumerate(sample.logprobs):
