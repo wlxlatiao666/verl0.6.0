@@ -481,7 +481,9 @@ class vLLMRollout(BaseRollout):
 
             # Always write tree routing metadata when tree search is active so that
             # DataProto.concat across workers sees consistent keys and lengths.
+            print("prompt_indices:", prompt_indices)
             if prompt_indices:
+                print("prompt_indices True")
                 non_tensor_batch["tree_prompt_indices"] = np.array(prompt_indices)
                 non_tensor_batch["tree_num_leaves"] = np.array([len(response)] * len(response))
                 non_tensor_batch["tree_num_prompts"] = np.array([len(outputs)] * len(response))

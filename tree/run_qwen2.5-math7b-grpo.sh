@@ -83,7 +83,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.tree_search.enable=False \
     actor_rollout_ref.rollout.tree_search.entropy_threshold=0 \
-    actor_rollout_ref.rollout.tree_search.branching_factor=3 \
+    actor_rollout_ref.rollout.tree_search.branching_factor=2 \
     actor_rollout_ref.rollout.tree_search.max_tree_depth=3 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
@@ -96,13 +96,14 @@ python3 -m verl.trainer.main_ppo \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb","tensorboard"]' \
-    trainer.project_name='verl_grpo_treerollout' \
-    trainer.experiment_name='qwen2.5_math7b_grpo_v1' \
+    trainer.project_name='verl_grpo_tree_latest' \
+    trainer.experiment_name='qwen2.5_math7b_grpo' \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
     trainer.test_freq=2 \
     trainer.total_epochs=1 \
+    trainer.rollout_data_dir=/inspire/hdd/global_user/weilongxuan-253108120168/verl0.6.0/logs/rollout_grpo \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=False\
     $@ 2>&1 | tee -a "${LOG_FILE}"
