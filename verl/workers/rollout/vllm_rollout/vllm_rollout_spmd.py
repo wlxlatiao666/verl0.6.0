@@ -397,7 +397,7 @@ class vLLMRollout(BaseRollout):
 
             for out_idx, output in enumerate(outputs):
                 seq_map = {out.seq_id: out for out in output.outputs}
-                has_tree = any(getattr(s, 'is_leaf', None) is not None for s in output.outputs)
+                has_tree = any(getattr(s, 'is_leaf', False) for s in output.outputs)
 
                 # if _tree_process_reward and has_tree:
                 #     # Collect ALL nodes; each node's response = its own segment (tree_ids only)
