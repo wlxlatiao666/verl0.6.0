@@ -397,7 +397,8 @@ class vLLMRollout(BaseRollout):
 
             for out_idx, output in enumerate(outputs):
                 seq_map = {out.seq_id: out for out in output.outputs}
-                has_tree = any(getattr(s, 'is_leaf', None) is not None for s in output.outputs)
+                has_tree = any(getattr(s, 'is_leaf', False) for s in output.outputs)
+                print("has_tree:", has_tree)
 
                 # if _tree_process_reward and has_tree:
                 #     # Collect ALL nodes; each node's response = its own segment (tree_ids only)
@@ -481,7 +482,9 @@ class vLLMRollout(BaseRollout):
 
             # Always write tree routing metadata when tree search is active so that
             # DataProto.concat across workers sees consistent keys and lengths.
+            print("prompt_indices:", prompt_indices)
             if prompt_indices:
+                print("prompt_indices True")
                 non_tensor_batch["tree_prompt_indices"] = np.array(prompt_indices)
                 non_tensor_batch["tree_num_leaves"] = np.array([len(response)] * len(response))
                 non_tensor_batch["tree_num_prompts"] = np.array([len(outputs)] * len(response))

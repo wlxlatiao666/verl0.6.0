@@ -103,7 +103,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.save_freq=20 \
     trainer.test_freq=2 \
     trainer.total_epochs=1 \
-    trainer.rollout_data_dir=/inspire/hdd/global_user/weilongxuan-253108120168/verl0.6.0/logs/rollout_logs \
+    trainer.rollout_data_dir=/inspire/hdd/global_user/weilongxuan-253108120168/verl0.6.0/logs/rollout_grpo \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=False\
     $@ 2>&1 | tee -a "${LOG_FILE}"

@@ -11,7 +11,7 @@ export NCCL_DEBUG=INFO
 HOME=/inspire/hdd/global_user/weilongxuan-253108120168
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl0.6.0"}
 
-TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k-processed.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
 TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
 
 # Real-time log file: each line is written immediately; data is not lost if the job is killed
@@ -104,7 +104,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.save_freq=20 \
     trainer.test_freq=2 \
     trainer.total_epochs=1 \
-    trainer.rollout_data_dir=/inspire/hdd/global_user/weilongxuan-253108120168/verl0.6.0/logs/rollout_logs \
+    trainer.rollout_data_dir=/inspire/hdd/global_user/weilongxuan-253108120168/verl0.6.0/logs/pr_logs \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=False\
     $@ 2>&1 | tee -a "${LOG_FILE}"
