@@ -15,9 +15,11 @@
     "answer": "2",
     "dataset": "olympiad_bench",
     "index": 0,
+    "level": null,
     "question": "Xenia and Sergey play the following game. Xenia thinks of a positive integer $N$ not exceeding 5000. Then she fixes 20 distinct positive integers $a_{1}, a_{2}, \\ldots, a_{20}$ such that, for each $k=1,2, \\ldots, 20$, the numbers $N$ and $a_{k}$ are congruent modulo $k$. By a move, Sergey tells Xenia a set $S$ of positive integers not exceeding 20 , and she tells him back the set $\\left\\{a_{k}: k \\in S\\right\\}$ without spelling out which number corresponds to which index. How many moves does Sergey need to determine for sure the number Xenia thought of?",
     "source": null,
     "split": "test",
-    "subject": "Math"
+    "subject": "Math",
+    "url": null
   }
 }
