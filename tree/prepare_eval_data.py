@@ -106,7 +106,7 @@ def build_math500(data_source: str):
         # MATH-500 already provides a clean final answer in ``answer``.
         answer = _normalize_answer(example.get("answer") or example.get("solution"))
         return _build_record(
-            data_source=data_source,
+            data_source="math500",
             question=question,
             answer=answer,
             idx=idx,
@@ -125,7 +125,7 @@ def build_amc(data_source: str):
         question = example["problem"]
         answer = _normalize_answer(example.get("answer"))
         return _build_record(
-            data_source=data_source,
+            data_source="amc",
             question=question,
             answer=answer,
             idx=idx,
@@ -156,7 +156,7 @@ def build_olympiad_bench(data_source: str):
             raw_answer = example.get("answer")
         answer = _normalize_answer(raw_answer)
         return _build_record(
-            data_source=data_source,
+            data_source="olympiad_bench",
             question=question,
             answer=answer,
             idx=idx,

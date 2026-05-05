@@ -122,7 +122,21 @@ mkdir -p "${WANDB_DIR}"
 
 # ---- eval loop --------------------------------------------------------------
 
-printf "checkpoint\tmath_dapo_acc_mean@1\n" > "${SUMMARY_FILE}"
+printf "checkpoint\tmath500\tamc\tolympiad_bench\tmean\n" > "${SUMMARY_FILE}"
+
+# Extract a single metric value from a step log file.
+# Handles both console format "key:value" and pprint format "'key': value".
+_extract_metric() {
+  local log_file="$1" key="$2"
+  local val
+  # console logger format: "step:N - key:value - ..."
+  val=$(grep -o "${key}:[0-9.eE+-]*" "${log_file}" | tail -n1 | cut -d: -f2) || true
+  if [[ -z "${val}" ]]; then
+    # pprint / dict format: "'key': value"
+    val=$(grep -o "'${key}': *[0-9.eE+-]*" "${log_file}" | tail -n1 | sed -E "s/.*: *//") || true
+  fi
+  echo "${val:-NA}"
+}
 
 for CKPT in "${CKPT_PATHS[@]}"; do
   if [[ ! -d "${CKPT}" ]]; then
@@ -173,7 +187,7 @@ for CKPT in "${CKPT_PATHS[@]}"; do
       +reward_model.reward_kwargs.max_resp_len=4096 \
       algorithm.use_kl_in_reward=False \
       trainer.critic_warmup=0 \
-      trainer.logger='["console","wandb","tensorboard"]' \
+      trainer.logger='["console","tensorboard"]' \
       trainer.project_name="${PROJECT_NAME}" \
       trainer.experiment_name="${EXPERIMENT_NAME}_eval_${STEP_NAME}" \
       trainer.n_gpus_per_node=4 \
@@ -189,13 +203,21 @@ for CKPT in "${CKPT_PATHS[@]}"; do
       actor_rollout_ref.rollout.val_kwargs.do_sample=False \
       "$@" 2>&1 | tee -a "${STEP_LOG}" | tee -a "${LOG_FILE}"
 
-  # Extract val-core/math_dapo/acc/mean@1 from the step log. verl prints the
-  # validation metric dict via pprint, so we grep-match both common spellings.
-  ACC=$(grep -Eo "val-core/math_dapo/acc/mean@1[^,}]*" "${STEP_LOG}" | tail -n1 | sed -E "s/.*: *([0-9.eE+-]+).*/\1/") || true
-  if [[ -z "${ACC}" ]]; then
-    ACC=$(grep -Eo "'val-core/math_dapo/acc/mean@1': *[0-9.eE+-]+" "${STEP_LOG}" | tail -n1 | sed -E "s/.*: *([0-9.eE+-]+).*/\1/") || true
-  fi
-  printf "%s\t%s\n" "${STEP_NAME}" "${ACC:-NA}" | tee -a "${SUMMARY_FILE}"
+  # Extract per-dataset acc from the step log.
+  # verl console logger emits: "step:N - val-core/<dataset>/acc/mean@1:<value> - ..."
+  ACC_MATH500=$(_extract_metric "${STEP_LOG}" "val-core/math500/acc/mean@1")
+  ACC_AMC=$(_extract_metric "${STEP_LOG}" "val-core/amc/acc/mean@1")
+  ACC_OLYMPIAD=$(_extract_metric "${STEP_LOG}" "val-core/olympiad_bench/acc/mean@1")
+
+  # Compute mean of the three scores (skip NA entries).
+  MEAN=$(python3 -c "
+vals = [x for x in ['${ACC_MATH500}','${ACC_AMC}','${ACC_OLYMPIAD}'] if x != 'NA']
+print(f'{sum(float(v) for v in vals)/len(vals):.5f}' if vals else 'NA')
+")
+
+  printf "%s\t%s\t%s\t%s\t%s\n" \
+    "${STEP_NAME}" "${ACC_MATH500}" "${ACC_AMC}" "${ACC_OLYMPIAD}" "${MEAN}" \
+    | tee -a "${SUMMARY_FILE}"
 done
 
 echo "=== Evaluation finished at $(date) ===" | tee -a "${LOG_FILE}"
