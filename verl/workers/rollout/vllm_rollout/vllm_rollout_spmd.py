@@ -474,7 +474,7 @@ class vLLMRollout(BaseRollout):
                 # Expand non_tensor_batch so every key matches the new batch size
                 expanded_ntb = {}
                 for k, v in non_tensor_batch.items():
-                    expanded_ntb[k] = np.array([v[pi] for pi in prompt_indices], dtype=object)
+                    expanded_ntb[k] = v[np.array(prompt_indices)]
                 non_tensor_batch = expanded_ntb
                 batch_size = len(response)
                 logger.info(f"[TreeRollout] Expanded batch: {len(outputs)} prompts -> {batch_size} leaf responses")
@@ -500,7 +500,10 @@ class vLLMRollout(BaseRollout):
                 _tree_metrics["unique_segments"] = np.array(unique_segments, dtype=object)
                 _tree_metrics["unique_segment_seq_ids"] = np.array(unique_segment_seq_ids, dtype=np.int64)
                 # leaf_segment_indices aligns with batch dimension (one entry per leaf response)
-                non_tensor_batch["leaf_segment_indices"] = np.array(leaf_segment_indices, dtype=object)
+                leaf_seg_arr = np.empty(len(leaf_segment_indices), dtype=object)
+                for i, v in enumerate(leaf_segment_indices):
+                    leaf_seg_arr[i] = v
+                non_tensor_batch["leaf_segment_indices"] = leaf_seg_arr
 
             # ── Compute tree search metrics ──
             _tree_total, _tree_leaves = 0, 0
