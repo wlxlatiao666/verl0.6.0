@@ -73,12 +73,18 @@ def _normalize_answer(ans) -> str:
 def _build_record(data_source: str, question: str, answer: str, idx: int, dataset_name: str, extra: dict | None = None):
     question = question.strip()
     prompt_text = f"{question} {INSTRUCTION_FOLLOWING}"
+    # All optional fields are always present (None when not applicable) so that
+    # every parquet file shares an identical schema and can be concatenated.
     extra_info = {
         "split": "test",
         "index": idx,
         "dataset": dataset_name,
         "question": question,
         "answer": answer,
+        "level": None,    # math500 only
+        "subject": None,  # math500 / olympiad_bench
+        "url": None,      # amc only
+        "source": None,   # olympiad_bench only
     }
     if extra:
         extra_info.update(extra)
