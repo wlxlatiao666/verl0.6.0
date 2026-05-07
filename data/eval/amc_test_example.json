@@ -1,5 +1,5 @@
 {
-  "data_source": "math_dapo",
+  "data_source": "amc",
   "prompt": [
     {
       "content": "$\\frac{m}{n}$ is the Irreducible fraction value of \\[3+\\frac{1}{3+\\frac{1}{3+\\frac13}}\\], what is the value of $m+n$? Let's think step by step and output the final answer within \\boxed{}.",

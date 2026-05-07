@@ -57,7 +57,7 @@ VAL_FILES="['${MATH500_FILE}','${AMC_FILE}','${OLYMPIAD_FILE}']"
 # Default checkpoint root matches verl's default:
 #   checkpoints/<project_name>/<experiment_name>/global_step_N/actor/...
 PROJECT_NAME=${PROJECT_NAME:-"verl_grpo_tree_latest"}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-"qwen2.5_math7b_grpo"}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-"qwen2.5_math7b_tree_pr"}
 CHECKPOINT_DIR=${CHECKPOINT_DIR:-"${RAY_DATA_HOME}/tree/checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}"}
 
 # Build the list of global_step_* directories to evaluate.
@@ -125,12 +125,15 @@ mkdir -p "${WANDB_DIR}"
 printf "checkpoint\tmath500\tamc\tolympiad_bench\tmean\n" > "${SUMMARY_FILE}"
 
 # Extract a single metric value from a step log file.
-# Handles both console format "key:value" and pprint format "'key': value".
+# Handles console format: "key:np.float64(0.692)" and pprint format: "'key': value"
 _extract_metric() {
   local log_file="$1" key="$2"
   local val
-  # console logger format: "step:N - key:value - ..."
-  val=$(grep -o "${key}:[0-9.eE+-]*" "${log_file}" | tail -n1 | cut -d: -f2) || true
+  # console logger format: "key:np.float64(value)" or "key:value"
+  val=$(grep -o "${key}:np\.float64([^)]*)" "${log_file}" | tail -n1 | sed -E "s/.*np\.float64\(([^)]*)\)/\1/") || true
+  if [[ -z "${val}" ]]; then
+    val=$(grep -o "${key}:[0-9.eE+-]*" "${log_file}" | tail -n1 | cut -d: -f2) || true
+  fi
   if [[ -z "${val}" ]]; then
     # pprint / dict format: "'key': value"
     val=$(grep -o "'${key}': *[0-9.eE+-]*" "${log_file}" | tail -n1 | sed -E "s/.*: *//") || true
