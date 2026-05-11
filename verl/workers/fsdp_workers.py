@@ -946,6 +946,25 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def update_entropy_threshold(self, threshold: float):
         self.rollout.update_entropy_threshold(threshold)
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def update_tau_importance(self, tau: float):
+        self.rollout.update_tau_importance(tau)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def collect_threshold_stats(self, prompts: DataProto) -> DataProto:
+        prompts = prompts.to(get_device_id())
+        if self._is_actor:
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            loop.run_until_complete(self.rollout_mode())
+        output = self.rollout.collect_threshold_stats(prompts)
+        if self._is_actor:
+            loop.run_until_complete(self.trainer_mode())
+        return output.to("cpu")
+
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
     def compute_log_prob(self, data: DataProto):
