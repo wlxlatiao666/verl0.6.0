@@ -104,6 +104,8 @@ class TreeSearchConfig(BaseConfig):
     # process reward: non-leaf reward = mean(children rewards),
     # advantage = node_reward - parent_reward (root advantage = 0).
     tree_process_reward: bool = False
+    # Number of samples per prompt used in the threshold stats pre-pass.
+    threshold_stats_n: int = 1
 
 
 @dataclass

@@ -246,14 +246,79 @@ class vLLMRollout(BaseRollout):
         self.pad_token_id = tokenizer.pad_token_id
 
     def update_entropy_threshold(self, threshold: float):
-        """Dynamically update the entropy_threshold for tree search.
-
-        Called by the trainer at the start of each rollout step with the
-        p80 entropy computed from the previous step.
-        """
+        """Dynamically update the entropy_threshold for tree search."""
         if self.sampling_params.tree_search_params is not None:
             self.sampling_params.tree_search_params.entropy_threshold = threshold
             logger.info(f"[TreeRollout] entropy_threshold updated to {threshold:.4f}")
+
+    def update_tau_importance(self, tau: float):
+        """Dynamically update the tau_importance for tree search."""
+        if self.sampling_params.tree_search_params is not None:
+            self.sampling_params.tree_search_params.tau_importance = tau
+            logger.info(f"[TreeRollout] tau_importance updated to {tau:.4f}")
+
+    @GPUMemoryLogger(role="vllm rollout spmd collect_threshold_stats", logger=logger)
+    @torch.no_grad()
+    def collect_threshold_stats(self, prompts: DataProto) -> DataProto:
+        """Run a forward pass with collect_threshold_stats=True to compute
+        per-token entropy and importance lists, then return their p80 values.
+
+        Returns a DataProto with meta_info containing:
+            - "entropy_p80": float
+            - "importance_p80": float or None (if importance_list is empty)
+        """
+        idx = prompts.batch["input_ids"]
+        batch_size = idx.size(0)
+
+        non_tensor_batch = dict(prompts.non_tensor_batch)
+        if "raw_prompt_ids" not in non_tensor_batch:
+            non_tensor_batch["raw_prompt_ids"] = np.array(
+                [_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)], dtype=object
+            )
+
+        if "multi_modal_data" in non_tensor_batch:
+            vllm_inputs = [
+                {"prompt_token_ids": list(raw_ids), "multi_modal_data": mm}
+                for raw_ids, mm in zip(non_tensor_batch["raw_prompt_ids"], non_tensor_batch["multi_modal_data"])
+            ]
+        else:
+            vllm_inputs = [{"prompt_token_ids": list(raw_ids)} for raw_ids in non_tensor_batch["raw_prompt_ids"]]
+
+        _tree_cfg = self.config.get("tree_search", {})
+        stats_n = int(_tree_cfg.get("threshold_stats_n", 1))
+
+        stats_params = SamplingParams(
+            n=stats_n,
+            temperature=float(self.sampling_params.temperature),
+            max_tokens=int(self.sampling_params.max_tokens),
+            collect_threshold_stats=True,
+        )
+
+        outputs = self.inference_engine.generate(
+            prompts=vllm_inputs,
+            sampling_params=stats_params,
+            use_tqdm=False,
+        )
+
+        all_entropy: list[float] = []
+        all_importance: list[float] = []
+        for output in outputs:
+            for completion in output.outputs:
+                all_entropy.extend(completion.entropy_list)
+                all_importance.extend(v for v in completion.importance_list if v is not None)
+
+        entropy_p80: float = float(np.percentile(all_entropy, 80)) if all_entropy else 1.0
+        importance_p80: float | None = float(np.percentile(all_importance, 80)) if all_importance else None
+
+        logger.info(
+            f"[TreeRollout] collect_threshold_stats: entropy_p80={entropy_p80:.4f}, "
+            f"importance_p80={importance_p80}"
+        )
+
+        result = DataProto.from_single_dict({})
+        result.meta_info["entropy_p80"] = entropy_p80
+        result.meta_info["importance_p80"] = importance_p80
+        return result
 
     @contextmanager
     def update_sampling_params(self, **kwargs):

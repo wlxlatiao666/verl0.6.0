@@ -293,6 +293,10 @@ tree_search:
   # Non-leaf reward = mean(children rewards); advantage = node_reward - parent_reward.
   tree_process_reward: False
 
+  # Number of samples per prompt in the threshold stats pre-pass (collect_threshold_stats).
+  # Higher values give more stable p80 estimates at the cost of extra compute.
+  threshold_stats_n: 1
+
 # profile the rollout model in `generate_sequence` 
 profiler:
 

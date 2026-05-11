@@ -1065,7 +1065,6 @@ class RayPPOTrainer:
         )
 
         self.global_steps = 0
-        self._entropy_p80: float | None = None  # updated each step, used next step
 
         # load checkpoint before doing anything
         self._load_checkpoint()
@@ -1124,11 +1123,20 @@ class RayPPOTrainer:
                 gen_batch.meta_info["global_steps"] = self.global_steps
                 gen_batch = gen_batch.repeat(self.config.actor_rollout_ref.rollout.n, interleave=True)
 
-                # Dynamic entropy threshold: push p80 from previous step to rollout workers
+                # Collect entropy/importance threshold stats for tree search before rollout.
+                # Runs a lightweight forward pass with collect_threshold_stats=True so that
+                # entropy_threshold and tau_importance reflect the current batch/model state.
                 _tree_cfg = self.config.actor_rollout_ref.rollout.get("tree_search", None)
-                if _tree_cfg is not None and _tree_cfg.get("enable", False) and self._entropy_p80 is not None:
-                    self.actor_rollout_wg.update_entropy_threshold(self._entropy_p80)
-                    metrics["tree/entropy_threshold"] = self._entropy_p80
+                if _tree_cfg is not None and _tree_cfg.get("enable", False):
+                    with marked_timer("tree_threshold_stats", timing_raw, color="yellow"):
+                        stats_output = self.actor_rollout_wg.collect_threshold_stats(gen_batch)
+                        _entropy_p80 = stats_output.meta_info.get("entropy_p80", 1.0)
+                        _importance_p80 = stats_output.meta_info.get("importance_p80", None)
+                    self.actor_rollout_wg.update_entropy_threshold(_entropy_p80)
+                    metrics["tree/entropy_threshold"] = _entropy_p80
+                    if _importance_p80 is not None:
+                        self.actor_rollout_wg.update_tau_importance(_importance_p80)
+                        metrics["tree/tau_importance"] = _importance_p80
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
@@ -1241,11 +1249,6 @@ class RayPPOTrainer:
                         entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
                         old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
                         metrics.update(old_log_prob_metrics)
-                        # Compute p80 of per-token entropy over valid tokens for next step's threshold
-                        _tree_cfg = self.config.actor_rollout_ref.rollout.get("tree_search", None)
-                        if _tree_cfg is not None and _tree_cfg.get("enable", False):
-                            _valid_entropy = entropys[response_masks.bool()]
-                            self._entropy_p80 = float(torch.quantile(_valid_entropy.float(), 0.8).item())
                         old_log_prob.batch.pop("entropys")
                         batch = batch.union(old_log_prob)
 
