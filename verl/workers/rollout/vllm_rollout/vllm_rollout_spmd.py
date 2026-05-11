@@ -451,8 +451,7 @@ class vLLMRollout(BaseRollout):
             response = []
             # unique_segments: one entry per unique tree node (deduped by seq_id)
             # unique_segment_seq_ids: seq_id for each entry in unique_segments
-            # leaf_segment_indices: for each leaf, the ordered list of indices into unique_segments
-            #                       representing its root→leaf path
+            # leaf_segment_indices: for each leaf, the ordered list of indices into unique_segments representing its root→leaf path
             unique_segments: list[list[int]] = []
             unique_segment_seq_ids: list[int] = []
             seq_id_to_segment_idx: dict[int, int] = {}
@@ -464,31 +463,6 @@ class vLLMRollout(BaseRollout):
                 seq_map = {out.seq_id: out for out in output.outputs}
                 has_tree = any(getattr(s, 'is_leaf', False) for s in output.outputs)
 
-                # if _tree_process_reward and has_tree:
-                #     # Collect ALL nodes; each node's response = its own segment (tree_ids only)
-                #     # Build seq_id -> future global index mapping first
-                #     seq_id_to_global: dict = {}
-                #     for sample in output.outputs:
-                #         seq_id_to_global[sample.seq_id] = len(response) + len(seq_id_to_global)
-
-                #     for sample in output.outputs:
-                #         response_ids = sample.tree_ids
-                #         response.append(response_ids)
-                #         prompt_indices.append(out_idx)
-                #         tree_node_is_leaf.append(bool(getattr(sample, 'is_leaf', True)))
-                #         tree_node_depth.append(int(getattr(sample, 'tree_depth', 0)))
-                #         parent_sid = getattr(sample, 'parent_seq_id', None)
-                #         if parent_sid is not None and parent_sid in seq_id_to_global:
-                #             tree_node_parent_offset.append(seq_id_to_global[parent_sid])
-                #         else:
-                #             tree_node_parent_offset.append(-1)
-                #         if self.config.calculate_log_probs:
-                #             curr_log_prob = []
-                #             for i, logprob in enumerate(sample.logprobs):
-                #                 curr_log_prob.append(logprob[response_ids[i]].logprob)
-                #             rollout_log_probs.append(curr_log_prob)
-                # else:
-                    # Original behaviour: collect leaf responses (full path concatenated)
                 samples_to_collect = output.outputs
                 for sample in samples_to_collect:
                     if has_tree:
