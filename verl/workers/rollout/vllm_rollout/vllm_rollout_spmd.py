@@ -240,6 +240,7 @@ class vLLMRollout(BaseRollout):
                 entropy_threshold=float(_tree_cfg.get("entropy_threshold", 1.0)),
                 branching_factor=int(_tree_cfg.get("branching_factor", 2)),
                 max_tree_depth=int(_tree_cfg.get("max_tree_depth", 3)),
+                tau_importance=float(_tree_cfg.get("tau_importance", 0.0)),
             )
             logger.info(f"[TreeRollout] TreeSearchParams enabled: {self.sampling_params.tree_search_params}")
 
