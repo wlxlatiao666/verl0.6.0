@@ -1130,8 +1130,15 @@ class RayPPOTrainer:
                 if _tree_cfg is not None and _tree_cfg.get("enable", False):
                     with marked_timer("tree_threshold_stats", timing_raw, color="yellow"):
                         stats_output = self.actor_rollout_wg.collect_threshold_stats(gen_batch)
-                        _entropy_p80 = stats_output.meta_info.get("entropy_p80", 1.0)
-                        _importance_p80 = stats_output.meta_info.get("importance_p80", None)
+                        # ONE_TO_ALL returns a list (one DataProto per worker); average across workers
+                        if isinstance(stats_output, list):
+                            _entropy_vals = [s.meta_info["entropy_p80"] for s in stats_output if "entropy_p80" in s.meta_info]
+                            _entropy_p80 = float(sum(_entropy_vals) / len(_entropy_vals)) if _entropy_vals else 1.0
+                            _imp_vals = [s.meta_info["importance_p80"] for s in stats_output if s.meta_info.get("importance_p80") is not None]
+                            _importance_p80 = float(sum(_imp_vals) / len(_imp_vals)) if _imp_vals else None
+                        else:
+                            _entropy_p80 = stats_output.meta_info.get("entropy_p80", 1.0)
+                            _importance_p80 = stats_output.meta_info.get("importance_p80", None)
                     self.actor_rollout_wg.update_entropy_threshold(_entropy_p80)
                     metrics["tree/entropy_threshold"] = _entropy_p80
                     if _importance_p80 is not None:
