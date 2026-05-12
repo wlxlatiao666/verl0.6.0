@@ -12,10 +12,14 @@ All three datasets are materialized as verl-style parquet files with:
     - prompt          = [{"role": "user", "content": question + instruction}]
     - ability         = "math"
     - reward_model    = {"style": "rule", "ground_truth": <final_answer_str>}
-    - extra_info      = {"split": "test", "index": i, "dataset": <short_name>}
+    - extra_info      = fixed keys (split, index, dataset, question, answer,
+                      level, subject, url, source) so merged val loads match in PyArrow
 
-Using data_source="math_dapo" is what makes the validation metric show up as
-``val-core/math_dapo/acc/mean@1`` (see verl/utils/reward_score/__init__.py).
+By default each parquet uses its own ``data_source`` (``math_dapo_math500``,
+``math_dapo_amc``, ``math_dapo_olympiad_bench``) so validation reports three
+separate ``val-core/<data_source>/acc/mean@1`` metrics. Pass ``--pooled_metrics``
+to use one shared ``math_dapo`` tag (single pooled mean). All of these route
+through ``math_dapo.compute_score`` (see verl/utils/reward_score/__init__.py).
 
 Usage:
     python prepare_eval_data.py --local_save_dir /path/to/data/eval
@@ -23,6 +27,7 @@ Usage:
 
 import argparse
 import json
+import math
 import os
 
 import datasets
@@ -52,25 +57,68 @@ def _extract_boxed(text: str) -> str | None:
     return None
 
 
+def _meta_str(v) -> str:
+    """Normalize optional metadata so every parquet shares the same Arrow struct schema."""
+    if v is None:
+        return ""
+    return str(v)
+
+
 def _normalize_answer(ans) -> str:
     """Make the ground-truth answer a clean string.
+
+    math_dapo.compute_score compares normalized strings; predictions from ``\\boxed{}``
+    drop trailing ``.0`` but ``str(123.0)`` does not, so AMC labels stored as
+    float64 on HF would become ``"123.0"`` and never match ``"123"`` (accuracy ~0).
 
     math_dapo.compute_score grades against a raw answer string, so we unwrap
     any ``\\boxed{...}`` and strip whitespace. Lists are joined with commas.
     """
     if ans is None:
         return ""
+    # NumPy / PyArrow scalars (e.g. float64 in AMC parquet)
+    if hasattr(ans, "item") and not isinstance(ans, (str, bytes, list, dict)):
+        try:
+            inner = ans.item()
+            if inner is not ans:
+                return _normalize_answer(inner)
+        except Exception:
+            pass
+
     if isinstance(ans, list):
-        ans = ", ".join(str(x) for x in ans)
-    ans = str(ans).strip()
-    boxed = _extract_boxed(ans)
+        return ", ".join(_normalize_answer(x) for x in ans)
+
+    if isinstance(ans, bool):
+        val = str(ans)
+    elif isinstance(ans, int):
+        val = str(ans)
+    elif isinstance(ans, float):
+        val = str(int(ans)) if math.isfinite(ans) and ans.is_integer() else str(ans)
+    else:
+        val = str(ans).strip()
+
+    boxed = _extract_boxed(val)
     if boxed is not None:
-        ans = boxed.strip()
-    ans = ans.strip().strip("$").strip()
-    return ans
+        val = boxed.strip()
+    return val.strip().strip("$").strip()
 
 
-def _build_record(data_source: str, question: str, answer: str, idx: int, dataset_name: str, extra: dict | None = None):
+def _build_record(
+    data_source: str,
+    question: str,
+    answer: str,
+    idx: int,
+    dataset_name: str,
+    *,
+    level=None,
+    subject=None,
+    url=None,
+    source=None,
+):
+    """Build one row. ``extra_info`` always has the same keys/types so verl can
+    ``concatenate_datasets`` across math500 / amc / olympiad parquets (PyArrow
+    requires matching struct schemas).
+    """
     question = question.strip()
     prompt_text = f"{question} {INSTRUCTION_FOLLOWING}"
     extra_info = {
@@ -79,9 +127,11 @@ def _build_record(data_source: str, question: str, answer: str, idx: int, datase
         "dataset": dataset_name,
         "question": question,
         "answer": answer,
+        "level": _meta_str(level),
+        "subject": _meta_str(subject),
+        "url": _meta_str(url),
+        "source": _meta_str(source),
     }
-    if extra:
-        extra_info.update(extra)
     return {
         "data_source": data_source,
         "prompt": [{"role": "user", "content": prompt_text}],
@@ -105,14 +155,19 @@ def build_math500(data_source: str):
             answer=answer,
             idx=idx,
             dataset_name="math500",
-            extra={"level": example.get("level"), "subject": example.get("subject")},
+            level=example.get("level"),
+            subject=example.get("subject"),
         )
 
     return ds.map(_map, with_indices=True, remove_columns=ds.column_names)
 
 
 def build_amc(data_source: str):
-    """AI-MO/aimo-validation-amc — AMC-12 problems with integer answers."""
+    """AI-MO/aimo-validation-amc — AMC-12 style integer-answer problems (HF).
+
+    Repo is correct; labels are often ``float64`` (e.g. ``123.0``). Use
+    :func:`_normalize_answer` so ground truth matches ``\\boxed{123}`` grading.
+    """
     ds = datasets.load_dataset("AI-MO/aimo-validation-amc", split="train")
 
     def _map(example, idx):
@@ -124,7 +179,7 @@ def build_amc(data_source: str):
             answer=answer,
             idx=idx,
             dataset_name="amc",
-            extra={"url": example.get("url")},
+            url=example.get("url"),
         )
 
     return ds.map(_map, with_indices=True, remove_columns=ds.column_names)
@@ -155,7 +210,8 @@ def build_olympiad_bench(data_source: str):
             answer=answer,
             idx=idx,
             dataset_name="olympiad_bench",
-            extra={"subject": example.get("subject"), "source": example.get("source")},
+            subject=example.get("subject"),
+            source=example.get("source"),
         )
 
     return ds.map(_map, with_indices=True, remove_columns=ds.column_names)
@@ -176,12 +232,19 @@ def main():
         help="Directory to write the preprocessed parquet files.",
     )
     parser.add_argument(
-        "--data_source",
+        "--data_source_prefix",
         default="math_dapo",
         help=(
-            "data_source field written into each record. Keep this as 'math_dapo' so that "
-            "validation metrics appear as val-core/math_dapo/acc/mean@1 and the reward "
-            "routes through verl's math_dapo.compute_score."
+            "Prefix for per-dataset tags (default: math_dapo -> math_dapo_math500, ...). "
+            "Ignored when --pooled_metrics is set (then this is the exact data_source)."
+        ),
+    )
+    parser.add_argument(
+        "--pooled_metrics",
+        action="store_true",
+        help=(
+            "If set, every row uses data_source==data_source_prefix (one pooled "
+            "val-core/<prefix>/acc/mean@1). Default is split metrics per parquet."
         ),
     )
     parser.add_argument(
@@ -198,7 +261,12 @@ def main():
 
     for name in args.datasets:
         print(f"[prepare_eval_data] building {name}...", flush=True)
-        ds = BUILDERS[name](args.data_source)
+        if args.pooled_metrics:
+            ds_src = args.data_source_prefix
+        else:
+            ds_src = f"{args.data_source_prefix}_{name}"
+        print(f"[prepare_eval_data] data_source={ds_src}", flush=True)
+        ds = BUILDERS[name](ds_src)
         out_path = os.path.join(save_dir, f"{name}_test.parquet")
         ds.to_parquet(out_path)
         print(f"[prepare_eval_data] wrote {len(ds)} rows -> {out_path}", flush=True)
