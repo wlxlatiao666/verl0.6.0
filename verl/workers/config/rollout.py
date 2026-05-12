@@ -107,6 +107,10 @@ class TreeSearchConfig(BaseConfig):
     tree_process_reward: bool = False
     # Number of samples per prompt used in the threshold stats pre-pass.
     threshold_stats_n: int = 1
+    # Only run threshold stats collection every N training steps (0 = every step).
+    threshold_stats_interval: int = 10
+    # Max tokens to generate during threshold stats collection (0 = use rollout max_tokens).
+    threshold_stats_max_tokens: int = 64
 
 
 @dataclass
