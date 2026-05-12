@@ -287,11 +287,13 @@ class vLLMRollout(BaseRollout):
 
         _tree_cfg = self.config.get("tree_search", {})
         stats_n = int(_tree_cfg.get("threshold_stats_n", 1))
+        _stats_max_tokens = int(_tree_cfg.get("threshold_stats_max_tokens", 0))
+        _max_tokens = _stats_max_tokens if _stats_max_tokens > 0 else int(self.sampling_params.max_tokens)
 
         stats_params = SamplingParams(
             n=stats_n,
             temperature=float(self.sampling_params.temperature),
-            max_tokens=int(self.sampling_params.max_tokens),
+            max_tokens=_max_tokens,
             collect_threshold_stats=True,
         )
 
