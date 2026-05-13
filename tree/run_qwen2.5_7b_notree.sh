@@ -3,6 +3,8 @@ set -x
 _ORIG_HOME="${HOME}"
 
 export PYTHONUNBUFFERED=1
+export VLLM_USE_V1=0
+export VERL_LOGGING_LEVEL="${VERL_LOGGING_LEVEL:-INFO}"
 export VERL_DEBUG_LOG_PATH=/inspire/hdd/project/project-public/zhangshenao-CZXS25250096
 export NCCL_SHM_DISABLE=1
 export NCCL_DEBUG=INFO
@@ -10,7 +12,7 @@ HOME=/inspire/hdd/project/project-public/zhangshenao-CZXS25250096
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl0.6.0"}
 
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
-TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
+TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime2026.parquet"}
 
 # Real-time log file: each line is written immediately; data is not lost if the job is killed
 LOG_DIR="${HOME}/logs"
@@ -56,16 +58,16 @@ python3 -m verl.trainer.main_ppo \
     data.train_files="$TRAIN_FILE" \
     data.val_files="$TEST_FILE" \
     data.train_batch_size=96 \
-    data.max_prompt_length=4096 \
-    data.max_response_length=4096 \
+    data.max_prompt_length=2048 \
+    data.max_response_length=2048 \
     data.filter_overlong_prompts=False \
     data.truncation='error' \
     actor_rollout_ref.actor.clip_ratio_low=0.2 \
     actor_rollout_ref.actor.clip_ratio_high=0.28 \
-    actor_rollout_ref.model.path=/inspire/hdd/global_public/public_models/Qwen/Qwen2.5-0.5B \
+    actor_rollout_ref.model.path=/inspire/hdd/global_public/public_models/Qwen/Qwen2.5-7B-Instruct \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
-    actor_rollout_ref.actor.ppo_mini_batch_size=2 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=16 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.kl_loss_coef=0 \
@@ -75,30 +77,30 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.n=8 \
-    actor_rollout_ref.rollout.tree_search.enable=True \
-    actor_rollout_ref.rollout.tree_search.entropy_threshold=0.8 \
-    actor_rollout_ref.rollout.tree_search.branching_factor=3 \
-    actor_rollout_ref.rollout.tree_search.max_tree_depth=3 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     reward_model.reward_manager=dapo \
-    reward_model.overlong_buffer.enable=False \
-    reward_model.overlong_buffer.len=512 \
-    reward_model.overlong_buffer.penalty_factor=1.0 \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.enable=False \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.len=512 \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=1.0 \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
+    +reward_model.reward_kwargs.max_resp_len=4096 \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb","tensorboard"]' \
     trainer.project_name='verl_grpo_treerollout' \
-    trainer.experiment_name='qwen3_8b_test' \
-    trainer.n_gpus_per_node=8 \
+    trainer.experiment_name='qwen2.5_7b_instruct_no_tree' \
+    trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
     trainer.test_freq=2 \
     trainer.total_epochs=1 \
+    # trainer.rollout_data_dir="${HOME}/rollout_data" \
+    # trainer.validation_data_dir="${HOME}/validation_data" \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
-    actor_rollout_ref.rollout.val_kwargs.do_sample=True \
+    actor_rollout_ref.rollout.val_kwargs.do_sample=False\
     $@ 2>&1 | tee -a "${LOG_FILE}"
