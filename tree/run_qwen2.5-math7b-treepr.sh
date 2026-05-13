@@ -5,14 +5,12 @@ _ORIG_HOME="${HOME}"
 export PYTHONUNBUFFERED=1
 export VLLM_USE_V1=0
 export VERL_LOGGING_LEVEL="${VERL_LOGGING_LEVEL:-INFO}"
-<<<<<<<< HEAD:tree/run_qwen2.5-math7b-treepr.sh
 export VERL_DEBUG_LOG_PATH=/inspire/hdd/global_user/weilongxuan-253108120168
-========
-export VERL_DEBUG_LOG_PATH=/inspire/hdd/project/project-public/zhangshenao-CZXS25250096
->>>>>>>> shenao:tree/run_qwen2.5_7b_notree.sh
 export NCCL_SHM_DISABLE=1
 export NCCL_DEBUG=INFO
 HOME=/inspire/hdd/global_user/weilongxuan-253108120168
+project_name=verl_grpo_tree_latest
+experiment_name=qwen2.5_math7b_tree_pr
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl0.6.0"}
 
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
@@ -68,11 +66,7 @@ python3 -m verl.trainer.main_ppo \
     data.truncation='error' \
     actor_rollout_ref.actor.clip_ratio_low=0.2 \
     actor_rollout_ref.actor.clip_ratio_high=0.28 \
-<<<<<<<< HEAD:tree/run_qwen2.5-math7b-treepr.sh
     actor_rollout_ref.model.path=/inspire/hdd/global_public/public_models/Qwen/Qwen2.5-Math-7B \
-========
-    actor_rollout_ref.model.path=/inspire/hdd/global_public/public_models/Qwen/Qwen2.5-7B-Instruct \
->>>>>>>> shenao:tree/run_qwen2.5_7b_notree.sh
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=16 \
@@ -88,16 +82,12 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
-<<<<<<<< HEAD:tree/run_qwen2.5-math7b-treepr.sh
     actor_rollout_ref.rollout.n=1 \
     actor_rollout_ref.rollout.tree_search.enable=True \
     actor_rollout_ref.rollout.tree_search.entropy_threshold=0.8 \
     actor_rollout_ref.rollout.tree_search.branching_factor=2 \
     actor_rollout_ref.rollout.tree_search.max_tree_depth=3 \
     actor_rollout_ref.rollout.tree_search.tree_process_reward=True \
-========
-    actor_rollout_ref.rollout.n=8 \
->>>>>>>> shenao:tree/run_qwen2.5_7b_notree.sh
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     reward_model.reward_manager=dapo \
@@ -109,24 +99,15 @@ python3 -m verl.trainer.main_ppo \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb","tensorboard"]' \
-<<<<<<<< HEAD:tree/run_qwen2.5-math7b-treepr.sh
-    trainer.project_name='verl_grpo_tree_latest' \
-    trainer.experiment_name='qwen2.5_math7b_tree_pr' \
-========
-    trainer.project_name='verl_grpo_treerollout' \
-    trainer.experiment_name='qwen2.5_7b_instruct_no_tree' \
->>>>>>>> shenao:tree/run_qwen2.5_7b_notree.sh
+    trainer.project_name=${project_name} \
+    trainer.experiment_name=${experiment_name} \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
     trainer.test_freq=2 \
     trainer.total_epochs=1 \
-<<<<<<<< HEAD:tree/run_qwen2.5-math7b-treepr.sh
-    trainer.rollout_data_dir=/inspire/hdd/global_user/weilongxuan-253108120168/verl0.6.0/logs/pr_logs \
-========
-    # trainer.rollout_data_dir="${HOME}/rollout_data" \
-    # trainer.validation_data_dir="${HOME}/validation_data" \
->>>>>>>> shenao:tree/run_qwen2.5_7b_notree.sh
+    trainer.rollout_data_dir="${HOME}/rollout_data/${project_name}/${experiment_name}" \
+    trainer.validation_data_dir="${HOME}/validation_data/${project_name}/${experiment_name}" \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=False\
     $@ 2>&1 | tee -a "${LOG_FILE}"
