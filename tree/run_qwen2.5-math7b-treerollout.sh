@@ -9,6 +9,8 @@ export VERL_DEBUG_LOG_PATH=/inspire/hdd/global_user/weilongxuan-253108120168
 export NCCL_SHM_DISABLE=1
 export NCCL_DEBUG=INFO
 HOME=/inspire/hdd/global_user/weilongxuan-253108120168
+project_name=verl_grpo_tree_latest
+experiment_name=qwen2.5_math7b_tree_rollout_waad
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl0.6.0"}
 
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
@@ -99,14 +101,15 @@ python3 -m verl.trainer.main_ppo \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb","tensorboard"]' \
-    trainer.project_name='verl_grpo_tree_latest' \
-    trainer.experiment_name='qwen2.5_math7b_tree_rollout_waad' \
+    trainer.project_name=${project_name} \
+    trainer.experiment_name=${experiment_name} \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
     trainer.test_freq=2 \
     trainer.total_epochs=1 \
-    trainer.rollout_data_dir=/inspire/hdd/global_user/weilongxuan-253108120168/verl0.6.0/logs/rollout_logs \
+    trainer.rollout_data_dir="${HOME}/rollout_data/${project_name}/${experiment_name}" \
+    trainer.validation_data_dir="${HOME}/validation_data/${project_name}/${experiment_name}" \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=False\
     $@ 2>&1 | tee -a "${LOG_FILE}"
