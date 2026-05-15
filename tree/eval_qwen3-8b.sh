@@ -7,14 +7,20 @@
 #   3. points data.val_files at the three parquet files produced by
 #      prepare_eval_data.sh (data_source="math_dapo").
 #
-# The metric reported is val-core/math_dapo/acc/mean@1, identical to what
-# run_qwen3-8b.sh uses during training validation.
+# By default all checkpoints are logged into one eval run:
+#   - one W&B run (fixed experiment_name + WANDB_RUN_ID)
+#   - one TensorBoard folder (fixed TENSORBOARD_DIR)
+#   - one main log + one summary TSV
 #
 # Typical usage:
 #   bash eval_qwen3-8b.sh                        # loop over every ckpt in CHECKPOINT_DIR
 #   CHECKPOINT_DIR=/path/to/exp bash eval_qwen3-8b.sh
 #   CHECKPOINT_STEP=120 bash eval_qwen3-8b.sh    # only evaluate global_step_120
 #   RESUME_FROM_PATH=/abs/path/global_step_80 bash eval_qwen3-8b.sh
+#
+# Optional:
+#   EVAL_EXPERIMENT_NAME=my_eval bash eval_qwen3-8b.sh
+#   SPLIT_STEP_LOGS=1 bash eval_qwen3-8b.sh      # also write one log per checkpoint
 #
 # All defaults mirror run_qwen3-8b.sh so the validation setup is comparable.
 
@@ -91,6 +97,9 @@ mkdir -p "${LOG_DIR}"
 RUN_STAMP="$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="${LOG_DIR}/eval_${RUN_STAMP}.log"
 SUMMARY_FILE="${LOG_DIR}/eval_${RUN_STAMP}_summary.txt"
+EVAL_EXPERIMENT_NAME="${EVAL_EXPERIMENT_NAME:-${EXPERIMENT_NAME}_eval}"
+EVAL_OUTPUT_DIR="${EVAL_OUTPUT_DIR:-${HOME}/eval_outputs/${PROJECT_NAME}/${EVAL_EXPERIMENT_NAME}}"
+mkdir -p "${EVAL_OUTPUT_DIR}"
 
 echo "=== Evaluation started at $(date) ===" | tee -a "${LOG_FILE}"
 echo "Checkpoint root: ${CHECKPOINT_DIR}"     | tee -a "${LOG_FILE}"
@@ -99,6 +108,8 @@ for p in "${CKPT_PATHS[@]}"; do echo "  - ${p}" | tee -a "${LOG_FILE}"; done
 echo "Val files: ${VAL_FILES}"                | tee -a "${LOG_FILE}"
 echo "Log file : ${LOG_FILE}"                 | tee -a "${LOG_FILE}"
 echo "Summary  : ${SUMMARY_FILE}"             | tee -a "${LOG_FILE}"
+echo "Eval run : ${PROJECT_NAME}/${EVAL_EXPERIMENT_NAME}" | tee -a "${LOG_FILE}"
+echo "Eval output dir: ${EVAL_OUTPUT_DIR}"     | tee -a "${LOG_FILE}"
 
 # ---- WANDB (mirror run_qwen3-8b.sh) ----------------------------------------
 # Validation-only runs still emit metrics; keep wandb offline for consistency.
@@ -120,9 +131,41 @@ export WANDB_MODE=offline
 export WANDB_DIR="${HOME}/wandb_offline"
 mkdir -p "${WANDB_DIR}"
 
+# Make all checkpoint evaluations appear in the same W&B/TensorBoard run.
+# verl logs validation with step=self.global_steps, which is parsed from global_step_N.
+export WANDB_RUN_ID="${WANDB_RUN_ID:-eval_${PROJECT_NAME}_${EVAL_EXPERIMENT_NAME}_${RUN_STAMP}}"
+export WANDB_RESUME="${WANDB_RESUME:-allow}"
+export TENSORBOARD_DIR="${TENSORBOARD_DIR:-${EVAL_OUTPUT_DIR}/tensorboard}"
+
 # ---- eval loop --------------------------------------------------------------
 
-printf "checkpoint\tmath_dapo_acc_mean@1\n" > "${SUMMARY_FILE}"
+printf "checkpoint\tmath500\tamc\tolympiad_bench\tmean\n" > "${SUMMARY_FILE}"
+
+# Parse last val-core/.../acc/mean@1 value from a log line (handles np.float64(...)).
+extract_acc() {
+  local key="$1"
+  local log_file="$2"
+  python3 - "$log_file" "$key" <<'PY'
+import re, sys
+path, key = sys.argv[1], sys.argv[2]
+try:
+    with open(path, "r", errors="replace") as f:
+        lines = f.readlines()
+except OSError:
+    print("NA")
+    raise SystemExit(0)
+pat_np = re.compile(re.escape(key) + r"[^\d]*np\.float64\(([-0-9.eE+]+)\)")
+pat_plain = re.compile(re.escape(key) + r"[^\d]*([-0-9.eE+]+)")
+for line in reversed(lines):
+    if key not in line:
+        continue
+    m = pat_np.search(line) or pat_plain.search(line)
+    if m:
+        print(m.group(1))
+        raise SystemExit(0)
+print("NA")
+PY
+}
 
 for CKPT in "${CKPT_PATHS[@]}"; do
   if [[ ! -d "${CKPT}" ]]; then
@@ -131,7 +174,15 @@ for CKPT in "${CKPT_PATHS[@]}"; do
   fi
 
   STEP_NAME="$(basename "${CKPT}")"
-  STEP_LOG="${LOG_DIR}/eval_${RUN_STAMP}_${STEP_NAME}.log"
+  if [[ "${SPLIT_STEP_LOGS:-0}" == "1" ]]; then
+    STEP_LOG="${LOG_DIR}/eval_${RUN_STAMP}_${STEP_NAME}.log"
+  else
+    STEP_LOG="${LOG_FILE}"
+  fi
+  TEE_FILES=("${LOG_FILE}")
+  if [[ "${STEP_LOG}" != "${LOG_FILE}" ]]; then
+    TEE_FILES+=("${STEP_LOG}")
+  fi
   echo "=== [${STEP_NAME}] evaluating ${CKPT} at $(date) ===" | tee -a "${LOG_FILE}"
 
   python3 -m verl.trainer.main_ppo \
@@ -175,7 +226,7 @@ for CKPT in "${CKPT_PATHS[@]}"; do
       trainer.critic_warmup=0 \
       trainer.logger='["console","wandb","tensorboard"]' \
       trainer.project_name="${PROJECT_NAME}" \
-      trainer.experiment_name="${EXPERIMENT_NAME}_eval_${STEP_NAME}" \
+      trainer.experiment_name="${EVAL_EXPERIMENT_NAME}" \
       trainer.n_gpus_per_node=4 \
       trainer.nnodes=1 \
       trainer.save_freq=-1 \
@@ -187,15 +238,39 @@ for CKPT in "${CKPT_PATHS[@]}"; do
       trainer.resume_from_path="${CKPT}" \
       actor_rollout_ref.rollout.val_kwargs.n=1 \
       actor_rollout_ref.rollout.val_kwargs.do_sample=False \
-      "$@" 2>&1 | tee -a "${STEP_LOG}" | tee -a "${LOG_FILE}"
+      "$@" 2>&1 | tee -a "${TEE_FILES[@]}"
 
-  # Extract val-core/math_dapo/acc/mean@1 from the step log. verl prints the
-  # validation metric dict via pprint, so we grep-match both common spellings.
-  ACC=$(grep -Eo "val-core/math_dapo/acc/mean@1[^,}]*" "${STEP_LOG}" | tail -n1 | sed -E "s/.*: *([0-9.eE+-]+).*/\1/") || true
-  if [[ -z "${ACC}" ]]; then
-    ACC=$(grep -Eo "'val-core/math_dapo/acc/mean@1': *[0-9.eE+-]+" "${STEP_LOG}" | tail -n1 | sed -E "s/.*: *([0-9.eE+-]+).*/\1/") || true
+  K_M500="val-core/math_dapo_math500/acc/mean@1"
+  K_AMC="val-core/math_dapo_amc/acc/mean@1"
+  K_OLY="val-core/math_dapo_olympiad_bench/acc/mean@1"
+  ACC_M500="$(extract_acc "${K_M500}" "${STEP_LOG}")"
+  ACC_AMC="$(extract_acc "${K_AMC}" "${STEP_LOG}")"
+  ACC_OLY="$(extract_acc "${K_OLY}" "${STEP_LOG}")"
+  MEAN="$(python3 - "${ACC_M500}" "${ACC_AMC}" "${ACC_OLY}" <<'PY'
+import sys
+vals = []
+for a in sys.argv[1:4]:
+    if a == "NA":
+        continue
+    try:
+        vals.append(float(a))
+    except ValueError:
+        pass
+if not vals:
+    print("NA")
+else:
+    print(f"{sum(vals)/len(vals):.6f}")
+PY
+)"
+  # Fallback: single pooled bucket (older parquet / POOLED_METRICS=1).
+  if [[ "${ACC_M500}" == "NA" && "${ACC_AMC}" == "NA" && "${ACC_OLY}" == "NA" ]]; then
+    POOL="$(extract_acc "val-core/math_dapo/acc/mean@1" "${STEP_LOG}")"
+    ACC_M500="${POOL}"
+    ACC_AMC="${POOL}"
+    ACC_OLY="${POOL}"
+    MEAN="${POOL}"
   fi
-  printf "%s\t%s\n" "${STEP_NAME}" "${ACC:-NA}" | tee -a "${SUMMARY_FILE}"
+  printf "%s\t%s\t%s\t%s\t%s\n" "${STEP_NAME}" "${ACC_M500}" "${ACC_AMC}" "${ACC_OLY}" "${MEAN}" | tee -a "${SUMMARY_FILE}"
 done
 
 echo "=== Evaluation finished at $(date) ===" | tee -a "${LOG_FILE}"
