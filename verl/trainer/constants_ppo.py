@@ -51,10 +51,15 @@ def get_ppo_ray_runtime_env():
             runtime_env["env_vars"].pop(key, None)
 
     # Forward wandb credentials to Ray workers (workers do not inherit the caller's env).
-    for _wandb_var in ("WANDB_API_KEY", "WANDB_KEY", "WANDB_MODE", "WANDB_DIR"):
+    for _wandb_var in ("WANDB_API_KEY", "WANDB_KEY", "WANDB_MODE", "WANDB_DIR", "WANDB_RUN_ID", "WANDB_RESUME"):
         _val = os.environ.get(_wandb_var)
         if _val:
             runtime_env["env_vars"][_wandb_var] = _val
+
+    # TensorBoard path (verl.utils.tracking._TensorboardAdapter reads TENSORBOARD_DIR).
+    _tb = os.environ.get("TENSORBOARD_DIR")
+    if _tb:
+        runtime_env["env_vars"]["TENSORBOARD_DIR"] = _tb
 
     # verl rollout uses logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN")); forward so [TreeRollout] INFO appears in worker logs.
     _verl_log = os.environ.get("VERL_LOGGING_LEVEL")
