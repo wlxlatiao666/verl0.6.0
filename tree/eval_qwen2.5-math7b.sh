@@ -57,7 +57,7 @@ VAL_FILES="['${MATH500_FILE}','${AMC_FILE}','${OLYMPIAD_FILE}']"
 # Default checkpoint root matches verl's default:
 #   checkpoints/<project_name>/<experiment_name>/global_step_N/actor/...
 PROJECT_NAME=${PROJECT_NAME:-"verl_grpo_tree_latest"}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-"qwen2.5_math7b_tree_pr"}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-"qwen2.5_math7b_tree_rollout_waad"}
 CHECKPOINT_DIR=${CHECKPOINT_DIR:-"${RAY_DATA_HOME}/tree/checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}"}
 
 # Build the list of global_step_* directories to evaluate.
@@ -208,9 +208,9 @@ for CKPT in "${CKPT_PATHS[@]}"; do
 
   # Extract per-dataset acc from the step log.
   # verl console logger emits: "step:N - val-core/<dataset>/acc/mean@1:<value> - ..."
-  ACC_MATH500=$(_extract_metric "${STEP_LOG}" "val-core/math500/acc/mean@1")
-  ACC_AMC=$(_extract_metric "${STEP_LOG}" "val-core/amc/acc/mean@1")
-  ACC_OLYMPIAD=$(_extract_metric "${STEP_LOG}" "val-core/olympiad_bench/acc/mean@1")
+  ACC_MATH500=$(_extract_metric "${STEP_LOG}" "val-core/math_dapo_math500/acc/mean@1")
+  ACC_AMC=$(_extract_metric "${STEP_LOG}" "val-core/math_dapo_amc/acc/mean@1")
+  ACC_OLYMPIAD=$(_extract_metric "${STEP_LOG}" "val-core/math_dapo_olympiad_bench/acc/mean@1")
 
   # Compute mean of the three scores (skip NA entries).
   MEAN=$(python3 -c "
