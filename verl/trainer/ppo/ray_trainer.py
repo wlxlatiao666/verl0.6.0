@@ -324,9 +324,15 @@ def compute_tree_process_advantage(data: DataProto) -> DataProto:
     seg_advantages = (node_scores - seg_mean) / (seg_std + 1e-6)  # (n_unique,)
 
     # ── Step 3: assemble token-level advantages per leaf ─────────────────────
-    # Each leaf's response is the concatenation of its path segments in order.
-    # We fill token positions with the advantage of the segment they belong to.
-    # Segments shared across leaves use the same pre-computed advantage (no duplication).
+    # A segment shared by K leaves would be back-propagated K times across the
+    # batch; dividing by seg_leaf_count makes each unique segment contribute
+    # exactly seg_advantages[seg_idx] to the total loss, independent of segment
+    # length or sharing.
+    seg_leaf_count = np.zeros(n_unique, dtype=np.int64)
+    for path in leaf_segment_indices:
+        for seg_idx in path:
+            seg_leaf_count[seg_idx] += 1
+
     token_advantages = torch.zeros(n_leaves, resp_len, dtype=torch.float32, device=device)
     for j, path in enumerate(leaf_segment_indices):
         pos = 0
@@ -334,7 +340,8 @@ def compute_tree_process_advantage(data: DataProto) -> DataProto:
             seg_len = len(unique_segments[seg_idx])
             end = min(pos + seg_len, resp_len)
             valid_seg_len = max(end - pos, 1)
-            token_advantages[j, pos:end] = seg_advantages[seg_idx] / valid_seg_len
+            leaf_share = max(int(seg_leaf_count[seg_idx]), 1)
+            token_advantages[j, pos:end] = seg_advantages[seg_idx] / valid_seg_len / leaf_share
             pos += seg_len
             if pos >= resp_len:
                 break
