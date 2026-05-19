@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
 from importlib.metadata import PackageNotFoundError, version
 
 from packaging import version as vs
@@ -50,15 +51,26 @@ elif vs.parse(package_version) >= vs.parse("0.7.0"):
     from vllm import LLM
     from vllm.distributed import parallel_state
 else:
-    if vs.parse(package_version) in [vs.parse("0.5.4"), vs.parse("0.6.3")]:
-        raise ValueError(
-            f"vLLM version {package_version} support has been removed. vLLM 0.5.4 and 0.6.3 are no longer "
-            f"supported. Please use vLLM 0.7.0 or later."
-        )
-    if not is_sglang_available():
-        raise ValueError(
-            f"vllm version {package_version} not supported and SGLang also not Found. Currently supported "
-            f"vllm versions are 0.7.0+"
-        )
+    # Keep local/dev vLLM builds usable while surfacing the compatibility risk.
+    # if vs.parse(package_version) in [vs.parse("0.5.4"), vs.parse("0.6.3")]:
+    #     raise ValueError(
+    #         f"vLLM version {package_version} support has been removed. vLLM 0.5.4 and 0.6.3 are no longer "
+    #         f"supported. Please use vLLM 0.7.0 or later."
+    #     )
+    # if not is_sglang_available():
+    #     raise ValueError(
+    #         f"vllm version {package_version} not supported and SGLang also not Found. Currently supported "
+    #         f"vllm versions are 0.7.0+"
+    #     )
+    warnings.warn(
+        f"vLLM version {package_version} is below verl's officially supported "
+        "range (0.7.0+). Proceeding because the package is importable. "
+        "Runtime compatibility is not guaranteed.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    vllm_version = package_version
+    from vllm import LLM
+    from vllm.distributed import parallel_state
 
 __all__ = ["LLM", "parallel_state"]

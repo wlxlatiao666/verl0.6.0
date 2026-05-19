@@ -127,3 +127,5 @@ log
 outputs
 .history
 core.*
+tensorboard_log/
+outputs/

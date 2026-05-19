@@ -333,7 +333,8 @@ def compute_tree_process_advantage(data: DataProto) -> DataProto:
         for seg_idx in path:
             seg_len = len(unique_segments[seg_idx])
             end = min(pos + seg_len, resp_len)
-            token_advantages[j, pos:end] = seg_advantages[seg_idx]
+            valid_seg_len = max(end - pos, 1)
+            token_advantages[j, pos:end] = seg_advantages[seg_idx] / valid_seg_len
             pos += seg_len
             if pos >= resp_len:
                 break
