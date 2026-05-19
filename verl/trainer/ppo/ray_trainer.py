@@ -309,14 +309,21 @@ def compute_tree_process_advantage(data: DataProto) -> DataProto:
 
     children_sum = torch.zeros(n_unique, dtype=torch.float32, device=device)
     children_count = torch.zeros(n_unique, dtype=torch.float32, device=device)
-    for i in np.argsort(-seg_depth):  # deepest first
-        p = int(parent_of[i])
-        if p >= 0:
-            children_sum[p] += node_scores[i]
-            children_count[p] += 1
 
-    has_children = children_count > 0
-    node_scores[has_children] = children_sum[has_children] / children_count[has_children]
+    # Process depth-by-depth from deepest to root.  Finalising a node's own score
+    # from its already-accumulated children before it contributes to its parent
+    # guarantees internal nodes propagate the correct value (not the zero-init
+    # placeholder).
+    max_depth = int(seg_depth.max()) if n_unique > 0 else -1
+    for depth in range(max_depth, -1, -1):
+        for i in np.nonzero(seg_depth == depth)[0]:
+            i = int(i)
+            if children_count[i].item() > 0:
+                node_scores[i] = children_sum[i] / children_count[i]
+            p = int(parent_of[i])
+            if p >= 0:
+                children_sum[p] += node_scores[i]
+                children_count[p] += 1
 
     # ── Step 2: GRPO-style normalisation (equal weight per unique segment) ──────
     seg_mean = node_scores.mean()
