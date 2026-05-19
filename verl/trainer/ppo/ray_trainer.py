@@ -1151,6 +1151,32 @@ class RayPPOTrainer:
                         gen_batch_output.meta_info.pop("timing", None)
                         # Extract tree rollout metrics (aggregated across workers) and forward to wandb/logger
                         _agg_metrics = gen_batch_output.meta_info.pop("metrics", {})
+                        # Flatten worker-wrapped tree segment data and rebase per-leaf path
+                        # indices from worker-local to global. DataProto.concat wraps each
+                        # metrics value in a list (one entry per worker), so unique_segments
+                        # arrives as list[list[seg]] and leaf indices reference each worker's
+                        # private 0..N_w-1 segment space.
+                        _worker_segs = _agg_metrics.get("unique_segments") or []
+                        if _worker_segs:
+                            _seg_offsets = np.cumsum([0] + [len(ws) for ws in _worker_segs[:-1]])
+                            _flat_segs = [s for ws in _worker_segs for s in ws]
+                            _n_leaves_per_worker = _agg_metrics.get("tree/leaf_nodes") or []
+                            _leaf_paths = gen_batch_output.non_tensor_batch.get("leaf_segment_indices")
+                            if _leaf_paths is not None and len(_n_leaves_per_worker) == len(_worker_segs):
+                                _cursor = 0
+                                for _wid, _n_l in enumerate(_n_leaves_per_worker):
+                                    _off = int(_seg_offsets[_wid])
+                                    if _off:
+                                        for _j in range(_cursor, _cursor + _n_l):
+                                            _leaf_paths[_j] = [idx + _off for idx in _leaf_paths[_j]]
+                                    _cursor += _n_l
+                            _new_metrics = {"unique_segments": np.array(_flat_segs, dtype=object)}
+                            _w_sids = _agg_metrics.get("unique_segment_seq_ids") or []
+                            if _w_sids:
+                                _new_metrics["unique_segment_seq_ids"] = np.concatenate(
+                                    [np.asarray(s) for s in _w_sids]
+                                )
+                            gen_batch_output.meta_info["metrics"] = _new_metrics
                         if _agg_metrics and isinstance(_agg_metrics, dict):
                             for k, v in _agg_metrics.items():
                                 if not k.startswith("tree/"):
