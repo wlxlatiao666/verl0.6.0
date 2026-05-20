@@ -335,10 +335,19 @@ def compute_tree_process_advantage(data: DataProto) -> DataProto:
     # batch; dividing by seg_leaf_count makes each unique segment contribute
     # exactly seg_advantages[seg_idx] to the total loss, independent of segment
     # length or sharing.
+    #
+    # Dividing by valid_seg_len normalises each segment's contribution equally
+    # regardless of length, but shrinks the overall loss magnitude.  We rescale
+    # by mean_seg_len (= total response tokens / n_unique segments) to restore
+    # the same order-of-magnitude as standard GRPO while keeping the per-segment
+    # equal-contribution property.
     seg_leaf_count = np.zeros(n_unique, dtype=np.int64)
     for path in leaf_segment_indices:
         for seg_idx in path:
             seg_leaf_count[seg_idx] += 1
+
+    total_response_tokens = int(response_mask.sum().item())
+    mean_seg_len = total_response_tokens / max(n_unique, 1)
 
     token_advantages = torch.zeros(n_leaves, resp_len, dtype=torch.float32, device=device)
     for j, path in enumerate(leaf_segment_indices):
@@ -348,7 +357,7 @@ def compute_tree_process_advantage(data: DataProto) -> DataProto:
             end = min(pos + seg_len, resp_len)
             valid_seg_len = max(end - pos, 1)
             leaf_share = max(int(seg_leaf_count[seg_idx]), 1)
-            token_advantages[j, pos:end] = seg_advantages[seg_idx] / valid_seg_len / leaf_share
+            token_advantages[j, pos:end] = seg_advantages[seg_idx] / valid_seg_len / leaf_share * mean_seg_len
             pos += seg_len
             if pos >= resp_len:
                 break
