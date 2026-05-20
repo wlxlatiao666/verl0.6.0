@@ -92,7 +92,7 @@ fi
 
 # ---- logging ----------------------------------------------------------------
 
-LOG_DIR="${HOME}/logs"
+LOG_DIR="${HOME}/verl_logs/${PROJECT_NAME}/${EXPERIMENT_NAME}"
 mkdir -p "${LOG_DIR}"
 RUN_STAMP="$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="${LOG_DIR}/eval_${RUN_STAMP}.log"
