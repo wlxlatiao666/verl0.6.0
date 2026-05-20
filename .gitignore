@@ -128,3 +128,5 @@ outputs
 .history
 core.*
 events.*
+tensorboard_log/
+outputs/
