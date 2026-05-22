@@ -1,23 +1,21 @@
-set -x
 # Save login home before HOME is overridden (otherwise ~/.wandb_api_key would be wrong).
 _ORIG_HOME="${HOME}"
 
 export PYTHONUNBUFFERED=1
 export VLLM_USE_V1=0
 export VERL_LOGGING_LEVEL="${VERL_LOGGING_LEVEL:-INFO}"
-export VERL_DEBUG_LOG_PATH=/inspire/hdd/global_user/weilongxuan-253108120168
 export NCCL_SHM_DISABLE=1
 export NCCL_DEBUG=INFO
 HOME=/inspire/hdd/global_user/weilongxuan-253108120168
-project_name=verl_grpo_tree_latest
-experiment_name=qwen2.5_math7b_grpo
+project_name=verl_grpo_tree_base
+experiment_name=qwen2.5_base7b_grpo
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl0.6.0"}
 
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
 TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
 
 # Real-time log file: each line is written immediately; data is not lost if the job is killed
-LOG_DIR="${HOME}/logs"
+LOG_DIR="${HOME}/verl_logs"
 mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/train_$(date +%Y%m%d_%H%M%S).log"
 
@@ -38,7 +36,7 @@ fi
 # Local testing only: put your key here if you do not use env / ~/.wandb_api_key.
 # Priority: shell export > key files above > this line (empty = skip).
 # Do not commit real keys to shared repos.
-_WANDB_API_KEY_INLINE="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"
+_WANDB_API_KEY_INLINE="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"
 if [[ -z "${WANDB_API_KEY:-}" ]] && [[ -n "${_WANDB_API_KEY_INLINE}" ]]; then
   export WANDB_API_KEY="${_WANDB_API_KEY_INLINE}"
 fi
@@ -49,22 +47,20 @@ if [[ -z "${WANDB_API_KEY:-}" ]]; then
 fi
 export WANDB_KEY="${WANDB_API_KEY}"
 
-# wandb offline mode: saves every wandb.log() call to disk immediately in real-time.
-# Sync later: wandb sync ${HOME}/wandb_offline/wandb/run-*
-export WANDB_MODE=offline
-export WANDB_DIR="${HOME}/wandb_offline"
+export WANDB_MODE="${WANDB_MODE:-online}"
+export WANDB_DIR="${WANDB_DIR:-${HOME}/wandb_online}"
 mkdir -p "${WANDB_DIR}"
 
-python3 -m verl.trainer.main_ppo \
+"${PYTHON_BIN}" -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files="$TRAIN_FILE" \
     data.val_files="$TEST_FILE" \
-    data.train_batch_size=96 \
+    data.train_batch_size=16 \
     data.max_prompt_length=2048 \
     data.max_response_length=2048 \
     data.filter_overlong_prompts=False \
     data.truncation='error' \
-    actor_rollout_ref.model.path=/inspire/hdd/global_public/public_models/Qwen/Qwen2.5-Math-7B \
+    actor_rollout_ref.model.path=/inspire/hdd/global_public/public_models/Qwen/Qwen2.5-7B \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=16 \
@@ -76,16 +72,18 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.75 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=16384 \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.tree_search.enable=False \
     actor_rollout_ref.rollout.tree_search.entropy_threshold=0 \
     actor_rollout_ref.rollout.tree_search.branching_factor=2 \
     actor_rollout_ref.rollout.tree_search.max_tree_depth=3 \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.rollout.tree_search.tree_process_reward=False \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=32 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     reward_model.reward_manager=dapo \
     +reward_model.reward_kwargs.overlong_buffer_cfg.enable=True \
@@ -100,8 +98,8 @@ python3 -m verl.trainer.main_ppo \
     trainer.experiment_name=${experiment_name} \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
-    trainer.save_freq=20 \
-    trainer.test_freq=2 \
+    trainer.save_freq=-1 \
+    trainer.test_freq=10 \
     trainer.total_epochs=1 \
     trainer.rollout_data_dir="${HOME}/rollout_data/${project_name}/${experiment_name}" \
     trainer.validation_data_dir="${HOME}/validation_data/${project_name}/${experiment_name}" \
