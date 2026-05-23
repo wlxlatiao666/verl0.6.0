@@ -260,7 +260,7 @@ def compute_advantage(
     return data
 
 
-def compute_tree_process_advantage(data: DataProto) -> DataProto:
+def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw") -> DataProto:
     """Compute per-segment advantages for tree process reward.
 
     Step 1 — Back-propagate leaf scores to all nodes (bottom-up):
@@ -327,13 +327,19 @@ def compute_tree_process_advantage(data: DataProto) -> DataProto:
     # Each leaf's response is the concatenation of its path segments in order.
     # We fill token positions with the advantage of the segment they belong to.
     # Segments shared across leaves use the same pre-computed advantage (no duplication).
+    total_response_tokens = int(response_mask.sum().item())
+    mean_seg_len = total_response_tokens / max(n_unique, 1)
     token_advantages = torch.zeros(n_leaves, resp_len, dtype=torch.float32, device=device)
     for j, path in enumerate(leaf_segment_indices):
         pos = 0
         for seg_idx in path:
             seg_len = len(unique_segments[seg_idx])
             end = min(pos + seg_len, resp_len)
-            token_advantages[j, pos:end] = seg_advantages[seg_idx]
+            valid_seg_len = max(end - pos, 1)
+            if proc_agg_mode == "raw":
+                token_advantages[j, pos:end] = seg_advantages[seg_idx]
+            elif proc_agg_mode == "length_balanced":
+                token_advantages[j, pos:end] = seg_advantages[seg_idx] / valid_seg_len  * mean_seg_len
             pos += seg_len
             if pos >= resp_len:
                 break
@@ -1313,7 +1319,8 @@ class RayPPOTrainer:
                         # per-node advantage = node_reward - parent_reward.
                         # This bypasses the normal advantage estimator for tree nodes.
                         if "unique_segments" in batch.meta_info.get("metrics", {}):
-                            batch = compute_tree_process_advantage(batch)
+                            proc_agg_mode = self.config.algorithm.get("proc_agg_mode", "raw")
+                            batch = compute_tree_process_advantage(batch, proc_agg_mode=proc_agg_mode)
                         else:
                             # compute advantages, executed on the driver process
                             norm_adv_by_std_in_grpo = self.config.algorithm.get(
