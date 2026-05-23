@@ -9,15 +9,15 @@ export VERL_DEBUG_LOG_PATH=/inspire/hdd/global_user/weilongxuan-253108120168
 export NCCL_SHM_DISABLE=1
 export NCCL_DEBUG=INFO
 HOME=/inspire/hdd/global_user/weilongxuan-253108120168
-project_name=verl_grpo_tree_latest
-experiment_name=qwen2.5_math7b_tree_rollout_waad
+project_name=verl_grpo_tree_base
+experiment_name=qwen2.5_base7b_treerollout_waad
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl0.6.0"}
 
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
 TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
 
 # Real-time log file: each line is written immediately; data is not lost if the job is killed
-LOG_DIR="${HOME}/logs"
+LOG_DIR="${HOME}/verl_logs"
 mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/train_$(date +%Y%m%d_%H%M%S).log"
 
@@ -65,8 +65,8 @@ python3 -m verl.trainer.main_ppo \
     data.filter_overlong_prompts=False \
     data.truncation='error' \
     actor_rollout_ref.actor.clip_ratio_low=0.2 \
-    actor_rollout_ref.actor.clip_ratio_high=0.28 \
-    actor_rollout_ref.model.path=/inspire/hdd/global_public/public_models/Qwen/Qwen2.5-Math-7B \
+    actor_rollout_ref.actor.clip_ratio_high=0.2 \
+    actor_rollout_ref.model.path=/inspire/hdd/global_public/public_models/Qwen/Qwen2.5-7B \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=16 \
@@ -108,8 +108,9 @@ python3 -m verl.trainer.main_ppo \
     trainer.save_freq=20 \
     trainer.test_freq=2 \
     trainer.total_epochs=1 \
-    trainer.rollout_data_dir="${HOME}/rollout_data/${project_name}/${experiment_name}" \
-    trainer.validation_data_dir="${HOME}/validation_data/${project_name}/${experiment_name}" \
+    trainer.default_local_dir="/inspire/qb-ilm2/project/neosmosis/weilongxuan-253108120168/verl_data/checkpoints/${project_name}/${experiment_name}" \
+    trainer.rollout_data_dir="/inspire/qb-ilm2/project/neosmosis/weilongxuan-253108120168/verl_data/rollout_data/${project_name}/${experiment_name}" \
+    trainer.validation_data_dir="/inspire/qb-ilm2/project/neosmosis/weilongxuan-253108120168/verl_data/validation_data/${project_name}/${experiment_name}" \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=False\
     $@ 2>&1 | tee -a "${LOG_FILE}"
