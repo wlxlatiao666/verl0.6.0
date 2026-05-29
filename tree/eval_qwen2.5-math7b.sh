@@ -63,7 +63,7 @@ VAL_FILES="['${MATH500_FILE}','${AMC_FILE}','${OLYMPIAD_FILE}']"
 # Default checkpoint root matches verl's default:
 #   checkpoints/<project_name>/<experiment_name>/global_step_N/actor/...
 PROJECT_NAME=${PROJECT_NAME:-"verl_grpo_tree_latest"}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-"qwen2.5_math7b_grpo_new"}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-"qwen2.5_math7b_tree_pr_ln_waad"}
 CHECKPOINT_DIR=${CHECKPOINT_DIR:-"/inspire/qb-ilm2/project/neosmosis/weilongxuan-253108120168/verl_data/checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}"}
 
 # Build the list of global_step_* directories to evaluate.
@@ -224,7 +224,7 @@ for CKPT in "${CKPT_PATHS[@]}"; do
       +reward_model.reward_kwargs.max_resp_len=4096 \
       algorithm.use_kl_in_reward=False \
       trainer.critic_warmup=0 \
-      trainer.logger='["console","wandb","tensorboard"]' \
+      trainer.logger='["console","tensorboard"]' \
       trainer.project_name="${PROJECT_NAME}" \
       trainer.experiment_name="${EVAL_EXPERIMENT_NAME}" \
       trainer.n_gpus_per_node=4 \

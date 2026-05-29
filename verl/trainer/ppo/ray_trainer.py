@@ -327,6 +327,11 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw") 
     # Each leaf's response is the concatenation of its path segments in order.
     # We fill token positions with the advantage of the segment they belong to.
     # Segments shared across leaves use the same pre-computed advantage (no duplication).
+    seg_leaf_count = np.zeros(n_unique, dtype=np.int64)
+    for path in leaf_segment_indices:
+        for seg_idx in path:
+            seg_leaf_count[seg_idx] += 1
+            
     total_response_tokens = int(response_mask.sum().item())
     mean_seg_len = total_response_tokens / max(n_unique, 1)
     token_advantages = torch.zeros(n_leaves, resp_len, dtype=torch.float32, device=device)
@@ -336,8 +341,10 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw") 
             seg_len = len(unique_segments[seg_idx])
             end = min(pos + seg_len, resp_len)
             valid_seg_len = max(end - pos, 1)
+            leaf_share = max(int(seg_leaf_count[seg_idx]), 1)
+            print(f"proc_agg_mode: {proc_agg_mode}")
             if proc_agg_mode == "raw":
-                token_advantages[j, pos:end] = seg_advantages[seg_idx]
+                token_advantages[j, pos:end] = seg_advantages[seg_idx] / leaf_share
             elif proc_agg_mode == "length_balanced":
                 token_advantages[j, pos:end] = seg_advantages[seg_idx] / valid_seg_len  * mean_seg_len
             pos += seg_len

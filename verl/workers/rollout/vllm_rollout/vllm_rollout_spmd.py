@@ -475,6 +475,7 @@ class vLLMRollout(BaseRollout):
                             path_nodes: list[tuple[int, list[int]]] = []
                             current = sample
                             while current is not None:
+                                print(f"segment length: {len(current.tree_ids)}, segment depth: {current.tree_depth}")
                                 path_nodes.append((current.seq_id, current.tree_ids))
                                 if current.parent_seq_id is not None and current.parent_seq_id in seq_map:
                                     current = seq_map[current.parent_seq_id]
