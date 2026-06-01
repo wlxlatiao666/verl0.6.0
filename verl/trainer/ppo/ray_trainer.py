@@ -267,8 +267,9 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw") 
         non-leaf score = mean(children scores)
         leaf score = sum of token_level_rewards for that leaf
 
-    Step 2 — GRPO-style normalisation across all unique segments (equal weight per segment):
-        adv(s) = (score(s) - mean_s(score)) / (std_s(score) + eps)
+    Step 2 — Parent-relative normalisation per sibling group:
+        adv(s) = (score(s) - score(parent(s))) / (std(siblings) + eps)
+        Root nodes (no parent) get advantage = 0.
 
     Step 3 — Assemble token-level advantages per leaf sequence:
         Each leaf's response tokens are filled with the advantage of the segment
@@ -318,10 +319,24 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw") 
     has_children = children_count > 0
     node_scores[has_children] = children_sum[has_children] / children_count[has_children]
 
-    # ── Step 2: GRPO-style normalisation (equal weight per unique segment) ──────
-    seg_mean = node_scores.mean()
-    seg_std = node_scores.std()
-    seg_advantages = (node_scores - seg_mean) / (seg_std + 1e-6)  # (n_unique,)
+    # ── Step 2: parent-relative normalisation ────────────────────────────────
+    # adv(s) = (score(s) - score(parent(s))) / std(siblings + eps)
+    # root nodes (no parent) get advantage = 0
+    seg_advantages = torch.zeros(n_unique, dtype=torch.float32, device=device)
+
+    # group children by parent to compute sibling std
+    children_of: dict[int, list[int]] = defaultdict(list)
+    for i in range(n_unique):
+        p = int(parent_of[i])
+        if p >= 0:
+            children_of[p].append(i)
+
+    for p, children in children_of.items():
+        children_t = torch.tensor(children, dtype=torch.long, device=device)
+        sibling_scores = node_scores[children_t]
+        sib_std = sibling_scores.std() if len(children) > 1 else torch.tensor(0.0, device=device)
+        parent_score = node_scores[p]
+        seg_advantages[children_t] = (sibling_scores - parent_score) / (sib_std + 1e-6)
 
     # ── Step 3: assemble token-level advantages per leaf ─────────────────────
     # Each leaf's response is the concatenation of its path segments in order.
