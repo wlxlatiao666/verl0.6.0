@@ -60,8 +60,8 @@ python3 -m verl.trainer.main_ppo \
     data.train_files="$TRAIN_FILE" \
     data.val_files="$TEST_FILE" \
     data.train_batch_size=96 \
-    data.max_prompt_length=4096 \
-    data.max_response_length=4096 \
+    data.max_prompt_length=2048 \
+    data.max_response_length=2048 \
     data.filter_overlong_prompts=False \
     data.truncation='right' \
     actor_rollout_ref.actor.clip_ratio_low=0.2 \
@@ -91,11 +91,6 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     reward_model.reward_manager=naive \
-    +reward_model.reward_kwargs.overlong_buffer_cfg.enable=True \
-    +reward_model.reward_kwargs.overlong_buffer_cfg.len=512 \
-    +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=1.0 \
-    +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
-    +reward_model.reward_kwargs.max_resp_len=4096 \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb","tensorboard"]' \

@@ -9,6 +9,7 @@ export VERL_DEBUG_LOG_PATH=/inspire/hdd/global_user/weilongxuan-253108120168
 export NCCL_SHM_DISABLE=1
 export NCCL_DEBUG=INFO
 HOME=/inspire/hdd/global_user/weilongxuan-253108120168
+verl_dir=/inspire/hdd/global_user/weilongxuan-253108120168/verl_data
 project_name=verl_grpo_tree_sr
 experiment_name=qwen2.5_math7b_treerollout
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl0.6.0"}
@@ -60,8 +61,8 @@ python3 -m verl.trainer.main_ppo \
     data.train_files="$TRAIN_FILE" \
     data.val_files="$TEST_FILE" \
     data.train_batch_size=96 \
-    data.max_prompt_length=4096 \
-    data.max_response_length=4096 \
+    data.max_prompt_length=2048 \
+    data.max_response_length=2048 \
     data.filter_overlong_prompts=False \
     data.truncation='right' \
     actor_rollout_ref.actor.clip_ratio_low=0.2 \
@@ -94,11 +95,6 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     reward_model.reward_manager=naive \
-    +reward_model.reward_kwargs.overlong_buffer_cfg.enable=True \
-    +reward_model.reward_kwargs.overlong_buffer_cfg.len=512 \
-    +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=1.0 \
-    +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
-    +reward_model.reward_kwargs.max_resp_len=4096 \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb","tensorboard"]' \
@@ -109,9 +105,9 @@ python3 -m verl.trainer.main_ppo \
     trainer.save_freq=20 \
     trainer.test_freq=2 \
     trainer.total_epochs=1 \
-    trainer.default_local_dir="/inspire/qb-ilm2/project/neosmosis/weilongxuan-253108120168/verl_data/checkpoints/${project_name}/${experiment_name}" \
-    trainer.rollout_data_dir="/inspire/qb-ilm2/project/neosmosis/weilongxuan-253108120168/verl_data/rollout_data/${project_name}/${experiment_name}" \
-    trainer.validation_data_dir="/inspire/qb-ilm2/project/neosmosis/weilongxuan-253108120168/verl_data/validation_data/${project_name}/${experiment_name}" \
+    trainer.default_local_dir="${verl_dir}/checkpoints/${project_name}/${experiment_name}" \
+    trainer.rollout_data_dir="${verl_dir}/rollout_data/${project_name}/${experiment_name}" \
+    trainer.validation_data_dir="${verl_dir}/validation_data/${project_name}/${experiment_name}" \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=False\
     $@ 2>&1 | tee -a "${LOG_FILE}"
