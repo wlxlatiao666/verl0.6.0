@@ -449,6 +449,14 @@ class DataParallelPPOActor(BasePPOActor):
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
 
                     # Compute policy loss (all functions return 4 values)
+                    extra_loss_kwargs = {}
+                    if loss_mode == "tree_segment":
+                        extra_loss_kwargs["unique_segments"] = model_inputs.get(
+                            "unique_segments",
+                            micro_batch.meta_info.get("metrics", {}).get("unique_segments"),
+                        )
+                        extra_loss_kwargs["leaf_segment_indices"] = model_inputs.get("leaf_segment_indices")
+                        print(f"unique_segments: {extra_loss_kwargs['unique_segments']}, leaf_segment_indices: {extra_loss_kwargs['leaf_segment_indices']}")
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,
@@ -457,6 +465,7 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_agg_mode=loss_agg_mode,
                         config=self.config,
                         rollout_is_weights=rollout_is_weights,
+                        **extra_loss_kwargs,
                     )
 
                     if entropy_coeff != 0:
