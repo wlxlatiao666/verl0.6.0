@@ -1374,6 +1374,10 @@ def compute_policy_loss_tree_segment(
     device = log_prob.device
     resp_len = log_prob.shape[1]
 
+    print(f"[tree_segment] INPUT shapes: old_log_prob={old_log_prob.shape}, log_prob={log_prob.shape}, "
+          f"advantages={advantages.shape}, response_mask={response_mask.shape}")
+    print(f"[tree_segment] n_leaves={log_prob.shape[0]}, resp_len={resp_len}, n_unique_segments={n_unique}")
+
     # For each unique segment, find the first leaf that contains it and the token offset
     # within that leaf's response where the segment starts.
     seg_canonical: list[tuple[int, int]] = [(-1, -1)] * n_unique  # (leaf_j, token_offset)
@@ -1388,6 +1392,9 @@ def compute_policy_loss_tree_segment(
 
     seg_lens = [len(unique_segments[i]) for i in range(n_unique)]
     max_seg_len = max(seg_lens)
+
+    print(f"[tree_segment] seg_lens: min={min(seg_lens)}, max={max_seg_len}, mean={sum(seg_lens)/len(seg_lens):.1f}")
+    print(f"[tree_segment] num of segments:{n_unique}")
 
     # Build (n_unique, max_seg_len) tensors by slicing from canonical leaves
     seg_log_prob = torch.zeros(n_unique, max_seg_len, device=device, dtype=log_prob.dtype)
@@ -1406,6 +1413,14 @@ def compute_policy_loss_tree_segment(
         seg_old_log_prob[seg_idx, :actual_len] = old_log_prob[leaf_j, tok_offset:end]
         seg_advantages[seg_idx, :actual_len] = advantages[leaf_j, tok_offset:end]
         seg_mask[seg_idx, :actual_len] = response_mask[leaf_j, tok_offset:end]
+
+    print(f"[tree_segment] REBUILT tensors: seg_log_prob={seg_log_prob.shape}, "
+          f"seg_advantages={seg_advantages.shape}, seg_mask={seg_mask.shape}")
+    print(f"[tree_segment] advantages stats: mean={seg_advantages[seg_mask.bool()].mean():.4f}, "
+          f"std={seg_advantages[seg_mask.bool()].std():.4f}, "
+          f"min={seg_advantages[seg_mask.bool()].min():.4f}, "
+          f"max={seg_advantages[seg_mask.bool()].max():.4f}")
+    print(f"[tree_segment] seg_mask active tokens: {seg_mask.sum().item()} / {seg_mask.numel()}")
 
     # Standard vanilla PPO loss on segment-level tensors
     negative_approx_kl = seg_log_prob - seg_old_log_prob
@@ -1444,6 +1459,9 @@ def compute_policy_loss_tree_segment(
         pg_losses = pg_losses * seg_is_weights
 
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=seg_mask, loss_agg_mode=loss_agg_mode)
+
+    print(f"[tree_segment] OUTPUT: pg_loss={pg_loss.item():.6f}, pg_clipfrac={pg_clipfrac.item():.4f}, "
+          f"ppo_kl={ppo_kl.item():.6f}, pg_clipfrac_lower={pg_clipfrac_lower.item():.4f}")
 
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 

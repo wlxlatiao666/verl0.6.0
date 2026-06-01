@@ -451,6 +451,7 @@ class DataParallelPPOActor(BasePPOActor):
                     # Compute policy loss (all functions return 4 values)
                     extra_loss_kwargs = {}
                     if loss_mode == "tree_segment":
+                        print(f"loss_mode is tree_segment, trying to get unique_segments and leaf_segment_indices from model_inputs and meta_info")
                         extra_loss_kwargs["unique_segments"] = model_inputs.get(
                             "unique_segments",
                             micro_batch.meta_info.get("metrics", {}).get("unique_segments"),
