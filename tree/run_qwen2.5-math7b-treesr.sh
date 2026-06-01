@@ -9,8 +9,8 @@ export VERL_DEBUG_LOG_PATH=/inspire/hdd/global_user/weilongxuan-253108120168
 export NCCL_SHM_DISABLE=1
 export NCCL_DEBUG=INFO
 HOME=/inspire/hdd/global_user/weilongxuan-253108120168
-project_name=verl_grpo_tree_latest
-experiment_name=qwen2.5_math7b_grpo_new
+project_name=verl_grpo_tree_sr
+experiment_name=qwen2.5_math7b_treesr
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl0.6.0"}
 
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
