@@ -379,7 +379,16 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("rollout_is_weights")
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
-        non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+        has_leaf_segments = "leaf_segment_indices" in data.non_tensor_batch
+
+        if has_multi_modal_inputs or has_leaf_segments:
+            non_tensor_select_keys = []
+            if has_multi_modal_inputs:
+                non_tensor_select_keys.append("multi_modal_inputs")
+            if has_leaf_segments:
+                non_tensor_select_keys.append("leaf_segment_indices")
+        else:
+            non_tensor_select_keys = None
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
@@ -451,13 +460,13 @@ class DataParallelPPOActor(BasePPOActor):
                     # Compute policy loss (all functions return 4 values)
                     extra_loss_kwargs = {}
                     if loss_mode == "tree_segment":
-                        print(f"loss_mode is tree_segment, trying to get unique_segments and leaf_segment_indices from model_inputs and meta_info")
+                        print(f"[tree_segment] meta_info keys: {list(micro_batch.meta_info.keys())}, metrics keys: {list(micro_batch.meta_info.get('metrics', {}).keys())}, non_tensor_batch keys: {list(micro_batch.non_tensor_batch.keys())}")
                         extra_loss_kwargs["unique_segments"] = model_inputs.get(
                             "unique_segments",
                             micro_batch.meta_info.get("metrics", {}).get("unique_segments"),
                         )
                         extra_loss_kwargs["leaf_segment_indices"] = model_inputs.get("leaf_segment_indices")
-                        print(f"unique_segments: {extra_loss_kwargs['unique_segments']}, leaf_segment_indices: {extra_loss_kwargs['leaf_segment_indices']}")
+                        print(f"[tree_segment] unique_segments: {type(extra_loss_kwargs['unique_segments'])}, len={len(extra_loss_kwargs['unique_segments']) if extra_loss_kwargs['unique_segments'] is not None else None}; leaf_segment_indices: {type(extra_loss_kwargs['leaf_segment_indices'])}, len={len(extra_loss_kwargs['leaf_segment_indices']) if extra_loss_kwargs['leaf_segment_indices'] is not None else None}")
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,
