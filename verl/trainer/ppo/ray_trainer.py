@@ -286,7 +286,8 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw") 
     # ── Step 1: back-propagate leaf scores to all nodes ──────────────────────
     leaf_scores = data.batch["token_level_rewards"].sum(dim=-1).float()  # (n_leaves,)
 
-    unique_segments = data.meta_info["metrics"]["unique_segments"]       # (n_unique,) of lists
+    unique_segments = data.meta_info["metrics"]["unique_segments"]  
+    print(f"[process advantage] unique_segments: {unique_segments}")     # (n_unique,) of lists
     leaf_segment_indices = data.non_tensor_batch["leaf_segment_indices"]  # (n_leaves,) of lists
 
     n_unique = len(unique_segments)
@@ -1203,6 +1204,12 @@ class RayPPOTrainer:
                                     metrics[k] = sum(v)  # sum across workers
                                 else:
                                     metrics[k] = sum(v) / len(v)  # average
+                            # Preserve unique_segments/unique_segment_seq_ids for tree_segment loss;
+                            # they are not scalar metrics but are needed downstream by the actor.
+                            _segment_keys = ("unique_segments", "unique_segment_seq_ids")
+                            _preserved = {k: _agg_metrics[k] for k in _segment_keys if k in _agg_metrics}
+                            if _preserved:
+                                gen_batch_output.meta_info["metrics"] = _preserved
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
