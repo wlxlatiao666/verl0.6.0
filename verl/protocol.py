@@ -936,11 +936,25 @@ class DataProto:
             batch_lst.append(batch.batch)
         new_batch = torch.cat(batch_lst, dim=0) if batch_lst[0] is not None else None
 
+        # Before concatenating non_tensor_batch, fix up leaf_segment_indices so that
+        # per-worker local indices into unique_segments become global indices.
+        # Each worker's leaf_segment_indices references its own unique_segments starting at 0;
+        # after concat the global unique_segments is the concatenation of all workers' arrays,
+        # so worker i's indices must be shifted by the cumulative length of workers 0..i-1.
+        offset = 0
+        for d in data:
+            seg_arr = d.meta_info.get("metrics", {}).get("unique_segments")
+            lsi = d.non_tensor_batch.get("leaf_segment_indices")
+            if seg_arr is not None and lsi is not None and offset > 0:
+                shifted = np.empty(len(lsi), dtype=object)
+                for i, path in enumerate(lsi):
+                    shifted[i] = [idx + offset for idx in path]
+                d.non_tensor_batch["leaf_segment_indices"] = shifted
+            if seg_arr is not None:
+                offset += len(seg_arr)
+
         non_tensor_batch = list_of_dict_to_dict_of_list(list_of_dict=[d.non_tensor_batch for d in data])
-        # print("non_tensor_batch:", non_tensor_batch)
         for key, val in non_tensor_batch.items():
-            # print('key:', key)
-            # print('val:', val)
             non_tensor_batch[key] = np.concatenate(val, axis=0)
 
         # Merge meta_info with special handling for metrics

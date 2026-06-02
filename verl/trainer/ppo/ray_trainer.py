@@ -1206,8 +1206,18 @@ class RayPPOTrainer:
                                     metrics[k] = sum(v) / len(v)  # average
                             # Preserve unique_segments/unique_segment_seq_ids for tree_segment loss;
                             # they are not scalar metrics but are needed downstream by the actor.
+                            # After DataProto.concat, list_of_dict_to_dict_of_list wraps each value in
+                            # a list (one entry per worker), so concatenate them into a single array.
                             _segment_keys = ("unique_segments", "unique_segment_seq_ids")
-                            _preserved = {k: _agg_metrics[k] for k in _segment_keys if k in _agg_metrics}
+                            _preserved = {}
+                            for k in _segment_keys:
+                                if k not in _agg_metrics:
+                                    continue
+                                v = _agg_metrics[k]
+                                if isinstance(v, list):
+                                    _preserved[k] = np.concatenate(v, axis=0)
+                                else:
+                                    _preserved[k] = v
                             if _preserved:
                                 gen_batch_output.meta_info["metrics"] = _preserved
 
