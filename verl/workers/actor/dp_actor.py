@@ -379,18 +379,13 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("rollout_is_weights")
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
-        has_leaf_segments = "leaf_segment_indices" in data.non_tensor_batch
+        non_tensor_select_keys = []
+        if has_multi_modal_inputs:
+            non_tensor_select_keys.append("multi_modal_inputs")
+        if "leaf_segment_indices" in data.non_tensor_batch:
+            non_tensor_select_keys.append("leaf_segment_indices")
 
-        if has_multi_modal_inputs or has_leaf_segments:
-            non_tensor_select_keys = []
-            if has_multi_modal_inputs:
-                non_tensor_select_keys.append("multi_modal_inputs")
-            if has_leaf_segments:
-                non_tensor_select_keys.append("leaf_segment_indices")
-        else:
-            non_tensor_select_keys = None
-
-        data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
+        data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys if non_tensor_select_keys else None)
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
