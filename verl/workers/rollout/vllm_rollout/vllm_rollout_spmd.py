@@ -574,7 +574,7 @@ class vLLMRollout(BaseRollout):
             n_prompts = max(len(outputs), 1)
             _tree_branch_pts = _tree_total - _tree_leaves
             avg_leaves = _tree_leaves / n_prompts
-            _tree_metrics = {
+            _tree_metrics.update({
                 # -- Structure: how large/deep is the tree? --
                 "tree/total_nodes": _tree_total,
                 "tree/leaf_nodes": _tree_leaves,
@@ -592,7 +592,7 @@ class vLLMRollout(BaseRollout):
                 "tree/max_leaf_resp_len": max(_leaf_resp_lens) if _leaf_resp_lens else 0,
                 # -- Expansion ratio (useful for batch size planning) --
                 "tree/expansion_ratio": round(avg_leaves, 2),  # how many times batch grows
-            }
+            })
 
             response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(
                 idx.device
