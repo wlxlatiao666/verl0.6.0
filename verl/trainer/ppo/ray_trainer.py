@@ -287,7 +287,7 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw") 
     leaf_scores = data.batch["token_level_rewards"].sum(dim=-1).float()  # (n_leaves,)
 
     unique_segments = data.meta_info["metrics"]["unique_segments"]  
-    print(f"[process advantage] unique_segments: {unique_segments}")     # (n_unique,) of lists
+    # print(f"[process advantage] unique_segments: {unique_segments}")     # (n_unique,) of lists
     leaf_segment_indices = data.non_tensor_batch["leaf_segment_indices"]  # (n_leaves,) of lists
 
     n_unique = len(unique_segments)
