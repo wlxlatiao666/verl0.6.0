@@ -10,15 +10,16 @@ export RAY_DEDUP_LOGS=0
 export NCCL_SHM_DISABLE=1
 export NCCL_DEBUG=INFO
 HOME=/inspire/hdd/global_user/weilongxuan-253108120168
+verl_dir=/inspire/qb-ilm2/project/neosmosis/weilongxuan-253108120168/verl_data
 project_name=verl_grpo_tree_latest
-experiment_name=qwen2.5_math7b_tree_rollout_waad
+experiment_name=qwen2.5_math7b_treesr_new
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl0.6.0"}
 
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
 TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
 
 # Real-time log file: each line is written immediately; data is not lost if the job is killed
-LOG_DIR="${HOME}/logs"
+LOG_DIR="${HOME}/verl_logs"
 mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/train_$(date +%Y%m%d_%H%M%S).log"
 
@@ -79,6 +80,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+    actor_rollout_ref.actor.policy_loss.loss_mode=tree_segment \
+    actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
@@ -90,7 +93,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.tree_search.branching_factor=2 \
     actor_rollout_ref.rollout.tree_search.max_tree_depth=3 \
     actor_rollout_ref.rollout.tree_search.tau_importance=0.0 \
-    actor_rollout_ref.rollout.tree_search.tree_process_reward=False \
+    actor_rollout_ref.rollout.tree_search.tree_process_reward=True \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     reward_model.reward_manager=dapo \
@@ -110,8 +113,9 @@ python3 -m verl.trainer.main_ppo \
     trainer.save_freq=20 \
     trainer.test_freq=2 \
     trainer.total_epochs=1 \
-    trainer.rollout_data_dir="${HOME}/rollout_data/${project_name}/${experiment_name}" \
-    trainer.validation_data_dir="${HOME}/validation_data/${project_name}/${experiment_name}" \
+    trainer.default_local_dir="${verl_dir}/checkpoints/${project_name}/${experiment_name}" \
+    trainer.rollout_data_dir="${verl_dir}/rollout_data/${project_name}/${experiment_name}" \
+    trainer.validation_data_dir="${verl_dir}/validation_data/${project_name}/${experiment_name}" \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=False\
     $@ 2>&1 | tee -a "${LOG_FILE}"
