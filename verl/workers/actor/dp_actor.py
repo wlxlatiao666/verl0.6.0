@@ -412,14 +412,16 @@ class DataParallelPPOActor(BasePPOActor):
                     unique_segments = mini_batch.meta_info.get("metrics", {}).get("unique_segments")
                     leaf_segment_indices = mini_batch.non_tensor_batch.get("leaf_segment_indices")
                     if unique_segments is not None and leaf_segment_indices is not None:
+                        # Unpack TensorDict to plain dict so .get() works safely
+                        mini_batch_inputs = {**mini_batch.batch, **mini_batch.non_tensor_batch}
                         _, seg_old_log_prob, seg_advantages, seg_response_mask, seg_canonical, seg_lens, seg_rollout_is = build_segment_tensors(
                             log_prob=None,
-                            old_log_prob=mini_batch.batch["old_log_probs"],
-                            advantages=mini_batch.batch["advantages"],
-                            response_mask=mini_batch.batch["response_mask"],
+                            old_log_prob=mini_batch_inputs["old_log_probs"],
+                            advantages=mini_batch_inputs["advantages"],
+                            response_mask=mini_batch_inputs["response_mask"],
                             unique_segments=unique_segments,
                             leaf_segment_indices=leaf_segment_indices,
-                            rollout_is_weights=mini_batch.batch.get("rollout_is_weights"),
+                            rollout_is_weights=mini_batch_inputs.get("rollout_is_weights"),
                         )
                         mini_batch.meta_info["tree_seg_targets"] = {
                             "old_log_prob": seg_old_log_prob,
@@ -508,7 +510,9 @@ class DataParallelPPOActor(BasePPOActor):
                                 else:
                                     leaf_inverse_map = {leaf_j: leaf_j - start for leaf_j in present_leaves}
 
-                                max_seg_len = max(seg_lens[i] for i in seg_indices)
+                                # Use the pre-computed global max_seg_len so shapes align with
+                                # tree_seg_targets tensors (old_log_prob / advantages / mask).
+                                max_seg_len = tree_seg_targets["old_log_prob"].shape[1]
                                 seg_log_prob_local = torch.zeros(len(seg_indices), max_seg_len, device=log_prob.device, dtype=log_prob.dtype)
 
                                 for local_i, seg_idx in enumerate(seg_indices):
