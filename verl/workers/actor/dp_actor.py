@@ -526,13 +526,13 @@ class DataParallelPPOActor(BasePPOActor):
                                 if on_policy:
                                     seg_old_log_prob_local = seg_log_prob_local.detach()
                                 else:
-                                    seg_old_log_prob_local = tree_seg_targets["old_log_prob"][seg_indices]
+                                    seg_old_log_prob_local = tree_seg_targets["old_log_prob"][seg_indices].to(log_prob.device)
 
-                                seg_advantages_local = tree_seg_targets["advantages"][seg_indices]
-                                seg_response_mask_local = tree_seg_targets["response_mask"][seg_indices]
+                                seg_advantages_local = tree_seg_targets["advantages"][seg_indices].to(log_prob.device)
+                                seg_response_mask_local = tree_seg_targets["response_mask"][seg_indices].to(log_prob.device)
                                 seg_rollout_is_weights_local = tree_seg_targets["rollout_is_weights"]
                                 if seg_rollout_is_weights_local is not None:
-                                    seg_rollout_is_weights_local = seg_rollout_is_weights_local[seg_indices]
+                                    seg_rollout_is_weights_local = seg_rollout_is_weights_local[seg_indices].to(log_prob.device)
 
                                 pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
                                     old_log_prob=seg_old_log_prob_local,

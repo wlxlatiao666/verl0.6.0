@@ -1365,7 +1365,7 @@ def build_segment_tensors(
     device = old_log_prob.device
     resp_len = old_log_prob.shape[1]
 
-    print(f"[tree_segment] log_prob shape: {log_prob.shape if log_prob is not None else None}")
+    print(f"[tree_segment] old_log_prob shape: {old_log_prob.shape if old_log_prob is not None else None}")
     print(f"[tree_segment] Building segment-level tensors for {n_unique} unique segments.")
 
     # For each unique segment, find the first leaf that contains it and the token offset
