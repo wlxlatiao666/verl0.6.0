@@ -358,7 +358,7 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw") 
             end = min(pos + seg_len, resp_len)
             valid_seg_len = max(end - pos, 1)
             leaf_share = max(int(seg_leaf_count[seg_idx]), 1)
-            print(f"proc_agg_mode: {proc_agg_mode}")
+            # print(f"proc_agg_mode: {proc_agg_mode}")
             if proc_agg_mode == "raw":
                 token_advantages[j, pos:end] = seg_advantages[seg_idx] / leaf_share
             elif proc_agg_mode == "length_balanced":
@@ -1172,6 +1172,8 @@ class RayPPOTrainer:
                                 _entropy_p80 = stats_output.meta_info.get("entropy_p80", 1.0)
                                 _importance_p80 = stats_output.meta_info.get("importance_p80", None)
                         self.actor_rollout_wg.update_entropy_threshold(_entropy_p80)
+                        print("entropy_threshold:", _entropy_p80)
+                        print("importance_threshold:", _importance_p80)
                         metrics["tree/entropy_threshold"] = _entropy_p80
                         if _importance_p80 is not None:
                             self.actor_rollout_wg.update_tau_importance(_importance_p80)

@@ -34,6 +34,7 @@ import os
 import pickle
 import socket
 import time
+import math
 from contextlib import contextmanager
 from dataclasses import asdict
 from types import MethodType
@@ -307,7 +308,9 @@ class vLLMRollout(BaseRollout):
         all_importance: list[float] = []
         for output in outputs:
             for completion in output.outputs:
-                all_entropy.extend(completion.entropy_list)
+                # Filter out nan values that can arise from numerical instability
+                # (e.g. 0.0 * (-inf) in entropy computation) before computing percentile.
+                all_entropy.extend(v for v in completion.entropy_list if not math.isnan(v))
                 all_importance.extend(v for v in completion.importance_list if v is not None)
 
         entropy_p80: float = float(np.percentile(all_entropy, 80)) if all_entropy else 1.0

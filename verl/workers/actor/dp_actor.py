@@ -455,14 +455,14 @@ class DataParallelPPOActor(BasePPOActor):
                     # Compute policy loss (all functions return 4 values)
                     extra_loss_kwargs = {}
                     if loss_mode == "tree_segment":
-                        print(f"[tree_segment] meta_info keys: {list(micro_batch.meta_info.keys())}, metrics keys: {list(micro_batch.meta_info.get('metrics', {}).keys())}, non_tensor_batch keys: {list(micro_batch.non_tensor_batch.keys())}")
+                        # print(f"[tree_segment] meta_info keys: {list(micro_batch.meta_info.keys())}, metrics keys: {list(micro_batch.meta_info.get('metrics', {}).keys())}, non_tensor_batch keys: {list(micro_batch.non_tensor_batch.keys())}")
                         extra_loss_kwargs["unique_segments"] = model_inputs.get(
                             "unique_segments",
                             micro_batch.meta_info.get("metrics", {}).get("unique_segments"),
                         )
                         extra_loss_kwargs["leaf_segment_indices"] = model_inputs.get("leaf_segment_indices")
-                        print(f"[tree_segment] unique_segments: {extra_loss_kwargs['unique_segments']}, leaf_segment_indices: {extra_loss_kwargs['leaf_segment_indices']}")
-                        print(f"[tree_segment] unique_segments: {type(extra_loss_kwargs['unique_segments'])}, len={len(extra_loss_kwargs['unique_segments']) if extra_loss_kwargs['unique_segments'] is not None else None}; leaf_segment_indices: {type(extra_loss_kwargs['leaf_segment_indices'])}, len={len(extra_loss_kwargs['leaf_segment_indices']) if extra_loss_kwargs['leaf_segment_indices'] is not None else None}")
+                        # print(f"[tree_segment] unique_segments: {extra_loss_kwargs['unique_segments']}, leaf_segment_indices: {extra_loss_kwargs['leaf_segment_indices']}")
+                        # print(f"[tree_segment] unique_segments: {type(extra_loss_kwargs['unique_segments'])}, len={len(extra_loss_kwargs['unique_segments']) if extra_loss_kwargs['unique_segments'] is not None else None}; leaf_segment_indices: {type(extra_loss_kwargs['leaf_segment_indices'])}, len={len(extra_loss_kwargs['leaf_segment_indices']) if extra_loss_kwargs['leaf_segment_indices'] is not None else None}")
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,
