@@ -27,7 +27,7 @@ from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import agg_loss, build_segment_tensors, get_policy_loss_fn, kl_penalty
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -398,16 +398,41 @@ class DataParallelPPOActor(BasePPOActor):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                    micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
+                    micro_batches, batch_idx_list = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
                 else:
                     self.gradient_accumulation = (
                         self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
                     )
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+                    batch_idx_list = None
+
+                # Pre-compute global segment-level targets for tree_segment loss
+                loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+                if loss_mode == "tree_segment":
+                    unique_segments = mini_batch.meta_info.get("metrics", {}).get("unique_segments")
+                    leaf_segment_indices = mini_batch.non_tensor_batch.get("leaf_segment_indices")
+                    if unique_segments is not None and leaf_segment_indices is not None:
+                        _, seg_old_log_prob, seg_advantages, seg_response_mask, seg_canonical, seg_lens, seg_rollout_is = build_segment_tensors(
+                            log_prob=None,
+                            old_log_prob=mini_batch.batch["old_log_probs"],
+                            advantages=mini_batch.batch["advantages"],
+                            response_mask=mini_batch.batch["response_mask"],
+                            unique_segments=unique_segments,
+                            leaf_segment_indices=leaf_segment_indices,
+                            rollout_is_weights=mini_batch.batch.get("rollout_is_weights"),
+                        )
+                        mini_batch.meta_info["tree_seg_targets"] = {
+                            "old_log_prob": seg_old_log_prob,
+                            "advantages": seg_advantages,
+                            "response_mask": seg_response_mask,
+                            "seg_canonical": seg_canonical,
+                            "seg_lens": seg_lens,
+                            "rollout_is_weights": seg_rollout_is,
+                        }
 
                 self.actor_optimizer.zero_grad()
 
-                for micro_batch in micro_batches:
+                for m, micro_batch in enumerate(micro_batches):
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
@@ -453,26 +478,88 @@ class DataParallelPPOActor(BasePPOActor):
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
 
                     # Compute policy loss (all functions return 4 values)
-                    extra_loss_kwargs = {}
                     if loss_mode == "tree_segment":
-                        # print(f"[tree_segment] meta_info keys: {list(micro_batch.meta_info.keys())}, metrics keys: {list(micro_batch.meta_info.get('metrics', {}).keys())}, non_tensor_batch keys: {list(micro_batch.non_tensor_batch.keys())}")
-                        extra_loss_kwargs["unique_segments"] = model_inputs.get(
-                            "unique_segments",
-                            micro_batch.meta_info.get("metrics", {}).get("unique_segments"),
+                        tree_seg_targets = micro_batch.meta_info.get("tree_seg_targets")
+                        if tree_seg_targets is not None:
+                            seg_canonical = tree_seg_targets["seg_canonical"]
+                            seg_lens = tree_seg_targets["seg_lens"]
+
+                            # Determine which leaves are present in this micro-batch
+                            if self.config.use_dynamic_bsz:
+                                present_leaves = set(batch_idx_list[m])
+                            else:
+                                start = m * self.config.ppo_micro_batch_size_per_gpu
+                                end = start + len(micro_batch)
+                                present_leaves = set(range(start, end))
+
+                            # Select segments whose canonical leaf is in this micro-batch.
+                            # This guarantees each segment is updated exactly once.
+                            seg_indices = [i for i, (leaf_j, _) in enumerate(seg_canonical) if leaf_j in present_leaves]
+
+                            if len(seg_indices) == 0:
+                                pg_loss = torch.tensor(0.0, device=log_prob.device)
+                                pg_clipfrac = torch.tensor(0.0, device=log_prob.device)
+                                ppo_kl = torch.tensor(0.0, device=log_prob.device)
+                                pg_clipfrac_lower = torch.tensor(0.0, device=log_prob.device)
+                            else:
+                                # Build inverse map from global leaf index to local micro-batch index
+                                if self.config.use_dynamic_bsz:
+                                    leaf_inverse_map = {global_idx: local_idx for local_idx, global_idx in enumerate(batch_idx_list[m])}
+                                else:
+                                    leaf_inverse_map = {leaf_j: leaf_j - start for leaf_j in present_leaves}
+
+                                max_seg_len = max(seg_lens[i] for i in seg_indices)
+                                seg_log_prob_local = torch.zeros(len(seg_indices), max_seg_len, device=log_prob.device, dtype=log_prob.dtype)
+
+                                for local_i, seg_idx in enumerate(seg_indices):
+                                    leaf_j, tok_offset = seg_canonical[seg_idx]
+                                    local_leaf_j = leaf_inverse_map[leaf_j]
+                                    seg_len = seg_lens[seg_idx]
+                                    end_tok = min(tok_offset + seg_len, log_prob.shape[1])
+                                    actual_len = end_tok - tok_offset
+                                    seg_log_prob_local[local_i, :actual_len] = log_prob[local_leaf_j, tok_offset:end_tok]
+
+                                if on_policy:
+                                    seg_old_log_prob_local = seg_log_prob_local.detach()
+                                else:
+                                    seg_old_log_prob_local = tree_seg_targets["old_log_prob"][seg_indices]
+
+                                seg_advantages_local = tree_seg_targets["advantages"][seg_indices]
+                                seg_response_mask_local = tree_seg_targets["response_mask"][seg_indices]
+                                seg_rollout_is_weights_local = tree_seg_targets["rollout_is_weights"]
+                                if seg_rollout_is_weights_local is not None:
+                                    seg_rollout_is_weights_local = seg_rollout_is_weights_local[seg_indices]
+
+                                pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                                    old_log_prob=seg_old_log_prob_local,
+                                    log_prob=seg_log_prob_local,
+                                    advantages=seg_advantages_local,
+                                    response_mask=seg_response_mask_local,
+                                    loss_agg_mode=loss_agg_mode,
+                                    config=self.config,
+                                    rollout_is_weights=seg_rollout_is_weights_local,
+                                )
+                        else:
+                            # Fallback if targets not precomputed
+                            pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                                old_log_prob=old_log_prob,
+                                log_prob=log_prob,
+                                advantages=advantages,
+                                response_mask=response_mask,
+                                loss_agg_mode=loss_agg_mode,
+                                config=self.config,
+                                rollout_is_weights=rollout_is_weights,
+                            )
+                    else:
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
                         )
-                        extra_loss_kwargs["leaf_segment_indices"] = model_inputs.get("leaf_segment_indices")
-                        # print(f"[tree_segment] unique_segments: {extra_loss_kwargs['unique_segments']}, leaf_segment_indices: {extra_loss_kwargs['leaf_segment_indices']}")
-                        # print(f"[tree_segment] unique_segments: {type(extra_loss_kwargs['unique_segments'])}, len={len(extra_loss_kwargs['unique_segments']) if extra_loss_kwargs['unique_segments'] is not None else None}; leaf_segment_indices: {type(extra_loss_kwargs['leaf_segment_indices'])}, len={len(extra_loss_kwargs['leaf_segment_indices']) if extra_loss_kwargs['leaf_segment_indices'] is not None else None}")
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        loss_agg_mode=loss_agg_mode,
-                        config=self.config,
-                        rollout_is_weights=rollout_is_weights,
-                        **extra_loss_kwargs,
-                    )
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)

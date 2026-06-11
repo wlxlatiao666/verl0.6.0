@@ -1329,58 +1329,48 @@ def compute_policy_loss_geo_mean(
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 
-@register_policy_loss("tree_segment")  # type: ignore[arg-type]
-def compute_policy_loss_tree_segment(
+def build_segment_tensors(
+    log_prob: torch.Tensor | None,
     old_log_prob: torch.Tensor,
-    log_prob: torch.Tensor,
     advantages: torch.Tensor,
     response_mask: torch.Tensor,
-    loss_agg_mode: str = "token-mean",
-    config: Optional[DictConfig | AlgoConfig] = None,
+    unique_segments: list[list[int]],
+    leaf_segment_indices: list[list[int]],
     rollout_is_weights: torch.Tensor | None = None,
-    unique_segments=None,
-    leaf_segment_indices=None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """PPO policy loss for tree-search decoding with segment-level deduplication.
+) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor, list[tuple[int, int]], list[int], torch.Tensor | None]:
+    """Rebuild leaf-level tensors into segment-level tensors.
 
-    Rebuilds (n_leaves, resp_len) tensors into (n_unique_segments, max_seg_len) by
-    extracting each unique segment's token slice from its canonical leaf, then runs
-    the standard vanilla PPO loss on the rebuilt tensors.
+    For each unique segment, finds the first leaf that contains it (canonical leaf)
+    and extracts the token slice from that leaf.
 
     Args:
+        log_prob: (n_leaves, resp_len) or None
         old_log_prob: (n_leaves, resp_len)
-        log_prob: (n_leaves, resp_len)
-        advantages: (n_leaves, resp_len) — segment advantage broadcast to token level
+        advantages: (n_leaves, resp_len)
         response_mask: (n_leaves, resp_len)
-        unique_segments: list of n_unique lists of token ids (from meta_info)
-        leaf_segment_indices: array of n_leaves lists of segment indices (from non_tensor_batch)
+        unique_segments: list of n_unique lists of token ids
+        leaf_segment_indices: array of n_leaves lists of segment indices
+        rollout_is_weights: (n_leaves, resp_len) or None
+
+    Returns:
+        seg_log_prob: (n_unique, max_seg_len) or None
+        seg_old_log_prob: (n_unique, max_seg_len)
+        seg_advantages: (n_unique, max_seg_len)
+        seg_response_mask: (n_unique, max_seg_len)
+        seg_canonical: list of (leaf_j, token_offset) per segment
+        seg_lens: list of segment lengths
+        seg_rollout_is_weights: (n_unique, max_seg_len) or None
     """
-    assert config is not None
-    assert not isinstance(config, AlgoConfig)
-    assert unique_segments is not None and leaf_segment_indices is not None, (
-        "compute_policy_loss_tree_segment requires unique_segments and leaf_segment_indices"
-    )
-
-    clip_ratio = config.clip_ratio
-    clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
-    clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
-    clip_ratio_c = config.get("clip_ratio_c", 3.0)
-    cliprange = clip_ratio
-    cliprange_low = clip_ratio_low
-    cliprange_high = clip_ratio_high
-    assert clip_ratio_c > 1.0
-
     n_unique = len(unique_segments)
-    device = log_prob.device
-    resp_len = log_prob.shape[1]
+    device = old_log_prob.device
+    resp_len = old_log_prob.shape[1]
 
-    print(f"[tree_segment] INPUT shapes: old_log_prob={old_log_prob.shape}, log_prob={log_prob.shape}, "
-          f"advantages={advantages.shape}, response_mask={response_mask.shape}")
-    print(f"[tree_segment] n_leaves={log_prob.shape[0]}, resp_len={resp_len}, n_unique_segments={n_unique}")
+    print(f"[tree_segment] log_prob shape: {log_prob.shape if log_prob is not None else None}")
+    print(f"[tree_segment] Building segment-level tensors for {n_unique} unique segments.")
 
     # For each unique segment, find the first leaf that contains it and the token offset
     # within that leaf's response where the segment starts.
-    seg_canonical: list[tuple[int, int]] = [(-1, -1)] * n_unique  # (leaf_j, token_offset)
+    seg_canonical: list[tuple[int, int]] = [(-1, -1)] * n_unique
     for j, path in enumerate(leaf_segment_indices):
         offset = 0
         for seg_idx in path:
@@ -1391,16 +1381,17 @@ def compute_policy_loss_tree_segment(
                 break
 
     seg_lens = [len(unique_segments[i]) for i in range(n_unique)]
-    max_seg_len = max(seg_lens)
+    max_seg_len = max(seg_lens) if seg_lens else 0
 
-    print(f"[tree_segment] seg_lens: min={min(seg_lens)}, max={max_seg_len}, mean={sum(seg_lens)/len(seg_lens):.1f}")
-    print(f"[tree_segment] num of segments:{n_unique}")
-
-    # Build (n_unique, max_seg_len) tensors by slicing from canonical leaves
-    seg_log_prob = torch.zeros(n_unique, max_seg_len, device=device, dtype=log_prob.dtype)
+    seg_log_prob = None
+    if log_prob is not None:
+        seg_log_prob = torch.zeros(n_unique, max_seg_len, device=device, dtype=log_prob.dtype)
     seg_old_log_prob = torch.zeros(n_unique, max_seg_len, device=device, dtype=old_log_prob.dtype)
     seg_advantages = torch.zeros(n_unique, max_seg_len, device=device, dtype=advantages.dtype)
     seg_mask = torch.zeros(n_unique, max_seg_len, device=device, dtype=response_mask.dtype)
+    seg_rollout_is = None
+    if rollout_is_weights is not None:
+        seg_rollout_is = torch.zeros(n_unique, max_seg_len, device=device, dtype=rollout_is_weights.dtype)
 
     for seg_idx in range(n_unique):
         leaf_j, tok_offset = seg_canonical[seg_idx]
@@ -1409,59 +1400,72 @@ def compute_policy_loss_tree_segment(
         seg_len = seg_lens[seg_idx]
         end = min(tok_offset + seg_len, resp_len)
         actual_len = end - tok_offset
-        seg_log_prob[seg_idx, :actual_len] = log_prob[leaf_j, tok_offset:end]
+        if seg_log_prob is not None:
+            seg_log_prob[seg_idx, :actual_len] = log_prob[leaf_j, tok_offset:end]
         seg_old_log_prob[seg_idx, :actual_len] = old_log_prob[leaf_j, tok_offset:end]
         seg_advantages[seg_idx, :actual_len] = advantages[leaf_j, tok_offset:end]
         seg_mask[seg_idx, :actual_len] = response_mask[leaf_j, tok_offset:end]
+        if seg_rollout_is is not None:
+            seg_rollout_is[seg_idx, :actual_len] = rollout_is_weights[leaf_j, tok_offset:end]
 
-    print(f"[tree_segment] REBUILT tensors: seg_log_prob={seg_log_prob.shape}, "
-          f"seg_advantages={seg_advantages.shape}, seg_mask={seg_mask.shape}")
-    print(f"[tree_segment] advantages stats: mean={seg_advantages[seg_mask.bool()].mean():.4f}, "
-          f"std={seg_advantages[seg_mask.bool()].std():.4f}, "
-          f"min={seg_advantages[seg_mask.bool()].min():.4f}, "
-          f"max={seg_advantages[seg_mask.bool()].max():.4f}")
-    print(f"[tree_segment] seg_mask active tokens: {seg_mask.sum().item()} / {seg_mask.numel()}")
+    return seg_log_prob, seg_old_log_prob, seg_advantages, seg_mask, seg_canonical, seg_lens, seg_rollout_is
+
+
+@register_policy_loss("tree_segment")  # type: ignore[arg-type]
+def compute_policy_loss_tree_segment(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[DictConfig | AlgoConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """PPO policy loss on pre-built segment-level tensors.
+
+    All inputs are already aligned at segment-level. This function simply runs
+    the standard vanilla PPO loss computation.
+    """
+    assert config is not None
+    assert not isinstance(config, AlgoConfig)
+
+    clip_ratio = config.clip_ratio
+    clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
+    clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
+    clip_ratio_c = config.get("clip_ratio_c", 3.0)
+    cliprange = clip_ratio
+    cliprange_low = clip_ratio_low
+    cliprange_high = clip_ratio_high
+    assert clip_ratio_c > 1.0
 
     # Standard vanilla PPO loss on segment-level tensors
-    negative_approx_kl = seg_log_prob - seg_old_log_prob
+    negative_approx_kl = log_prob - old_log_prob
     negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
     ratio = torch.exp(negative_approx_kl)
-    ppo_kl = verl_F.masked_mean(-negative_approx_kl, seg_mask)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
 
-    pg_losses1 = -seg_advantages * ratio
+    pg_losses1 = -advantages * ratio
     if cliprange_low is None:
         cliprange_low = cliprange
     if cliprange_high is None:
         cliprange_high = cliprange
-    pg_losses2 = -seg_advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)
+    pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)
     clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)
-    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), seg_mask)
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
 
-    pg_losses3 = -seg_advantages * clip_ratio_c
+    pg_losses3 = -advantages * clip_ratio_c
     clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
     pg_clipfrac_lower = verl_F.masked_mean(
-        torch.gt(clip_pg_losses1, pg_losses3) * (seg_advantages < 0).float(), seg_mask
+        torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask
     )
 
-    pg_losses = torch.where(seg_advantages < 0, clip_pg_losses2, clip_pg_losses1)
+    pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
 
     if rollout_is_weights is not None:
-        # rollout_is_weights is (n_leaves, resp_len); slice same as log_prob
-        seg_is_weights = torch.ones(n_unique, max_seg_len, device=device, dtype=rollout_is_weights.dtype)
-        for seg_idx in range(n_unique):
-            leaf_j, tok_offset = seg_canonical[seg_idx]
-            if leaf_j == -1:
-                continue
-            seg_len = seg_lens[seg_idx]
-            end = min(tok_offset + seg_len, resp_len)
-            actual_len = end - tok_offset
-            seg_is_weights[seg_idx, :actual_len] = rollout_is_weights[leaf_j, tok_offset:end]
-        pg_losses = pg_losses * seg_is_weights
+        pg_losses = pg_losses * rollout_is_weights
 
-    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=seg_mask, loss_agg_mode=loss_agg_mode)
-
-    print(f"[tree_segment] OUTPUT: pg_loss={pg_loss.item():.6f}, pg_clipfrac={pg_clipfrac.item():.4f}, "
-          f"ppo_kl={ppo_kl.item():.6f}, pg_clipfrac_lower={pg_clipfrac_lower.item():.4f}")
+    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    print(f"[tree_segment] pg_loss: {pg_loss}, pg_clipfrac: {pg_clipfrac}, ppo_kl: {ppo_kl}, pg_clipfrac_lower: {pg_clipfrac_lower}")
 
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
