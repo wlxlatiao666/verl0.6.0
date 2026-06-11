@@ -1343,6 +1343,11 @@ def build_segment_tensors(
     For each unique segment, finds the first leaf that contains it (canonical leaf)
     and extracts the token slice from that leaf.
 
+    NOTE: For tree_segment loss, we assume that advantages[leaf_j, tok_offset:end]
+    for a segment are ALL THE SAME (they are filled in compute_tree_process_advantage
+    with the same seg_advantages[seg_idx] value). So we just take the first one
+    for each segment, or average them if needed.
+
     Args:
         log_prob: (n_leaves, resp_len) or None
         old_log_prob: (n_leaves, resp_len)
@@ -1366,7 +1371,7 @@ def build_segment_tensors(
     resp_len = old_log_prob.shape[1]
 
     print(f"[tree_segment] old_log_prob shape: {old_log_prob.shape if old_log_prob is not None else None}")
-    print(f"[tree_segment] Building segment-level tensors for {n_unique} unique segments.")
+    print(f"[tree_segment] Building segment-level tensors for {n_unique} unique segments from {len(leaf_segment_indices)} leaves.")
 
     # For each unique segment, find the first leaf that contains it and the token offset
     # within that leaf's response where the segment starts.
@@ -1403,10 +1408,34 @@ def build_segment_tensors(
         if seg_log_prob is not None:
             seg_log_prob[seg_idx, :actual_len] = log_prob[leaf_j, tok_offset:end]
         seg_old_log_prob[seg_idx, :actual_len] = old_log_prob[leaf_j, tok_offset:end]
-        seg_advantages[seg_idx, :actual_len] = advantages[leaf_j, tok_offset:end]
+
+        # For advantages: since all positions in a segment should have the same value,
+        # we take the FIRST valid value and fill the entire segment with it.
+        # This avoids issues with partial/masked positions.
+        if actual_len > 0:
+            # Find the first non-masked position with a valid advantage
+            first_pos = -1
+            for pos in range(tok_offset, end):
+                if response_mask[leaf_j, pos] > 0:
+                    first_pos = pos
+                    break
+            if first_pos >= 0:
+                seg_advantage_val = advantages[leaf_j, first_pos]
+                seg_advantages[seg_idx, :actual_len] = seg_advantage_val
+            else:
+                seg_advantages[seg_idx, :actual_len] = advantages[leaf_j, tok_offset:end]
+        else:
+            seg_advantages[seg_idx, :actual_len] = advantages[leaf_j, tok_offset:end]
+
         seg_mask[seg_idx, :actual_len] = response_mask[leaf_j, tok_offset:end]
         if seg_rollout_is is not None:
             seg_rollout_is[seg_idx, :actual_len] = rollout_is_weights[leaf_j, tok_offset:end]
+
+    # Print stats about advantages to help debug pg_loss magnitude
+    if n_unique > 0:
+        flat_adv = seg_advantages[seg_mask > 0]
+        if len(flat_adv) > 0:
+            print(f"[tree_segment] Segment advantages: min={flat_adv.min():.4f}, max={flat_adv.max():.4f}, mean={flat_adv.mean():.4f}, std={flat_adv.std():.4f}")
 
     return seg_log_prob, seg_old_log_prob, seg_advantages, seg_mask, seg_canonical, seg_lens, seg_rollout_is
 
