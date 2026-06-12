@@ -304,21 +304,40 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw") 
             if depth > 0:
                 parent_of[seg_idx] = path[depth - 1]
 
-    # Assign leaf scores; propagate bottom-up by depth
+    # Assign leaf scores first
     node_scores = torch.zeros(n_unique, dtype=torch.float32, device=device)
     for seg_idx, leaf_j in leaf_seg_to_leaf_idx.items():
         node_scores[seg_idx] = leaf_scores[leaf_j]
 
-    children_sum = torch.zeros(n_unique, dtype=torch.float32, device=device)
-    children_count = torch.zeros(n_unique, dtype=torch.float32, device=device)
-    for i in np.argsort(-seg_depth):  # deepest first
+    # Build children_of map
+    from collections import defaultdict
+    children_of = defaultdict(list)
+    for i in range(n_unique):
         p = int(parent_of[i])
         if p >= 0:
-            children_sum[p] += node_scores[i]
-            children_count[p] += 1
+            children_of[p].append(i)
 
-    has_children = children_count > 0
-    node_scores[has_children] = children_sum[has_children] / children_count[has_children]
+    # Get list of internal nodes (non-leaf nodes)
+    internal_nodes = [i for i in range(n_unique) if i in children_of]
+
+    # Sort internal nodes by depth descending (compute deeper nodes first)
+    internal_nodes_sorted = sorted(internal_nodes, key=lambda i: -seg_depth[i])
+
+    # Compute scores for internal nodes bottom-up
+    for i in internal_nodes_sorted:
+        children = children_of[i]
+        children_t = torch.tensor(children, dtype=torch.long, device=device)
+        child_scores = node_scores[children_t]
+        node_scores[i] = child_scores.mean()
+
+    # Compute children_sum and children_count (not strictly needed but kept for consistency)
+    # children_sum = torch.zeros(n_unique, dtype=torch.float32, device=device)
+    # children_count = torch.zeros(n_unique, dtype=torch.float32, device=device)
+    # for i in range(n_unique):
+    #     p = int(parent_of[i])
+    #     if p >= 0:
+    #         children_sum[p] += node_scores[i]
+    #         children_count[p] += 1
 
     # ── Step 2: parent-relative normalisation ────────────────────────────────
     # adv(s) = (score(s) - score(parent(s))) / std(siblings + eps)
@@ -338,8 +357,7 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw") 
         sib_std = sibling_scores.std() if len(children) > 1 else torch.tensor(0.0, device=device)
         print("sib_std:", sib_std)
         parent_score = node_scores[p]
-        seg_advantages[children_t] = sibling_scores - parent_score
-
+        seg_advantages[children_t] = (sibling_scores - parent_score) / (sib_std + 1e-6)
     # ── Step 3: assemble token-level advantages per leaf ─────────────────────
     # Each leaf's response is the concatenation of its path segments in order.
     # We fill token positions with the advantage of the segment they belong to.
