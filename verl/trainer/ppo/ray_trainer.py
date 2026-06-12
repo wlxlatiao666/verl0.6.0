@@ -1218,7 +1218,30 @@ class RayPPOTrainer:
                                     continue
                                 v = _agg_metrics[k]
                                 if isinstance(v, list):
-                                    _preserved[k] = np.concatenate(v, axis=0)
+                                    # Filter out empty arrays and arrays with wrong dimensions
+                                    valid_arrays = []
+                                    for arr in v:
+                                        if arr is None:
+                                            continue
+                                        if isinstance(arr, np.ndarray):
+                                            # Skip 0-dimensional arrays or empty arrays
+                                            if arr.ndim == 0 or arr.size == 0:
+                                                continue
+                                            # For unique_segments (object dtype, typically 1D)
+                                            # For unique_segment_seq_ids (int dtype, typically 1D)
+                                            if arr.ndim == 1:
+                                                valid_arrays.append(arr)
+                                    if valid_arrays:
+                                        # Handle object arrays specially
+                                        if valid_arrays[0].dtype == object:
+                                            # Concatenate object arrays by creating a new array
+                                            concatenated = []
+                                            for arr in valid_arrays:
+                                                concatenated.extend(arr.tolist())
+                                            _preserved[k] = np.array(concatenated, dtype=object)
+                                        else:
+                                            # For non-object dtypes (like int64), use np.concatenate normally
+                                            _preserved[k] = np.concatenate(valid_arrays, axis=0)
                                 else:
                                     _preserved[k] = v
                             if _preserved:

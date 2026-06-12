@@ -539,17 +539,21 @@ class vLLMRollout(BaseRollout):
             # unique_segment_seq_ids: seq_id for each entry in unique_segments, shape (n_unique_nodes,)
             # leaf_segment_indices: for each leaf, ordered indices into unique_segments for its root→leaf path
             #                       shape (n_leaves,) of variable-len index arrays
-            if _tree_process_reward and unique_segments:
-                # unique_segments / unique_segment_seq_ids are node-level (not leaf-level) so they
-                # cannot live in non_tensor_batch (which must match batch_size).  Store them in
-                # meta_info instead; leaf_segment_indices is leaf-aligned and stays in non_tensor_batch.
-                _tree_metrics["unique_segments"] = np.array(unique_segments, dtype=object)
-                _tree_metrics["unique_segment_seq_ids"] = np.array(unique_segment_seq_ids, dtype=np.int64)
+            if _tree_process_reward:
+                # Always write these keys (even if empty) so all workers have the same metrics keys
+                if unique_segments:
+                    _tree_metrics["unique_segments"] = np.array(unique_segments, dtype=object)
+                    _tree_metrics["unique_segment_seq_ids"] = np.array(unique_segment_seq_ids, dtype=np.int64)
+                else:
+                    # Write empty arrays with the right dtype
+                    _tree_metrics["unique_segments"] = np.array([], dtype=object)
+                    _tree_metrics["unique_segment_seq_ids"] = np.array([], dtype=np.int64)
                 # leaf_segment_indices aligns with batch dimension (one entry per leaf response)
-                leaf_seg_arr = np.empty(len(leaf_segment_indices), dtype=object)
-                for i, v in enumerate(leaf_segment_indices):
-                    leaf_seg_arr[i] = v
-                non_tensor_batch["leaf_segment_indices"] = leaf_seg_arr
+                if leaf_segment_indices:
+                    leaf_seg_arr = np.empty(len(leaf_segment_indices), dtype=object)
+                    for i, v in enumerate(leaf_segment_indices):
+                        leaf_seg_arr[i] = v
+                    non_tensor_batch["leaf_segment_indices"] = leaf_seg_arr
 
             # ── Compute tree search metrics ──
             _tree_total, _tree_leaves = 0, 0
