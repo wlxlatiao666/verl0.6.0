@@ -336,8 +336,9 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw") 
         children_t = torch.tensor(children, dtype=torch.long, device=device)
         sibling_scores = node_scores[children_t]
         sib_std = sibling_scores.std() if len(children) > 1 else torch.tensor(0.0, device=device)
+        print("sib_std:", sib_std)
         parent_score = node_scores[p]
-        seg_advantages[children_t] = (sibling_scores - parent_score) / (sib_std + 1e-6)
+        seg_advantages[children_t] = sibling_scores - parent_score
 
     # ── Step 3: assemble token-level advantages per leaf ─────────────────────
     # Each leaf's response is the concatenation of its path segments in order.
@@ -357,10 +358,10 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw") 
             seg_len = len(unique_segments[seg_idx])
             end = min(pos + seg_len, resp_len)
             valid_seg_len = max(end - pos, 1)
-            leaf_share = max(int(seg_leaf_count[seg_idx]), 1)
+            # leaf_share = max(int(seg_leaf_count[seg_idx]), 1)
             # print(f"proc_agg_mode: {proc_agg_mode}")
             if proc_agg_mode == "raw":
-                token_advantages[j, pos:end] = seg_advantages[seg_idx] / leaf_share
+                token_advantages[j, pos:end] = seg_advantages[seg_idx]
             elif proc_agg_mode == "length_balanced":
                 token_advantages[j, pos:end] = seg_advantages[seg_idx] / valid_seg_len  * mean_seg_len
             pos += seg_len
