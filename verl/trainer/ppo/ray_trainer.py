@@ -285,12 +285,15 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw") 
 
     # ── Step 1: back-propagate leaf scores to all nodes ──────────────────────
     leaf_scores = data.batch["token_level_rewards"].sum(dim=-1).float()  # (n_leaves,)
-
+    print(f"leave_scores:{leaf_scores}")
+    print(f"leave_scores.shape:{leaf_scores.shape}")
+    
     unique_segments = data.meta_info["metrics"]["unique_segments"]  
     # print(f"[process advantage] unique_segments: {unique_segments}")     # (n_unique,) of lists
     leaf_segment_indices = data.non_tensor_batch["leaf_segment_indices"]  # (n_leaves,) of lists
 
     n_unique = len(unique_segments)
+    print("n_unique:",n_unique)
 
     # Map leaf segment -> leaf row index; build parent map in one pass
     leaf_seg_to_leaf_idx: dict[int, int] = {}
@@ -356,6 +359,7 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw") 
         sibling_scores = node_scores[children_t]
         sib_std = sibling_scores.std() if len(children) > 1 else torch.tensor(0.0, device=device)
         print("sib_std:", sib_std)
+        print("sibling_scores:", sibling_scores)
         parent_score = node_scores[p]
         seg_advantages[children_t] = (sibling_scores - parent_score) / (sib_std + 1e-6)
     # ── Step 3: assemble token-level advantages per leaf ─────────────────────
