@@ -6,11 +6,13 @@ export PYTHONUNBUFFERED=1
 export VLLM_USE_V1=0
 export VERL_LOGGING_LEVEL="${VERL_LOGGING_LEVEL:-INFO}"
 export VERL_DEBUG_LOG_PATH=/inspire/hdd/global_user/weilongxuan-253108120168
+export RAY_DEDUP_LOGS=0
 export NCCL_SHM_DISABLE=1
 export NCCL_DEBUG=INFO
 HOME=/inspire/hdd/global_user/weilongxuan-253108120168
+verl_dir=/inspire/qb-ilm2/project/neosmosis/weilongxuan-253108120168/verl_data
 project_name=verl_grpo_tree_latest
-experiment_name=qwen2.5_math7b_grpo_new
+experiment_name=qwen2.5_math7b_grpo_n27_260613
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl0.6.0"}
 
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
@@ -38,7 +40,7 @@ fi
 # Local testing only: put your key here if you do not use env / ~/.wandb_api_key.
 # Priority: shell export > key files above > this line (empty = skip).
 # Do not commit real keys to shared repos.
-_WANDB_API_KEY_INLINE="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"
+_WANDB_API_KEY_INLINE=""
 if [[ -z "${WANDB_API_KEY:-}" ]] && [[ -n "${_WANDB_API_KEY_INLINE}" ]]; then
   export WANDB_API_KEY="${_WANDB_API_KEY_INLINE}"
 fi
@@ -65,14 +67,14 @@ python3 -m verl.trainer.main_ppo \
     data.filter_overlong_prompts=False \
     data.truncation='error' \
     actor_rollout_ref.actor.clip_ratio_low=0.2 \
-    actor_rollout_ref.actor.clip_ratio_high=0.28 \
+    actor_rollout_ref.actor.clip_ratio_high=0.2 \
     actor_rollout_ref.model.path=/inspire/hdd/global_public/public_models/Qwen/Qwen2.5-Math-7B \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=16 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.actor.use_kl_loss=True \
-    actor_rollout_ref.actor.kl_loss_coef=0.01 \
+    actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
@@ -82,19 +84,16 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
-    actor_rollout_ref.rollout.n=8 \
+    actor_rollout_ref.rollout.n=27 \
+    actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.tree_search.enable=False \
-    actor_rollout_ref.rollout.tree_search.entropy_threshold=0 \
-    actor_rollout_ref.rollout.tree_search.branching_factor=2 \
+    actor_rollout_ref.rollout.tree_search.entropy_threshold=0.8 \
+    actor_rollout_ref.rollout.tree_search.branching_factor=3 \
     actor_rollout_ref.rollout.tree_search.max_tree_depth=3 \
+    actor_rollout_ref.rollout.tree_search.tau_importance=0.0 \
+    actor_rollout_ref.rollout.tree_search.tree_process_reward=False \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
-    reward_model.reward_manager=dapo \
-    +reward_model.reward_kwargs.overlong_buffer_cfg.enable=True \
-    +reward_model.reward_kwargs.overlong_buffer_cfg.len=512 \
-    +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=1.0 \
-    +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
-    +reward_model.reward_kwargs.max_resp_len=4096 \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb","tensorboard"]' \
@@ -102,12 +101,13 @@ python3 -m verl.trainer.main_ppo \
     trainer.experiment_name=${experiment_name} \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
+    +ray_kwargs.ray_init.log_to_driver=True \
     trainer.save_freq=20 \
     trainer.test_freq=2 \
     trainer.total_epochs=1 \
-    trainer.default_local_dir="/inspire/qb-ilm2/project/neosmosis/weilongxuan-253108120168/verl_data/checkpoints/${project_name}/${experiment_name}" \
-    trainer.rollout_data_dir="/inspire/qb-ilm2/project/neosmosis/weilongxuan-253108120168/verl_data/rollout_data/${project_name}/${experiment_name}" \
-    trainer.validation_data_dir="/inspire/qb-ilm2/project/neosmosis/weilongxuan-253108120168/verl_data/validation_data/${project_name}/${experiment_name}" \
+    trainer.default_local_dir="${verl_dir}/checkpoints/${project_name}/${experiment_name}" \
+    trainer.rollout_data_dir="${verl_dir}/rollout_data/${project_name}/${experiment_name}" \
+    trainer.validation_data_dir="${verl_dir}/validation_data/${project_name}/${experiment_name}" \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=False\
     $@ 2>&1 | tee -a "${LOG_FILE}"
