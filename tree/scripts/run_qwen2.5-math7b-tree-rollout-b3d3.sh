@@ -40,7 +40,7 @@ fi
 # Local testing only: put your key here if you do not use env / ~/.wandb_api_key.
 # Priority: shell export > key files above > this line (empty = skip).
 # Do not commit real keys to shared repos.
-_WANDB_API_KEY_INLINE=""
+_WANDB_API_KEY_INLINE="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"
 if [[ -z "${WANDB_API_KEY:-}" ]] && [[ -n "${_WANDB_API_KEY_INLINE}" ]]; then
   export WANDB_API_KEY="${_WANDB_API_KEY_INLINE}"
 fi
