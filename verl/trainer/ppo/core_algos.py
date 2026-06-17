@@ -1373,6 +1373,22 @@ def build_segment_tensors(
     print(f"[tree_segment] old_log_prob shape: {old_log_prob.shape if old_log_prob is not None else None}")
     print(f"[tree_segment] Building segment-level tensors for {n_unique} unique segments from {len(leaf_segment_indices)} leaves.")
 
+    # Debug: Print segment distribution statistics
+    path_lengths = [len(path) for path in leaf_segment_indices]
+    if path_lengths:
+        import numpy as np
+        print(f"[tree_segment] Path length stats: min={min(path_lengths)}, max={max(path_lengths)}, "
+              f"mean={np.mean(path_lengths):.2f}, median={np.median(path_lengths):.2f}")
+
+        # Count how many times each segment appears
+        seg_counts = {}
+        for path in leaf_segment_indices:
+            for seg_idx in path:
+                seg_counts[seg_idx] = seg_counts.get(seg_idx, 0) + 1
+
+        top_shared = sorted(seg_counts.items(), key=lambda x: -x[1])[:5]
+        print(f"[tree_segment] Top 5 most shared segments: {top_shared}")
+
     # For each unique segment, find the first leaf that contains it and the token offset
     # within that leaf's response where the segment starts.
     seg_canonical: list[tuple[int, int]] = [(-1, -1)] * n_unique

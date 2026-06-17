@@ -90,6 +90,10 @@ class ActorConfig(BaseConfig):
         "ppo_infer_micro_batch_size_per_gpu",
     }
 
+    # Tree segment loss related configurations
+    tree_segment_batch_strategy: str = "leaf"  # 'leaf' (default) or 'segment'
+    ppo_micro_batch_segments: Optional[int] = None
+
     strategy: str = MISSING
     ppo_mini_batch_size: int = 256
     ppo_micro_batch_size: Optional[int] = None  # deprecate

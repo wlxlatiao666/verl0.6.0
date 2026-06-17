@@ -287,12 +287,40 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw") 
     leaf_scores = data.batch["token_level_rewards"].sum(dim=-1).float()  # (n_leaves,)
     print(f"leave_scores:{leaf_scores}")
     print(f"leave_scores.shape:{leaf_scores.shape}")
-    
-    unique_segments = data.meta_info["metrics"]["unique_segments"]  
+
+    unique_segments = data.meta_info["metrics"]["unique_segments"]
     # print(f"[process advantage] unique_segments: {unique_segments}")     # (n_unique,) of lists
     leaf_segment_indices = data.non_tensor_batch["leaf_segment_indices"]  # (n_leaves,) of lists
 
     n_unique = len(unique_segments)
+    n_leaves = len(leaf_segment_indices)
+    print(f"[compute_tree_process_advantage] n_unique segments: {n_unique}, n_leaves: {n_leaves}")
+
+    # Debug: Print tree structure stats
+    import numpy as np
+    path_lengths = [len(path) for path in leaf_segment_indices]
+    print(f"[compute_tree_process_advantage] Path length stats: min={min(path_lengths)}, max={max(path_lengths)}, "
+          f"mean={np.mean(path_lengths):.2f}, median={np.median(path_lengths):.2f}")
+
+    # Count segments at each depth
+    from collections import defaultdict
+    depth_counts = defaultdict(int)
+    for path in leaf_segment_indices:
+        for depth, _ in enumerate(path):
+            depth_counts[depth] += 1
+    print(f"[compute_tree_process_advantage] Segment depth counts: {dict(depth_counts)}")
+
+    # Check for root nodes (segments with no parent)
+    all_segments = set()
+    child_segments = set()
+    for path in leaf_segment_indices:
+        for i, seg_idx in enumerate(path):
+            all_segments.add(seg_idx)
+            if i > 0:
+                child_segments.add(seg_idx)
+    root_segments = all_segments - child_segments
+    print(f"[compute_tree_process_advantage] Number of root segments: {len(root_segments)}")
+
     print("n_unique:",n_unique)
 
     # Map leaf segment -> leaf row index; build parent map in one pass

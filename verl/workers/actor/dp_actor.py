@@ -418,207 +418,137 @@ class DataParallelPPOActor(BasePPOActor):
                 }
                 print(f"[tree_segment] Global segment tensors built: seg_old_log_prob.shape={seg_old_log_prob.shape}")
 
-        # Split to make minibatch iterator for updating the actor
-        # See PPO paper for details. https://arxiv.org/abs/1707.06347
-        mini_batches = data.split(self.config.ppo_mini_batch_size)
+        # === New code: Check batch strategy for tree_segment loss ===
+        tree_segment_batch_strategy = getattr(self.config, "tree_segment_batch_strategy", "leaf")
+        use_segment_batching = (
+            loss_mode == "tree_segment" and
+            tree_segment_batch_strategy == "segment" and
+            global_tree_seg_targets is not None and
+            not self.config.use_dynamic_bsz  # Dynamic bsz not supported with segment batching yet
+        )
 
-        # Track global leaf index ranges for each mini_batch (to correctly map segments to micro_batches)
-        mini_batch_ranges = []
-        current_start = 0
-        for mb in mini_batches:
-            mb_len = len(mb)
-            mini_batch_ranges.append((current_start, current_start + mb_len))
-            current_start += mb_len
-
-        on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
-
+        on_policy = False
         metrics = {}
-        for _ in range(self.config.ppo_epochs):
-            for batch_idx, mini_batch in enumerate(mini_batches):
-                global_leaf_start, global_leaf_end = mini_batch_ranges[batch_idx]
-                if self.config.use_dynamic_bsz:
-                    max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                    micro_batches, batch_idx_list = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
-                    # Adjust batch_idx_list to be GLOBAL leaf indices instead of mini_batch local indices
-                    if batch_idx_list is not None:
-                        batch_idx_list = [[global_leaf_start + local_idx for local_idx in sublist] for sublist in batch_idx_list]
+
+        if use_segment_batching:
+            # === SEGMENT-BASED BATCHING STRATEGY ===
+            ppo_micro_batch_segments = getattr(self.config, "ppo_micro_batch_segments", None)
+            total_segments = len(global_tree_seg_targets["seg_lens"])
+
+            if ppo_micro_batch_segments is None:
+                # Default estimation: use similar ratio as leaf-based batching
+                if self.config.ppo_micro_batch_size_per_gpu is not None:
+                    avg_segments_per_leaf = total_segments / max(global_batch_size, 1)
+                    ppo_micro_batch_segments = max(8, int(self.config.ppo_micro_batch_size_per_gpu * avg_segments_per_leaf))
                 else:
-                    self.gradient_accumulation = (
-                        self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
-                    )
-                    micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
-                    batch_idx_list = None
+                    ppo_micro_batch_segments = max(8, total_segments // 10)
 
-                # Use pre-computed GLOBAL segment targets, don't rebuild at mini_batch level
-                if loss_mode == "tree_segment" and global_tree_seg_targets is not None:
-                    mini_batch.meta_info["tree_seg_targets"] = global_tree_seg_targets
+            print(f"[tree_segment] Using segment-based batching: {total_segments} segments total, "
+                  f"{ppo_micro_batch_segments} segments per micro-batch")
 
-                self.actor_optimizer.zero_grad()
+            self.gradient_accumulation = max(1, total_segments // self.config.ppo_mini_batch_size // ppo_micro_batch_segments)
+            on_policy = total_segments <= ppo_micro_batch_segments and self.config.ppo_epochs == 1
 
-                for m, micro_batch in enumerate(micro_batches):
-                    micro_batch = micro_batch.to(get_device_id())
-                    micro_batch_metrics = {}
-                    model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
-                    response_mask = model_inputs["response_mask"]
-                    old_log_prob = model_inputs["old_log_probs"]
-                    advantages = model_inputs["advantages"]
+            for _ in range(self.config.ppo_epochs):
+                # Shuffle segments
+                segment_indices = torch.randperm(total_segments).tolist()
 
+                # Split into micro-batches (we use gradient accumulation for multiple micro-batches per step)
+                segment_micro_batches = [
+                    segment_indices[i:i+ppo_micro_batch_segments]
+                    for i in range(0, total_segments, ppo_micro_batch_segments)
+                ]
+
+                for m, seg_indices in enumerate(segment_micro_batches):
+                    if not seg_indices:
+                        continue
+
+                    # Collect all required leaves for these segments
+                    seg_canonical = global_tree_seg_targets["seg_canonical"]
+                    required_leaves = list({seg_canonical[i][0] for i in seg_indices})
+
+                    # Get the data for required leaves only
+                    mini_batch = data[required_leaves]
+                    mini_batch = mini_batch.to(get_device_id())
+
+                    # Forward pass on required leaves
+                    model_inputs = {**mini_batch.batch, **mini_batch.non_tensor_batch}
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
+                    loss_scale_factor = 1 / self.gradient_accumulation
 
-                    if self.config.use_dynamic_bsz:
-                        loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
-                    else:
-                        loss_scale_factor = 1 / self.gradient_accumulation
-
-                    # all return: (bsz, response_length)
-                    calculate_entropy = False
-                    if entropy_coeff != 0:
-                        calculate_entropy = True
+                    calculate_entropy = entropy_coeff != 0
                     entropy, log_prob = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
 
+                    # Build leaf inverse map
+                    leaf_inverse_map = {global_idx: local_idx for local_idx, global_idx in enumerate(required_leaves)}
+
+                    # Build segment log_probs
+                    max_seg_len = global_tree_seg_targets["old_log_prob"].shape[1]
+                    seg_log_prob_local = torch.zeros(len(seg_indices), max_seg_len, device=log_prob.device, dtype=log_prob.dtype)
+
+                    seg_lens = global_tree_seg_targets["seg_lens"]
+                    for local_i, seg_idx in enumerate(seg_indices):
+                        leaf_j, tok_offset = seg_canonical[seg_idx]
+                        local_leaf_j = leaf_inverse_map[leaf_j]
+                        seg_len = seg_lens[seg_idx]
+                        end_tok = min(tok_offset + seg_len, log_prob.shape[1])
+                        actual_len = end_tok - tok_offset
+                        seg_log_prob_local[local_i, :actual_len] = log_prob[local_leaf_j, tok_offset:end_tok]
+
+                    # Get other segment tensors
                     if on_policy:
-                        old_log_prob = log_prob.detach()
+                        seg_old_log_prob_local = seg_log_prob_local.detach()
                     else:
-                        old_log_prob = model_inputs["old_log_probs"]
+                        seg_old_log_prob_local = global_tree_seg_targets["old_log_prob"][seg_indices].to(log_prob.device)
 
-                    loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-                    # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
+                    seg_advantages_local = global_tree_seg_targets["advantages"][seg_indices].to(log_prob.device)
+                    seg_response_mask_local = global_tree_seg_targets["response_mask"][seg_indices].to(log_prob.device)
+                    seg_rollout_is_weights_local = global_tree_seg_targets["rollout_is_weights"]
+                    if seg_rollout_is_weights_local is not None:
+                        seg_rollout_is_weights_local = seg_rollout_is_weights_local[seg_indices].to(log_prob.device)
 
-                    # Extract pre-computed rollout importance sampling weights if present
-                    # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
-                    rollout_is_weights = model_inputs.get("rollout_is_weights", None)
-
-                    # NOTE: Both mismatch diagnostic metrics (PPL, KL, etc.) and IS weight metrics
-                    # are computed centrally in ray_trainer.py for consistency and efficiency.
-                    # This ensures metrics are computed uniformly across all batches at the trainer level
-                    # and avoids redundant computation across workers and micro-batches.
-
-                    # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
-                    # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
+                    # Compute loss
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
+                    micro_batch_metrics = {}
 
-                    # Compute policy loss (all functions return 4 values)
-                    if loss_mode == "tree_segment":
-                        tree_seg_targets = micro_batch.meta_info.get("tree_seg_targets")
-                        if tree_seg_targets is not None:
-                            seg_canonical = tree_seg_targets["seg_canonical"]
-                            seg_lens = tree_seg_targets["seg_lens"]
+                    if m == 0:
+                        print(f"[tree_segment] Updating {len(seg_indices)} segments in this micro-batch")
 
-                            # Determine which leaves are present in this micro-batch (using GLOBAL leaf indices)
-                            if self.config.use_dynamic_bsz:
-                                present_leaves = set(batch_idx_list[m])
-                            else:
-                                # For non-dynamic bsz, compute the GLOBAL leaf indices in this micro_batch
-                                global_micro_batch_start = global_leaf_start + m * self.config.ppo_micro_batch_size_per_gpu
-                                global_micro_batch_end = min(global_micro_batch_start + self.config.ppo_micro_batch_size_per_gpu, global_leaf_end)
-                                present_leaves = set(range(global_micro_batch_start, global_micro_batch_end))
+                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                        old_log_prob=seg_old_log_prob_local,
+                        log_prob=seg_log_prob_local,
+                        advantages=seg_advantages_local,
+                        response_mask=seg_response_mask_local,
+                        loss_agg_mode=loss_agg_mode,
+                        config=self.config,
+                        rollout_is_weights=seg_rollout_is_weights_local,
+                    )
 
-                            # Select segments whose canonical leaf is in this micro-batch.
-                            # This guarantees each segment is updated exactly once.
-                            seg_indices = [i for i, (leaf_j, _) in enumerate(seg_canonical) if leaf_j in present_leaves]
-
-                            if len(seg_indices) == 0:
-                                pg_loss = torch.tensor(0.0, device=log_prob.device)
-                                pg_clipfrac = torch.tensor(0.0, device=log_prob.device)
-                                ppo_kl = torch.tensor(0.0, device=log_prob.device)
-                                pg_clipfrac_lower = torch.tensor(0.0, device=log_prob.device)
-                            else:
-                                # Build inverse map from GLOBAL leaf index to local micro-batch index
-                                if self.config.use_dynamic_bsz:
-                                    # batch_idx_list[m] already contains GLOBAL indices
-                                    leaf_inverse_map = {global_idx: local_idx for local_idx, global_idx in enumerate(batch_idx_list[m])}
-                                else:
-                                    # Map from global leaf index to local micro_batch index
-                                    leaf_inverse_map = {}
-                                    for local_idx, global_idx in enumerate(range(global_micro_batch_start, global_micro_batch_end)):
-                                        leaf_inverse_map[global_idx] = local_idx
-
-                                # Use the pre-computed global max_seg_len so shapes align with
-                                # tree_seg_targets tensors (old_log_prob / advantages / mask).
-                                max_seg_len = tree_seg_targets["old_log_prob"].shape[1]
-                                seg_log_prob_local = torch.zeros(len(seg_indices), max_seg_len, device=log_prob.device, dtype=log_prob.dtype)
-
-                                for local_i, seg_idx in enumerate(seg_indices):
-                                    leaf_j, tok_offset = seg_canonical[seg_idx]
-                                    local_leaf_j = leaf_inverse_map[leaf_j]
-                                    seg_len = seg_lens[seg_idx]
-                                    end_tok = min(tok_offset + seg_len, log_prob.shape[1])
-                                    actual_len = end_tok - tok_offset
-                                    seg_log_prob_local[local_i, :actual_len] = log_prob[local_leaf_j, tok_offset:end_tok]
-
-                                if on_policy:
-                                    seg_old_log_prob_local = seg_log_prob_local.detach()
-                                else:
-                                    seg_old_log_prob_local = tree_seg_targets["old_log_prob"][seg_indices].to(log_prob.device)
-
-                                seg_advantages_local = tree_seg_targets["advantages"][seg_indices].to(log_prob.device)
-                                seg_response_mask_local = tree_seg_targets["response_mask"][seg_indices].to(log_prob.device)
-                                seg_rollout_is_weights_local = tree_seg_targets["rollout_is_weights"]
-                                if seg_rollout_is_weights_local is not None:
-                                    seg_rollout_is_weights_local = seg_rollout_is_weights_local[seg_indices].to(log_prob.device)
-
-                                if batch_idx == 0 and m == 0:  # Print once per epoch
-                                    print(f"[tree_segment] Updating {len(seg_indices)} segments in this micro_batch")
-
-                                pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
-                                    old_log_prob=seg_old_log_prob_local,
-                                    log_prob=seg_log_prob_local,
-                                    advantages=seg_advantages_local,
-                                    response_mask=seg_response_mask_local,
-                                    loss_agg_mode=loss_agg_mode,
-                                    config=self.config,
-                                    rollout_is_weights=seg_rollout_is_weights_local,
-                                )
-                        else:
-                            # Fallback if targets not precomputed
-                            pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
-                                old_log_prob=old_log_prob,
-                                log_prob=log_prob,
-                                advantages=advantages,
-                                response_mask=response_mask,
-                                loss_agg_mode=loss_agg_mode,
-                                config=self.config,
-                                rollout_is_weights=rollout_is_weights,
-                            )
-                    else:
-                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
-                            old_log_prob=old_log_prob,
-                            log_prob=log_prob,
-                            advantages=advantages,
-                            response_mask=response_mask,
-                            loss_agg_mode=loss_agg_mode,
-                            config=self.config,
-                            rollout_is_weights=rollout_is_weights,
-                        )
-
+                    # Entropy loss
                     if entropy_coeff != 0:
+                        response_mask = model_inputs["response_mask"]
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-
-                        # compute policy loss
                         policy_loss = pg_loss - entropy_loss * entropy_coeff
                     else:
                         policy_loss = pg_loss
 
+                    # KL loss
                     if self.config.use_kl_loss:
                         ref_log_prob = model_inputs["ref_log_prob"]
-                        # compute kl loss
+                        response_mask = model_inputs["response_mask"]
                         kld = kl_penalty(
                             logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
                         )
                         kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                         micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
-                    if self.config.use_dynamic_bsz:
-                        # relative to the dynamic bsz
-                        loss = policy_loss * loss_scale_factor
-                    else:
-                        loss = policy_loss * loss_scale_factor
+                    # Backward pass with gradient accumulation
+                    loss = policy_loss * loss_scale_factor
                     loss.backward()
 
                     micro_batch_metrics.update(
@@ -631,8 +561,227 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                     append_to_dict(metrics, micro_batch_metrics)
 
+                # Optimizer step after gradient accumulation
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
+
+        else:
+            # === ORIGINAL LEAF-BASED BATCHING STRATEGY ===
+            # Split to make minibatch iterator for updating the actor
+            # See PPO paper for details. https://arxiv.org/abs/1707.06347
+            mini_batches = data.split(self.config.ppo_mini_batch_size)
+
+            # Track global leaf index ranges for each mini_batch (to correctly map segments to micro_batches)
+            mini_batch_ranges = []
+            current_start = 0
+            for mb in mini_batches:
+                mb_len = len(mb)
+                mini_batch_ranges.append((current_start, current_start + mb_len))
+                current_start += mb_len
+
+            on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
+
+            for _ in range(self.config.ppo_epochs):
+                for batch_idx, mini_batch in enumerate(mini_batches):
+                    global_leaf_start, global_leaf_end = mini_batch_ranges[batch_idx]
+                    if self.config.use_dynamic_bsz:
+                        max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                        micro_batches, batch_idx_list = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
+                        # Adjust batch_idx_list to be GLOBAL leaf indices instead of mini_batch local indices
+                        if batch_idx_list is not None:
+                            batch_idx_list = [[global_leaf_start + local_idx for local_idx in sublist] for sublist in batch_idx_list]
+                    else:
+                        self.gradient_accumulation = (
+                            self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+                        )
+                        micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+                        batch_idx_list = None
+
+                    # Use pre-computed GLOBAL segment targets, don't rebuild at mini_batch level
+                    if loss_mode == "tree_segment" and global_tree_seg_targets is not None:
+                        mini_batch.meta_info["tree_seg_targets"] = global_tree_seg_targets
+
+                    self.actor_optimizer.zero_grad()
+
+                    for m, micro_batch in enumerate(micro_batches):
+                        micro_batch = micro_batch.to(get_device_id())
+                        micro_batch_metrics = {}
+                        model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+                        response_mask = model_inputs["response_mask"]
+                        old_log_prob = model_inputs["old_log_probs"]
+                        advantages = model_inputs["advantages"]
+
+                        entropy_coeff = self.config.entropy_coeff
+                        loss_agg_mode = self.config.loss_agg_mode
+
+                        if self.config.use_dynamic_bsz:
+                            loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
+                        else:
+                            loss_scale_factor = 1 / self.gradient_accumulation
+
+                        # all return: (bsz, response_length)
+                        calculate_entropy = False
+                        if entropy_coeff != 0:
+                            calculate_entropy = True
+                        entropy, log_prob = self._forward_micro_batch(
+                            model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                        )
+
+                        if on_policy:
+                            old_log_prob = log_prob.detach()
+                        else:
+                            old_log_prob = model_inputs["old_log_probs"]
+
+                        # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
+
+                        # Extract pre-computed rollout importance sampling weights if present
+                        # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
+                        rollout_is_weights = model_inputs.get("rollout_is_weights", None)
+
+                        # NOTE: Both mismatch diagnostic metrics (PPL, KL, etc.) and IS weight metrics
+                        # are computed centrally in ray_trainer.py for consistency and efficiency.
+                        # This ensures metrics are computed uniformly across all batches at the trainer level
+                        # and avoids redundant computation across workers and micro-batches.
+
+                        # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
+                        # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
+                        policy_loss_fn = get_policy_loss_fn(loss_mode)
+
+                        # Compute policy loss (all functions return 4 values)
+                        if loss_mode == "tree_segment":
+                            tree_seg_targets = micro_batch.meta_info.get("tree_seg_targets")
+                            if tree_seg_targets is not None:
+                                seg_canonical = tree_seg_targets["seg_canonical"]
+                                seg_lens = tree_seg_targets["seg_lens"]
+
+                                # Determine which leaves are present in this micro-batch (using GLOBAL leaf indices)
+                                if self.config.use_dynamic_bsz:
+                                    present_leaves = set(batch_idx_list[m])
+                                else:
+                                    # For non-dynamic bsz, compute the GLOBAL leaf indices in this micro_batch
+                                    global_micro_batch_start = global_leaf_start + m * self.config.ppo_micro_batch_size_per_gpu
+                                    global_micro_batch_end = min(global_micro_batch_start + self.config.ppo_micro_batch_size_per_gpu, global_leaf_end)
+                                    present_leaves = set(range(global_micro_batch_start, global_micro_batch_end))
+
+                                # Select segments whose canonical leaf is in this micro-batch.
+                                # This guarantees each segment is updated exactly once.
+                                seg_indices = [i for i, (leaf_j, _) in enumerate(seg_canonical) if leaf_j in present_leaves]
+
+                                if len(seg_indices) == 0:
+                                    pg_loss = torch.tensor(0.0, device=log_prob.device)
+                                    pg_clipfrac = torch.tensor(0.0, device=log_prob.device)
+                                    ppo_kl = torch.tensor(0.0, device=log_prob.device)
+                                    pg_clipfrac_lower = torch.tensor(0.0, device=log_prob.device)
+                                else:
+                                    # Build inverse map from GLOBAL leaf index to local micro-batch index
+                                    if self.config.use_dynamic_bsz:
+                                        # batch_idx_list[m] already contains GLOBAL indices
+                                        leaf_inverse_map = {global_idx: local_idx for local_idx, global_idx in enumerate(batch_idx_list[m])}
+                                    else:
+                                        # Map from global leaf index to local micro_batch index
+                                        leaf_inverse_map = {}
+                                        for local_idx, global_idx in enumerate(range(global_micro_batch_start, global_micro_batch_end)):
+                                            leaf_inverse_map[global_idx] = local_idx
+
+                                    # Use the pre-computed global max_seg_len so shapes align with
+                                    # tree_seg_targets tensors (old_log_prob / advantages / mask).
+                                    max_seg_len = tree_seg_targets["old_log_prob"].shape[1]
+                                    seg_log_prob_local = torch.zeros(len(seg_indices), max_seg_len, device=log_prob.device, dtype=log_prob.dtype)
+
+                                    for local_i, seg_idx in enumerate(seg_indices):
+                                        leaf_j, tok_offset = seg_canonical[seg_idx]
+                                        local_leaf_j = leaf_inverse_map[leaf_j]
+                                        seg_len = seg_lens[seg_idx]
+                                        end_tok = min(tok_offset + seg_len, log_prob.shape[1])
+                                        actual_len = end_tok - tok_offset
+                                        seg_log_prob_local[local_i, :actual_len] = log_prob[local_leaf_j, tok_offset:end_tok]
+
+                                    if on_policy:
+                                        seg_old_log_prob_local = seg_log_prob_local.detach()
+                                    else:
+                                        seg_old_log_prob_local = tree_seg_targets["old_log_prob"][seg_indices].to(log_prob.device)
+
+                                    seg_advantages_local = tree_seg_targets["advantages"][seg_indices].to(log_prob.device)
+                                    seg_response_mask_local = tree_seg_targets["response_mask"][seg_indices].to(log_prob.device)
+                                    seg_rollout_is_weights_local = tree_seg_targets["rollout_is_weights"]
+                                    if seg_rollout_is_weights_local is not None:
+                                        seg_rollout_is_weights_local = seg_rollout_is_weights_local[seg_indices].to(log_prob.device)
+
+                                    if batch_idx == 0 and m == 0:  # Print once per epoch
+                                        print(f"[tree_segment] Updating {len(seg_indices)} segments in this micro_batch")
+
+                                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                                        old_log_prob=seg_old_log_prob_local,
+                                        log_prob=seg_log_prob_local,
+                                        advantages=seg_advantages_local,
+                                        response_mask=seg_response_mask_local,
+                                        loss_agg_mode=loss_agg_mode,
+                                        config=self.config,
+                                        rollout_is_weights=seg_rollout_is_weights_local,
+                                    )
+                            else:
+                                # Fallback if targets not precomputed
+                                pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                                    old_log_prob=old_log_prob,
+                                    log_prob=log_prob,
+                                    advantages=advantages,
+                                    response_mask=response_mask,
+                                    loss_agg_mode=loss_agg_mode,
+                                    config=self.config,
+                                    rollout_is_weights=rollout_is_weights,
+                                )
+                        else:
+                            pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                                old_log_prob=old_log_prob,
+                                log_prob=log_prob,
+                                advantages=advantages,
+                                response_mask=response_mask,
+                                loss_agg_mode=loss_agg_mode,
+                                config=self.config,
+                                rollout_is_weights=rollout_is_weights,
+                            )
+
+                        if entropy_coeff != 0:
+                            entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+                            # compute policy loss
+                            policy_loss = pg_loss - entropy_loss * entropy_coeff
+                        else:
+                            policy_loss = pg_loss
+
+                        if self.config.use_kl_loss:
+                            ref_log_prob = model_inputs["ref_log_prob"]
+                            # compute kl loss
+                            kld = kl_penalty(
+                                logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
+                            )
+                            kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+                            policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+                            micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor
+                            micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
+
+                        if self.config.use_dynamic_bsz:
+                            # relative to the dynamic bsz
+                            loss = policy_loss * loss_scale_factor
+                        else:
+                            loss = policy_loss * loss_scale_factor
+                        loss.backward()
+
+                        micro_batch_metrics.update(
+                            {
+                                "actor/pg_loss": pg_loss.detach().item() * loss_scale_factor,
+                                "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+                                "actor/ppo_kl": ppo_kl.detach().item(),
+                                "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+                            }
+                        )
+                        append_to_dict(metrics, micro_batch_metrics)
+
+                    grad_norm = self._optimizer_step()
+                    mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
+                    append_to_dict(metrics, mini_batch_metrics)
+
         self.actor_optimizer.zero_grad()
         return metrics

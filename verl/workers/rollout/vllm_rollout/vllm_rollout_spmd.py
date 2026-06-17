@@ -561,13 +561,21 @@ class vLLMRollout(BaseRollout):
             _leaves_per_prompt = []
             _leaf_resp_lens = []
 
-            for _out in outputs:
+            # Debug: Print per-prompt tree statistics
+            print(f"[TreeRollout] Number of prompts (outputs): {len(outputs)}")
+            print(f"[TreeRollout] Total unique_segments collected so far: {len(unique_segments)}")
+            print(f"[TreeRollout] Total leaf_segment_indices collected so far: {len(leaf_segment_indices)}")
+
+            for _out_idx, _out in enumerate(outputs):
                 _seqs = _out.outputs
                 _tree_total += len(_seqs)
                 prompt_leaf_count = 0
                 prompt_max_depth = 0
+                prompt_total_nodes = 0
+                prompt_segments_before = len(unique_segments)
                 for _s in _seqs:
                     depth = getattr(_s, 'tree_depth', 0)
+                    prompt_total_nodes += 1
                     if isinstance(depth, (int, float)):
                         prompt_max_depth = max(prompt_max_depth, depth)
                     if getattr(_s, 'is_leaf', True):
@@ -577,6 +585,12 @@ class vLLMRollout(BaseRollout):
                 _leaves_per_prompt.append(prompt_leaf_count)
                 _depth_sum += prompt_max_depth
                 _depth_max = max(_depth_max, prompt_max_depth)
+
+                # Debug per-prompt tree info
+                prompt_new_segments = len(unique_segments) - prompt_segments_before
+                print(f"[TreeRollout] Prompt {_out_idx}: {prompt_total_nodes} total nodes, "
+                      f"{prompt_leaf_count} leaves, max_depth={prompt_max_depth}, "
+                      f"{prompt_new_segments} new segments (segments/leaf ratio: {prompt_total_nodes / max(prompt_leaf_count, 1):.2f})")
 
             n_prompts = max(len(outputs), 1)
             _tree_branch_pts = _tree_total - _tree_leaves
