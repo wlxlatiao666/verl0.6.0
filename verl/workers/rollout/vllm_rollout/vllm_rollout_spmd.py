@@ -413,6 +413,11 @@ class vLLMRollout(BaseRollout):
             and _tree_cfg.get("tree_process_reward", False)
             and not is_validate
         )
+        print(f"[TreeRollout] Debug: _tree_cfg: {_tree_cfg}")
+        print(f"[TreeRollout] Debug: _tree_process_reward: {_tree_process_reward}")
+        print(f"[TreeRollout] Debug: self.sampling_params.tree_search_params before: {self.sampling_params.tree_search_params}")
+
+        kwargs = {}  # Initialize as empty dict
         if not do_sample:
             kwargs = {
                 "best_of": 1,
@@ -432,6 +437,8 @@ class vLLMRollout(BaseRollout):
                 "n": 1,  # if validate, already repeat in ray_trainer
             }
 
+        print(f"[TreeRollout] Debug: kwargs to apply: {kwargs}")
+
         lora_requests = None
         if self.lora_kwargs:
             lora_int_ids = list(self.inference_engine.llm_engine.list_loras())
@@ -443,7 +450,9 @@ class vLLMRollout(BaseRollout):
 
         # users can customize different sampling_params at different run
         _tree_metrics: dict = {}
+        print(f"[TreeRollout] Debug: tree_search_params entering context: {self.sampling_params.tree_search_params}")
         with self.update_sampling_params(**kwargs):
+            print(f"[TreeRollout] Debug: tree_search_params inside context: {self.sampling_params.tree_search_params}")
             outputs = self.inference_engine.generate(
                 prompts=vllm_inputs,  # because we have already convert it to prompt token id
                 sampling_params=self.sampling_params,
@@ -467,7 +476,19 @@ class vLLMRollout(BaseRollout):
 
             for out_idx, output in enumerate(outputs):
                 seq_map = {out.seq_id: out for out in output.outputs}
+                # Debug: Check what attributes are available
+                if out_idx == 0 and len(output.outputs) > 0:
+                    first_sample = output.outputs[0]
+                    print(f"[TreeRollout] Debug first sample attrs: {dir(first_sample)}")
+                    print(f"[TreeRollout] Debug hasattr is_leaf: {hasattr(first_sample, 'is_leaf')}")
+                    print(f"[TreeRollout] Debug hasattr parent_seq_id: {hasattr(first_sample, 'parent_seq_id')}")
+                    print(f"[TreeRollout] Debug hasattr tree_ids: {hasattr(first_sample, 'tree_ids')}")
+                    print(f"[TreeRollout] Debug hasattr tree_depth: {hasattr(first_sample, 'tree_depth')}")
+                    print(f"[TreeRollout] Debug sampling_params.tree_search_params: {self.sampling_params.tree_search_params}")
                 has_tree = any(getattr(s, 'is_leaf', False) for s in output.outputs)
+                # Check another way - do any outputs have tree_ids?
+                if not has_tree:
+                    has_tree = any(hasattr(s, 'tree_ids') and len(getattr(s, 'tree_ids', [])) > 0 for s in output.outputs)
 
                 samples_to_collect = output.outputs
                 for sample in samples_to_collect:
