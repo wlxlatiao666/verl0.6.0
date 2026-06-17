@@ -10,7 +10,7 @@ export RAY_DEDUP_LOGS=0
 export NCCL_SHM_DISABLE=1
 export NCCL_DEBUG=INFO
 HOME=/inspire/hdd/global_user/weilongxuan-253108120168
-verl_dir=/inspire/qb-ilm2/project/neosmosis/weilongxuan-253108120168/verl_data
+verl_dir=/inspire/hdd/global_user/weilongxuan-253108120168/verl_data
 project_name=verl_grpo_tree_0613
 experiment_name=qwen2.5_math7b_tree_segment_b3d3_260613
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl0.6.0"}
@@ -40,7 +40,7 @@ fi
 # Local testing only: put your key here if you do not use env / ~/.wandb_api_key.
 # Priority: shell export > key files above > this line (empty = skip).
 # Do not commit real keys to shared repos.
-_WANDB_API_KEY_INLINE=""
+_WANDB_API_KEY_INLINE="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"
 if [[ -z "${WANDB_API_KEY:-}" ]] && [[ -n "${_WANDB_API_KEY_INLINE}" ]]; then
   export WANDB_API_KEY="${_WANDB_API_KEY_INLINE}"
 fi
@@ -80,7 +80,6 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
-    actor_rollout_ref.actor.policy_loss.loss_mode=tree_segment \
     actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
