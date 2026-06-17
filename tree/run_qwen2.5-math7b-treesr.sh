@@ -82,6 +82,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.actor.policy_loss.loss_mode=tree_segment \
     actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean \
+    actor_rollout_ref.actor.tree_segment_batch_strategy=segment \
+    actor_rollout_ref.actor.ppo_micro_batch_segments=2 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
