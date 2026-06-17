@@ -260,16 +260,18 @@ def compute_advantage(
     return data
 
 
-def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw") -> DataProto:
+def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", local_adv_weight: float = 0.5, global_adv_weight: float = 0.5) -> DataProto:
     """Compute per-segment advantages for tree process reward.
 
     Step 1 — Back-propagate leaf scores to all nodes (bottom-up):
         non-leaf score = mean(children scores)
         leaf score = sum of token_level_rewards for that leaf
 
-    Step 2 — Parent-relative normalisation per sibling group:
-        adv(s) = (score(s) - score(parent(s))) / (std(siblings) + eps)
-        Root nodes (no parent) get advantage = 0.
+    Step 2 — Compute advantages combining local and global signals:
+        - Local advantage: adv_local(s) = (score(s) - score(parent(s))) / (std(siblings) + eps)
+        - Global advantage: adv_global(s) = (score(s) - mean_leaf_score) / (std_leaf_scores + eps)
+        - Combined advantage: adv(s) = local_adv_weight * adv_local(s) + global_adv_weight * adv_global(s)
+        Root nodes (no parent) get local advantage = 0.
 
     Step 3 — Assemble token-level advantages per leaf sequence:
         Each leaf's response tokens are filled with the advantage of the segment
@@ -374,12 +376,13 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw") 
     #         children_sum[p] += node_scores[i]
     #         children_count[p] += 1
 
-    # ── Step 2: parent-relative normalisation ────────────────────────────────
-    # adv(s) = (score(s) - score(parent(s))) / std(siblings + eps)
-    # root nodes (no parent) get advantage = 0
-    seg_advantages = torch.zeros(n_unique, dtype=torch.float32, device=device)
+    # ── Step 2: combine local and global advantages ──────────────────────────
+    # Local advantage: adv_local(s) = (score(s) - score(parent(s))) / (std(siblings) + eps)
+    # Global advantage: adv_global(s) = (score(s) - mean_leaf_score) / (std_leaf_scores + eps)
+    # Combined: adv(s) = local_adv_weight * adv_local(s) + global_adv_weight * adv_global(s)
+    seg_local_advantages = torch.zeros(n_unique, dtype=torch.float32, device=device)
 
-    # group children by parent to compute sibling std
+    # group children by parent to compute sibling std for local advantage
     children_of: dict[int, list[int]] = defaultdict(list)
     for i in range(n_unique):
         p = int(parent_of[i])
@@ -393,7 +396,17 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw") 
         # print("sib_std:", sib_std)
         # print("sibling_scores:", sibling_scores)
         parent_score = node_scores[p]
-        seg_advantages[children_t] = (sibling_scores - parent_score) / (sib_std + 1e-6)
+        seg_local_advantages[children_t] = (sibling_scores - parent_score) / (sib_std + 1e-6)
+
+    # Compute global advantage (relative to all leaf nodes)
+    leaf_indices = torch.tensor(list(leaf_seg_to_leaf_idx.keys()), dtype=torch.long, device=device)
+    leaf_node_scores = node_scores[leaf_indices]
+    mean_leaf_score = leaf_node_scores.mean()
+    std_leaf_score = leaf_node_scores.std() if len(leaf_node_scores) > 1 else torch.tensor(0.0, device=device)
+    seg_global_advantages = (node_scores - mean_leaf_score) / (std_leaf_score + 1e-6)
+
+    # Combine local and global advantages
+    seg_advantages = local_adv_weight * seg_local_advantages + global_adv_weight * seg_global_advantages
     # ── Step 3: assemble token-level advantages per leaf ─────────────────────
     # Each leaf's response is the concatenation of its path segments in order.
     # We fill token positions with the advantage of the segment they belong to.
@@ -1433,13 +1446,20 @@ class RayPPOTrainer:
                         metrics.update(is_metrics)
 
                         # Tree process reward: propagate rewards bottom-up and compute
-                        # per-node advantage = node_reward - parent_reward.
+                        # per-node advantage combining local (parent-relative) and global (all leaves-relative) signals.
                         # This bypasses the normal advantage estimator for tree nodes.
                         has_unique_segments = "unique_segments" in batch.non_tensor_batch or \
                                               "unique_segments" in batch.meta_info.get("metrics", {})
                         if has_unique_segments:
                             proc_agg_mode = self.config.algorithm.get("proc_agg_mode", "raw")
-                            batch = compute_tree_process_advantage(batch, proc_agg_mode=proc_agg_mode)
+                            local_adv_weight = self.config.algorithm.get("local_adv_weight", 0.5)
+                            global_adv_weight = self.config.algorithm.get("global_adv_weight", 0.5)
+                            batch = compute_tree_process_advantage(
+                                batch,
+                                proc_agg_mode=proc_agg_mode,
+                                local_adv_weight=local_adv_weight,
+                                global_adv_weight=global_adv_weight
+                            )
                         else:
                             # compute advantages, executed on the driver process
                             norm_adv_by_std_in_grpo = self.config.algorithm.get(
