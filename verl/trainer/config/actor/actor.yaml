@@ -71,6 +71,12 @@ clip_ratio_c: 3.0
 # Loss aggregation mode: "token-mean", "seq-mean-token-sum", or "seq-mean-token-mean"
 loss_agg_mode: token-mean
 
+# Tree segment batch strategy: 'leaf' (default) or 'segment'
+tree_segment_batch_strategy: leaf
+
+# Number of segments per micro batch when using segment batching
+ppo_micro_batch_segments: null
+
 # Entropy regularization coefficient in PPO loss
 entropy_coeff: 0
 
