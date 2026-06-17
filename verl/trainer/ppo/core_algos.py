@@ -1371,7 +1371,14 @@ def build_segment_tensors(
     resp_len = old_log_prob.shape[1]
 
     print(f"[tree_segment] old_log_prob shape: {old_log_prob.shape if old_log_prob is not None else None}")
-    print(f"[tree_segment] Building segment-level tensors for {n_unique} unique segments from {len(leaf_segment_indices)} leaves.")
+    print(f"[tree_segment] Building segment-level tensors for {n_unique} unique segments from {len(leaf_segment_indices)} leaves, resp_len={resp_len}")
+
+    # Validate that unique_segments and leaf paths make sense
+    if n_unique > 0 and len(leaf_segment_indices) > 0:
+        # Check the first leaf
+        first_path = leaf_segment_indices[0]
+        total_seg_len = sum(len(unique_segments[s]) for s in first_path)
+        print(f"[tree_segment] First leaf path len: {len(first_path)}, total segment tokens: {total_seg_len}, resp_len: {resp_len}")
 
     # Debug: Print segment distribution statistics
     path_lengths = [len(path) for path in leaf_segment_indices]
@@ -1395,11 +1402,15 @@ def build_segment_tensors(
     for j, path in enumerate(leaf_segment_indices):
         offset = 0
         for seg_idx in path:
+            if offset >= resp_len:
+                # Prevent offsets beyond the response length
+                break
             if seg_canonical[seg_idx][0] == -1:
                 seg_canonical[seg_idx] = (j, offset)
-            offset += len(unique_segments[seg_idx])
-            if offset >= resp_len:
-                break
+            # Only advance offset if there's space left
+            remaining = resp_len - offset
+            seg_len = len(unique_segments[seg_idx])
+            offset += min(seg_len, remaining)
 
     seg_lens = [len(unique_segments[i]) for i in range(n_unique)]
     max_seg_len = max(seg_lens) if seg_lens else 0

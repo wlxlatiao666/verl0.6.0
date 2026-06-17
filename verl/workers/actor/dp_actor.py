@@ -524,18 +524,49 @@ class DataParallelPPOActor(BasePPOActor):
                     # Build leaf inverse map: from original local leaf index to local index in mini_batch
                     leaf_inverse_map = {global_idx: local_idx for local_idx, global_idx in enumerate(required_leaves)}
 
-                    # Build segment log_probs
+                    # Build segment log_probs - the simple but safe way
                     max_seg_len = global_tree_seg_targets["old_log_prob"].shape[1]
                     seg_log_prob_local = torch.zeros(len(seg_indices), max_seg_len, device=log_prob.device, dtype=log_prob.dtype)
 
+                    seg_canonical = global_tree_seg_targets["seg_canonical"]
                     seg_lens = global_tree_seg_targets["seg_lens"]
+                    print(f"[tree_segment] log_prob shape: {log_prob.shape}, max_seg_len: {max_seg_len}, num_segs: {len(seg_indices)}, num_leaves: {len(required_leaves)}")
+
+                    # Also keep track of valid segments in case we need to filter
+                    valid_seg_mask = torch.ones(len(seg_indices), dtype=torch.bool, device=log_prob.device)
+
                     for local_i, seg_idx in enumerate(seg_indices):
                         leaf_j, tok_offset = seg_canonical[seg_idx]
                         local_leaf_j = leaf_inverse_map[leaf_j]
                         seg_len = seg_lens[seg_idx]
-                        end_tok = min(tok_offset + seg_len, log_prob.shape[1])
-                        actual_len = end_tok - tok_offset
-                        seg_log_prob_local[local_i, :actual_len] = log_prob[local_leaf_j, tok_offset:end_tok]
+
+                        # Skip if the leaf or offset is out of bounds
+                        if local_leaf_j >= log_prob.shape[0]:
+                            print(f"[tree_segment] WARNING: local_leaf_j={local_leaf_j} >= log_prob.shape[0]={log_prob.shape[0]}, skipping seg_idx={seg_idx}")
+                            valid_seg_mask[local_i] = False
+                            continue
+
+                        if tok_offset >= log_prob.shape[1]:
+                            print(f"[tree_segment] WARNING: tok_offset={tok_offset} >= log_prob.shape[1]={log_prob.shape[1]}, skipping seg_idx={seg_idx}")
+                            valid_seg_mask[local_i] = False
+                            continue
+
+                        # Calculate safe end position
+                        available_len = log_prob.shape[1] - tok_offset
+                        actual_len = min(seg_len, available_len, max_seg_len)
+
+                        if actual_len <= 0:
+                            print(f"[tree_segment] WARNING: actual_len={actual_len} <=0 for seg_idx={seg_idx}, skipping")
+                            valid_seg_mask[local_i] = False
+                            continue
+
+                        # Extract the slice safely
+                        try:
+                            log_prob_slice = log_prob[local_leaf_j, tok_offset : tok_offset + actual_len]
+                            seg_log_prob_local[local_i, :actual_len] = log_prob_slice
+                        except Exception as e:
+                            print(f"[tree_segment] ERROR extracting slice for seg_idx={seg_idx}: {e}")
+                            valid_seg_mask[local_i] = False
 
                     # Get other segment tensors
                     if on_policy:
@@ -549,12 +580,28 @@ class DataParallelPPOActor(BasePPOActor):
                     if seg_rollout_is_weights_local is not None:
                         seg_rollout_is_weights_local = seg_rollout_is_weights_local[seg_indices].to(log_prob.device)
 
+                    # Filter out invalid segments
+                    num_valid = valid_seg_mask.sum().item()
+                    if num_valid < len(seg_indices):
+                        print(f"[tree_segment] Filtering out {len(seg_indices) - num_valid} invalid segments out of {len(seg_indices)}")
+                        if num_valid == 0:
+                            print(f"[tree_segment] WARNING: No valid segments in this micro-batch, skipping")
+                            continue
+
+                        # Filter all the tensors
+                        seg_log_prob_local = seg_log_prob_local[valid_seg_mask]
+                        seg_old_log_prob_local = seg_old_log_prob_local[valid_seg_mask]
+                        seg_advantages_local = seg_advantages_local[valid_seg_mask]
+                        seg_response_mask_local = seg_response_mask_local[valid_seg_mask]
+                        if seg_rollout_is_weights_local is not None:
+                            seg_rollout_is_weights_local = seg_rollout_is_weights_local[valid_seg_mask]
+
                     # Compute loss
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
                     micro_batch_metrics = {}
 
                     if m == 0:
-                        print(f"[tree_segment] Updating {len(seg_indices)} segments in this micro-batch, "
+                        print(f"[tree_segment] Updating {num_valid} valid segments (out of {len(seg_indices)}) in this micro-batch, "
                               f"requiring {len(required_leaves)} leaves out of {global_batch_size} total leaves")
 
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
