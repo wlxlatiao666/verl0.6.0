@@ -83,8 +83,6 @@ class DataParallelPPOActor(BasePPOActor):
             else entropy_from_logits
         )
         self.device_name = get_device_name()
-
-        # Initialize gradient accumulation attribute for safety
         self.gradient_accumulation = 1
 
     def _forward_micro_batch(
@@ -471,17 +469,16 @@ class DataParallelPPOActor(BasePPOActor):
                 else:
                     ppo_micro_batch_segments = max(8, total_segments // 10)
 
+            print(f"[tree_segment] Using segment-based batching: {total_segments} segments total, "
+                  f"{ppo_micro_batch_segments} segments per micro-batch, "
+                  f"gradient accumulation over {self.gradient_accumulation} micro-batches")
+
             # Determine gradient accumulation: how many micro-batches per optimizer step
             # This should match the leaf-based strategy logic
             if self.config.ppo_micro_batch_size_per_gpu is not None and self.config.ppo_mini_batch_size is not None:
                 self.gradient_accumulation = max(1, self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu)
             else:
                 self.gradient_accumulation = 1
-
-            print(f"[tree_segment] Using segment-based batching: {total_segments} segments total, "
-                  f"{ppo_micro_batch_segments} segments per micro-batch, "
-                  f"gradient accumulation over {self.gradient_accumulation} micro-batches")
-
             on_policy = total_segments <= ppo_micro_batch_segments and self.config.ppo_epochs == 1
 
             for _ in range(self.config.ppo_epochs):
@@ -497,67 +494,65 @@ class DataParallelPPOActor(BasePPOActor):
                 # Zero grad at the start of each mini-batch cycle
                 self.actor_optimizer.zero_grad()
 
-                # SIMPLER & SAFER APPROACH: First compute log_prob for ALL leaves in one go!
-                # This avoids all the subset indexing issues
-                full_data = data.to(get_device_id())
-                full_model_inputs = {**full_data.batch, **full_data.non_tensor_batch}
-                entropy_coeff = self.config.entropy_coeff
-                loss_agg_mode = self.config.loss_agg_mode
-
-                calculate_entropy = entropy_coeff != 0
-                entropy_full, log_prob_full = self._forward_micro_batch(
-                    full_model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
-                )
-
-                print(f"[tree_segment] Computed log_prob for full batch: {log_prob_full.shape}")
-
-                # Now build segment tensors ONCE using the full log_prob
-                unique_segments = data.non_tensor_batch.get("unique_segments")
-                if unique_segments is None:
-                    unique_segments = data.meta_info.get("metrics", {}).get("unique_segments", [])
-                leaf_segment_indices = data.non_tensor_batch.get("leaf_segment_indices", [])
-
-                seg_log_prob_all, _, _, _, _, _, _ = build_segment_tensors(
-                    log_prob=log_prob_full,
-                    old_log_prob=full_model_inputs["old_log_probs"],
-                    advantages=full_model_inputs["advantages"],
-                    response_mask=full_model_inputs["response_mask"],
-                    unique_segments=unique_segments,
-                    leaf_segment_indices=leaf_segment_indices,
-                    rollout_is_weights=full_model_inputs.get("rollout_is_weights"),
-                )
-
-                print(f"[tree_segment] Built seg_log_prob_all for all {len(seg_log_prob_all)} segments")
-
                 for m, seg_indices in enumerate(segment_micro_batches):
                     if not seg_indices:
                         continue
 
-                    print(f"[tree_segment] Processing micro-batch with {len(seg_indices)} segments")
+                    # Collect all required leaves for these segments
+                    seg_canonical = global_tree_seg_targets["seg_canonical"]
+                    required_leaves = list({seg_canonical[i][0] for i in seg_indices})
 
-                    # Now simply EXTRACT the segments we need from our pre-built seg_log_prob_all!
-                    seg_log_prob_local = seg_log_prob_all[seg_indices].clone()
-                    # Get other segment tensors from our pre-built global targets
+                    # Get the data for required leaves only
+                    # Note: seg_canonical uses LOCAL leaf indices within this worker's data
+                    mini_batch = data[required_leaves]
+                    mini_batch = mini_batch.to(get_device_id())
+
+                    # Forward pass on required leaves
+                    model_inputs = {**mini_batch.batch, **mini_batch.non_tensor_batch}
+                    entropy_coeff = self.config.entropy_coeff
+                    loss_agg_mode = self.config.loss_agg_mode
+                    loss_scale_factor = 1 / self.gradient_accumulation
+
+                    calculate_entropy = entropy_coeff != 0
+                    entropy, log_prob = self._forward_micro_batch(
+                        model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                    )
+
+                    # Build leaf inverse map: from original local leaf index to local index in mini_batch
+                    leaf_inverse_map = {global_idx: local_idx for local_idx, global_idx in enumerate(required_leaves)}
+
+                    # Build segment log_probs
+                    max_seg_len = global_tree_seg_targets["old_log_prob"].shape[1]
+                    seg_log_prob_local = torch.zeros(len(seg_indices), max_seg_len, device=log_prob.device, dtype=log_prob.dtype)
+
+                    seg_lens = global_tree_seg_targets["seg_lens"]
+                    for local_i, seg_idx in enumerate(seg_indices):
+                        leaf_j, tok_offset = seg_canonical[seg_idx]
+                        local_leaf_j = leaf_inverse_map[leaf_j]
+                        seg_len = seg_lens[seg_idx]
+                        end_tok = min(tok_offset + seg_len, log_prob.shape[1])
+                        actual_len = end_tok - tok_offset
+                        seg_log_prob_local[local_i, :actual_len] = log_prob[local_leaf_j, tok_offset:end_tok]
+
+                    # Get other segment tensors
                     if on_policy:
                         seg_old_log_prob_local = seg_log_prob_local.detach()
                     else:
-                        seg_old_log_prob_local = global_tree_seg_targets["old_log_prob"][seg_indices].to(seg_log_prob_local.device)
+                        seg_old_log_prob_local = global_tree_seg_targets["old_log_prob"][seg_indices].to(log_prob.device)
 
-                    seg_advantages_local = global_tree_seg_targets["advantages"][seg_indices].to(seg_log_prob_local.device)
-                    seg_response_mask_local = global_tree_seg_targets["response_mask"][seg_indices].to(seg_log_prob_local.device)
+                    seg_advantages_local = global_tree_seg_targets["advantages"][seg_indices].to(log_prob.device)
+                    seg_response_mask_local = global_tree_seg_targets["response_mask"][seg_indices].to(log_prob.device)
                     seg_rollout_is_weights_local = global_tree_seg_targets["rollout_is_weights"]
                     if seg_rollout_is_weights_local is not None:
-                        seg_rollout_is_weights_local = seg_rollout_is_weights_local[seg_indices].to(seg_log_prob_local.device)
-
-                    num_valid = len(seg_indices)
-                    loss_scale_factor = 1 / self.gradient_accumulation
+                        seg_rollout_is_weights_local = seg_rollout_is_weights_local[seg_indices].to(log_prob.device)
 
                     # Compute loss
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
                     micro_batch_metrics = {}
 
                     if m == 0:
-                        print(f"[tree_segment] Updating {num_valid} segments in this micro-batch")
+                        print(f"[tree_segment] Updating {len(seg_indices)} segments in this micro-batch, "
+                              f"requiring {len(required_leaves)} leaves out of {global_batch_size} total leaves")
 
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
                         old_log_prob=seg_old_log_prob_local,
@@ -569,34 +564,25 @@ class DataParallelPPOActor(BasePPOActor):
                         rollout_is_weights=seg_rollout_is_weights_local,
                     )
 
-                    policy_loss = pg_loss
-
-                    # Entropy loss: we compute it at micro-batch level by tracking which leaves are needed
+                    # Entropy loss
                     if entropy_coeff != 0:
-                        # Collect all leaves required for these segments and compute entropy on them
-                        seg_canonical = global_tree_seg_targets["seg_canonical"]
-                        required_leaves = list({seg_canonical[i][0] for i in seg_indices})
-                        if required_leaves:
-                            response_mask = full_model_inputs["response_mask"][required_leaves]
-                            entropy_loss = agg_loss(loss_mat=entropy_full[required_leaves], loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-                            policy_loss = pg_loss - entropy_loss * entropy_coeff
+                        response_mask = model_inputs["response_mask"]
+                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        policy_loss = pg_loss - entropy_loss * entropy_coeff
+                    else:
+                        policy_loss = pg_loss
 
-                    # KL loss (similar approach)
+                    # KL loss
                     if self.config.use_kl_loss:
-                        seg_canonical = global_tree_seg_targets["seg_canonical"]
-                        required_leaves = list({seg_canonical[i][0] for i in seg_indices})
-                        if required_leaves:
-                            ref_log_prob = full_model_inputs["ref_log_prob"][required_leaves]
-                            response_mask = full_model_inputs["response_mask"][required_leaves]
-                            # Compute log_prob for these leaves if we haven't already
-                            log_prob_leaves = log_prob_full[required_leaves]
-                            kld = kl_penalty(
-                                logprob=log_prob_leaves, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
-                            )
-                            kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-                            policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
-                            micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor
-                            micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
+                        ref_log_prob = model_inputs["ref_log_prob"]
+                        response_mask = model_inputs["response_mask"]
+                        kld = kl_penalty(
+                            logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
+                        )
+                        kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+                        micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor
+                        micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
                     # Backward pass with gradient accumulation
                     loss = policy_loss * loss_scale_factor
