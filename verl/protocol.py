@@ -481,6 +481,11 @@ class DataProto:
                     f"data in the non_tensor_batch must be a numpy.array with dtype=object, but for "
                     f"{key=}, got {type(val)=}"
                 )
+                # Skip length check for tree segment metadata - they are per-worker collections,
+                # not per-leaf data. unique_segments has length = number of unique tree nodes,
+                # not equal to batch size (number of leaves).
+                if key in ("unique_segments", "unique_segment_seq_ids"):
+                    continue
                 assert val.shape[0] == batch_size, (
                     f"key {key} length {len(val)} is not equal to batch size {batch_size}"
                 )
@@ -677,7 +682,11 @@ class DataProto:
 
         selected_non_tensor = {}
         for key, val in self.non_tensor_batch.items():
-            selected_non_tensor[key] = val[idxs_np]
+            if key in ("unique_segments", "unique_segment_seq_ids"):
+                # Keep these as-is - they are global segment collections, not per-leaf data
+                selected_non_tensor[key] = val
+            else:
+                selected_non_tensor[key] = val[idxs_np]
 
         return type(self)(batch=selected_batch, non_tensor_batch=selected_non_tensor, meta_info=self.meta_info)
 
@@ -722,7 +731,11 @@ class DataProto:
         # Handle the non-tensor batch data
         sliced_non_tensor = {}
         for key, val in self.non_tensor_batch.items():
-            sliced_non_tensor[key] = val[slice_obj]
+            if key in ("unique_segments", "unique_segment_seq_ids"):
+                # Keep these as-is - they are global segment collections, not per-leaf data
+                sliced_non_tensor[key] = val
+            else:
+                sliced_non_tensor[key] = val[slice_obj]
 
         # Return a new DataProto object
         return type(self)(batch=sliced_batch, non_tensor_batch=sliced_non_tensor, meta_info=self.meta_info)
@@ -895,13 +908,19 @@ class DataProto:
         non_tensor_batch_lst = [{} for _ in range(chunks)]
         for key, val in self.non_tensor_batch.items():
             assert isinstance(val, np.ndarray)
-            if bsz_in_batch is not None:
-                non_tensor_lst = np.array_split(val, chunk_indices.tolist())
+            if key in ("unique_segments", "unique_segment_seq_ids"):
+                # These are global segment collections - copy the full array to each chunk
+                for i in range(chunks):
+                    non_tensor_batch_lst[i][key] = val
             else:
-                non_tensor_lst = np.array_split(val, chunks)
-            assert len(non_tensor_lst) == chunks
-            for i in range(chunks):
-                non_tensor_batch_lst[i][key] = non_tensor_lst[i]
+                # Normal per-leaf data - split across chunks
+                if bsz_in_batch is not None:
+                    non_tensor_lst = np.array_split(val, chunk_indices.tolist())
+                else:
+                    non_tensor_lst = np.array_split(val, chunks)
+                assert len(non_tensor_lst) == chunks
+                for i in range(chunks):
+                    non_tensor_batch_lst[i][key] = non_tensor_lst[i]
 
         output = []
         for i in range(chunks):
@@ -1026,7 +1045,14 @@ class DataProto:
         """
         indices_np = indices.detach().numpy()
         self.batch = self.batch[indices]
-        self.non_tensor_batch = {key: val[indices_np] for key, val in self.non_tensor_batch.items()}
+        new_non_tensor_batch = {}
+        for key, val in self.non_tensor_batch.items():
+            if key in ("unique_segments", "unique_segment_seq_ids"):
+                # Keep these as-is - they are global segment collections
+                new_non_tensor_batch[key] = val
+            else:
+                new_non_tensor_batch[key] = val[indices_np]
+        self.non_tensor_batch = new_non_tensor_batch
 
     def repeat(self, repeat_times=2, interleave=True):
         """
@@ -1061,10 +1087,14 @@ class DataProto:
 
         repeated_non_tensor_batch = {}
         for key, val in self.non_tensor_batch.items():
-            if interleave:
-                repeated_non_tensor_batch[key] = np.repeat(val, repeat_times, axis=0)
+            if key in ("unique_segments", "unique_segment_seq_ids"):
+                # Keep these as-is - they are global segment collections
+                repeated_non_tensor_batch[key] = val
             else:
-                repeated_non_tensor_batch[key] = np.tile(val, (repeat_times,) + (1,) * (val.ndim - 1))
+                if interleave:
+                    repeated_non_tensor_batch[key] = np.repeat(val, repeat_times, axis=0)
+                else:
+                    repeated_non_tensor_batch[key] = np.tile(val, (repeat_times,) + (1,) * (val.ndim - 1))
 
         return type(self)(
             batch=repeated_batch,
@@ -1151,7 +1181,11 @@ class DataProto:
 
         repeated_non_tensor_batch = {}
         for key, val in self.non_tensor_batch.items():
-            repeated_non_tensor_batch[key] = np.repeat(val, repeat_times, axis=0)
+            if key in ("unique_segments", "unique_segment_seq_ids"):
+                # Keep these as-is - they are global segment collections
+                repeated_non_tensor_batch[key] = val
+            else:
+                repeated_non_tensor_batch[key] = np.repeat(val, repeat_times, axis=0)
 
         return type(self)(
             batch=repeated_batch,
