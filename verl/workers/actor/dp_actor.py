@@ -84,6 +84,9 @@ class DataParallelPPOActor(BasePPOActor):
         )
         self.device_name = get_device_name()
 
+        # Initialize gradient accumulation attribute for safety
+        self.gradient_accumulation = 1
+
     def _forward_micro_batch(
         self, micro_batch, temperature, calculate_entropy=False
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -468,16 +471,17 @@ class DataParallelPPOActor(BasePPOActor):
                 else:
                     ppo_micro_batch_segments = max(8, total_segments // 10)
 
-            print(f"[tree_segment] Using segment-based batching: {total_segments} segments total, "
-                  f"{ppo_micro_batch_segments} segments per micro-batch, "
-                  f"gradient accumulation over {self.gradient_accumulation} micro-batches")
-
             # Determine gradient accumulation: how many micro-batches per optimizer step
             # This should match the leaf-based strategy logic
             if self.config.ppo_micro_batch_size_per_gpu is not None and self.config.ppo_mini_batch_size is not None:
                 self.gradient_accumulation = max(1, self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu)
             else:
                 self.gradient_accumulation = 1
+
+            print(f"[tree_segment] Using segment-based batching: {total_segments} segments total, "
+                  f"{ppo_micro_batch_segments} segments per micro-batch, "
+                  f"gradient accumulation over {self.gradient_accumulation} micro-batches")
+
             on_policy = total_segments <= ppo_micro_batch_segments and self.config.ppo_epochs == 1
 
             for _ in range(self.config.ppo_epochs):
