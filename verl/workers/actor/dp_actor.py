@@ -385,6 +385,11 @@ class DataParallelPPOActor(BasePPOActor):
             non_tensor_select_keys.append("multi_modal_inputs")
         if "leaf_segment_indices" in data.non_tensor_batch:
             non_tensor_select_keys.append("leaf_segment_indices")
+        # Also select tree segment data if present
+        if "unique_segments" in data.non_tensor_batch:
+            non_tensor_select_keys.append("unique_segments")
+        if "unique_segment_seq_ids" in data.non_tensor_batch:
+            non_tensor_select_keys.append("unique_segment_seq_ids")
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys if non_tensor_select_keys else None)
 
@@ -394,7 +399,11 @@ class DataParallelPPOActor(BasePPOActor):
         global_tree_seg_targets = None
         global_batch_size = len(data)
         if loss_mode == "tree_segment":
-            unique_segments = data.meta_info.get("metrics", {}).get("unique_segments")
+            # Try to get unique_segments from non_tensor_batch first (new location),
+            # then fall back to meta_info['metrics'] (old location for compatibility)
+            unique_segments = data.non_tensor_batch.get("unique_segments")
+            if unique_segments is None:
+                unique_segments = data.meta_info.get("metrics", {}).get("unique_segments")
             leaf_segment_indices = data.non_tensor_batch.get("leaf_segment_indices")
             if unique_segments is not None and leaf_segment_indices is not None:
                 import torch.distributed as dist

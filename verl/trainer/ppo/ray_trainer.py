@@ -288,7 +288,11 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw") 
     print(f"leave_scores:{leaf_scores}")
     print(f"leave_scores.shape:{leaf_scores.shape}")
 
-    unique_segments = data.meta_info["metrics"]["unique_segments"]
+    # Try to get unique_segments from non_tensor_batch first (new location),
+    # then fall back to meta_info['metrics'] (old location for compatibility)
+    unique_segments = data.non_tensor_batch.get("unique_segments")
+    if unique_segments is None:
+        unique_segments = data.meta_info["metrics"]["unique_segments"]
     # print(f"[process advantage] unique_segments: {unique_segments}")     # (n_unique,) of lists
     leaf_segment_indices = data.non_tensor_batch["leaf_segment_indices"]  # (n_leaves,) of lists
 
@@ -1257,10 +1261,8 @@ class RayPPOTrainer:
                                     metrics[k] = sum(v)  # sum across workers
                                 else:
                                     metrics[k] = sum(v) / len(v)  # average
-                            # Preserve unique_segments/unique_segment_seq_ids for tree_segment loss;
-                            # they are not scalar metrics but are needed downstream by the actor.
-                            # After DataProto.concat, list_of_dict_to_dict_of_list wraps each value in
-                            # a list (one entry per worker), so concatenate them into a single array.
+                            # For backward compatibility: if unique_segments/unique_segment_seq_ids are still
+                            # in metrics (from old code), preserve them there. In new code they are in non_tensor_batch.
                             _segment_keys = ("unique_segments", "unique_segment_seq_ids")
                             _preserved = {}
                             for k in _segment_keys:
@@ -1433,7 +1435,9 @@ class RayPPOTrainer:
                         # Tree process reward: propagate rewards bottom-up and compute
                         # per-node advantage = node_reward - parent_reward.
                         # This bypasses the normal advantage estimator for tree nodes.
-                        if "unique_segments" in batch.meta_info.get("metrics", {}):
+                        has_unique_segments = "unique_segments" in batch.non_tensor_batch or \
+                                              "unique_segments" in batch.meta_info.get("metrics", {})
+                        if has_unique_segments:
                             proc_agg_mode = self.config.algorithm.get("proc_agg_mode", "raw")
                             batch = compute_tree_process_advantage(batch, proc_agg_mode=proc_agg_mode)
                         else:

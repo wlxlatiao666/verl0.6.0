@@ -540,14 +540,16 @@ class vLLMRollout(BaseRollout):
             # leaf_segment_indices: for each leaf, ordered indices into unique_segments for its root→leaf path
             #                       shape (n_leaves,) of variable-len index arrays
             if _tree_process_reward:
-                # Always write these keys (even if empty) so all workers have the same metrics keys
+                # Always write these keys (even if empty) so all workers have the same keys
+                # NOTE: unique_segments and unique_segment_seq_ids are stored in non_tensor_batch
+                # rather than meta_info['metrics'] so they are properly partitioned per-worker
                 if unique_segments:
-                    _tree_metrics["unique_segments"] = np.array(unique_segments, dtype=object)
-                    _tree_metrics["unique_segment_seq_ids"] = np.array(unique_segment_seq_ids, dtype=np.int64)
+                    non_tensor_batch["unique_segments"] = np.array(unique_segments, dtype=object)
+                    non_tensor_batch["unique_segment_seq_ids"] = np.array(unique_segment_seq_ids, dtype=np.int64)
                 else:
                     # Write empty arrays with the right dtype
-                    _tree_metrics["unique_segments"] = np.array([], dtype=object)
-                    _tree_metrics["unique_segment_seq_ids"] = np.array([], dtype=np.int64)
+                    non_tensor_batch["unique_segments"] = np.array([], dtype=object)
+                    non_tensor_batch["unique_segment_seq_ids"] = np.array([], dtype=np.int64)
                 # leaf_segment_indices aligns with batch dimension (one entry per leaf response)
                 if leaf_segment_indices:
                     leaf_seg_arr = np.empty(len(leaf_segment_indices), dtype=object)
