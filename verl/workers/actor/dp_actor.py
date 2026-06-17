@@ -20,6 +20,7 @@ Single Process Actor
 import logging
 import os
 
+import numpy as np
 import torch
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -396,9 +397,24 @@ class DataParallelPPOActor(BasePPOActor):
             unique_segments = data.meta_info.get("metrics", {}).get("unique_segments")
             leaf_segment_indices = data.non_tensor_batch.get("leaf_segment_indices")
             if unique_segments is not None and leaf_segment_indices is not None:
-                print(f"[tree_segment] Building GLOBAL segment tensors: batch_size={len(data)}, n_unique={len(unique_segments)}")
+                import torch.distributed as dist
+                rank = dist.get_rank() if dist.is_initialized() else 0
+                world_size = dist.get_world_size() if dist.is_initialized() else 1
+
+                print(f"[tree_segment] [Rank {rank}/{world_size}] Building segment tensors:")
+                print(f"[tree_segment] [Rank {rank}/{world_size}] - Batch size (leaves): {len(data)}")
+                print(f"[tree_segment] [Rank {rank}/{world_size}] - Unique segments (global): {len(unique_segments)}")
+                print(f"[tree_segment] [Rank {rank}/{world_size}] - leaf_segment_indices count: {len(leaf_segment_indices)}")
+
                 # Unpack TensorDict to plain dict so .get() works safely
                 data_inputs = {**data.batch, **data.non_tensor_batch}
+                print(f"[tree_segment] [Rank {rank}/{world_size}] - old_log_probs shape: {data_inputs['old_log_probs'].shape}")
+
+                # Check the first few path lengths
+                if len(leaf_segment_indices) > 0:
+                    avg_path_len = np.mean([len(p) for p in leaf_segment_indices])
+                    max_path_len = max([len(p) for p in leaf_segment_indices])
+                    print(f"[tree_segment] [Rank {rank}/{world_size}] - Avg path length: {avg_path_len:.2f}, Max path length: {max_path_len}")
                 _, seg_old_log_prob, seg_advantages, seg_response_mask, seg_canonical, seg_lens, seg_rollout_is = build_segment_tensors(
                     log_prob=None,
                     old_log_prob=data_inputs["old_log_probs"],
