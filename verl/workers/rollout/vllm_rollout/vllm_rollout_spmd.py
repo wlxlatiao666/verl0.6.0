@@ -533,8 +533,8 @@ class vLLMRollout(BaseRollout):
 
             # When tree search produces more responses than prompts,
             # expand prompt tensors and non_tensor_batch to match
-            if len(response) != batch_size:
-                prompt_indices_t = torch.tensor(prompt_indices, device=idx.device)
+            if len(response) != batch_size and len(prompt_indices) == len(response):
+                prompt_indices_t = torch.tensor(prompt_indices, device=idx.device, dtype=torch.long)
                 idx = idx[prompt_indices_t]
                 attention_mask = attention_mask[prompt_indices_t]
                 position_ids = position_ids[prompt_indices_t]
