@@ -390,8 +390,8 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw") 
         children_t = torch.tensor(children, dtype=torch.long, device=device)
         sibling_scores = node_scores[children_t]
         sib_std = sibling_scores.std() if len(children) > 1 else torch.tensor(0.0, device=device)
-        print("sib_std:", sib_std)
-        print("sibling_scores:", sibling_scores)
+        # print("sib_std:", sib_std)
+        # print("sibling_scores:", sibling_scores)
         parent_score = node_scores[p]
         seg_advantages[children_t] = (sibling_scores - parent_score) / (sib_std + 1e-6)
     # ── Step 3: assemble token-level advantages per leaf ─────────────────────

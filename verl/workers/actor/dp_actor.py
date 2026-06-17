@@ -469,9 +469,15 @@ class DataParallelPPOActor(BasePPOActor):
                     ppo_micro_batch_segments = max(8, total_segments // 10)
 
             print(f"[tree_segment] Using segment-based batching: {total_segments} segments total, "
-                  f"{ppo_micro_batch_segments} segments per micro-batch")
+                  f"{ppo_micro_batch_segments} segments per micro-batch, "
+                  f"gradient accumulation over {self.gradient_accumulation} micro-batches")
 
-            self.gradient_accumulation = max(1, total_segments // self.config.ppo_mini_batch_size // ppo_micro_batch_segments)
+            # Determine gradient accumulation: how many micro-batches per optimizer step
+            # This should match the leaf-based strategy logic
+            if self.config.ppo_micro_batch_size_per_gpu is not None and self.config.ppo_mini_batch_size is not None:
+                self.gradient_accumulation = max(1, self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu)
+            else:
+                self.gradient_accumulation = 1
             on_policy = total_segments <= ppo_micro_batch_segments and self.config.ppo_epochs == 1
 
             for _ in range(self.config.ppo_epochs):
@@ -484,6 +490,9 @@ class DataParallelPPOActor(BasePPOActor):
                     for i in range(0, total_segments, ppo_micro_batch_segments)
                 ]
 
+                # Zero grad at the start of each mini-batch cycle
+                self.actor_optimizer.zero_grad()
+
                 for m, seg_indices in enumerate(segment_micro_batches):
                     if not seg_indices:
                         continue
@@ -493,6 +502,7 @@ class DataParallelPPOActor(BasePPOActor):
                     required_leaves = list({seg_canonical[i][0] for i in seg_indices})
 
                     # Get the data for required leaves only
+                    # Note: seg_canonical uses LOCAL leaf indices within this worker's data
                     mini_batch = data[required_leaves]
                     mini_batch = mini_batch.to(get_device_id())
 
@@ -507,7 +517,7 @@ class DataParallelPPOActor(BasePPOActor):
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
 
-                    # Build leaf inverse map
+                    # Build leaf inverse map: from original local leaf index to local index in mini_batch
                     leaf_inverse_map = {global_idx: local_idx for local_idx, global_idx in enumerate(required_leaves)}
 
                     # Build segment log_probs
@@ -540,7 +550,8 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch_metrics = {}
 
                     if m == 0:
-                        print(f"[tree_segment] Updating {len(seg_indices)} segments in this micro-batch")
+                        print(f"[tree_segment] Updating {len(seg_indices)} segments in this micro-batch, "
+                              f"requiring {len(required_leaves)} leaves out of {global_batch_size} total leaves")
 
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
                         old_log_prob=seg_old_log_prob_local,
