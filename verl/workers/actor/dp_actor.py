@@ -834,10 +834,7 @@ class DataParallelPPOActor(BasePPOActor):
                                         seg_rollout_is_weights_local = seg_rollout_is_weights_local[seg_indices].to(log_prob.device)
 
                                     if batch_idx == 0 and m == 0:  # Print once per epoch
-                                        import torch.distributed as dist
-                                        rank = dist.get_rank() if dist.is_initialized() else 0
-                                        world_size = dist.get_world_size() if dist.is_initialized() else 1
-                                        print(f"[tree_segment] [Rank {rank}/{world_size}] Updating {len(seg_indices)} segments in this micro_batch")
+                                        print(f"[tree_segment] Updating {len(seg_indices)} segments in this micro_batch")
 
                                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
                                         old_log_prob=seg_old_log_prob_local,
