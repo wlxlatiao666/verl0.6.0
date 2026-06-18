@@ -396,48 +396,83 @@ class DataParallelPPOActor(BasePPOActor):
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys if non_tensor_select_keys else None)
 
-        # Pre-compute GLOBAL segment-level targets FIRST (before splitting into mini_batches) for tree_segment loss
-        # This ensures we aggregate ALL leaves in the entire batch first, then convert to segment-level tensors
+        # Pre-compute LOCAL segment-level targets FIRST (before splitting into mini_batches) for tree_segment loss
+        # Note: data is already sliced per-worker (each worker has its own leaves and segments)
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-        global_tree_seg_targets = None
-        global_batch_size = len(data)
+        local_tree_seg_targets = None
+        local_batch_size = len(data)
         if loss_mode == "tree_segment":
             # Try to get unique_segments from non_tensor_batch first (new location),
             # then fall back to meta_info['metrics'] (old location for compatibility)
-            unique_segments = data.non_tensor_batch.get("unique_segments")
-            if unique_segments is None:
-                unique_segments = data.meta_info.get("metrics", {}).get("unique_segments")
+            global_unique_segments = data.non_tensor_batch.get("unique_segments")
+            if global_unique_segments is None:
+                global_unique_segments = data.meta_info.get("metrics", {}).get("unique_segments")
                 print("get unique_segments from meta_info['metrics'] for tree_segment loss. This is the old location and may be None if not set properly in trainer.")
-            leaf_segment_indices = data.non_tensor_batch.get("leaf_segment_indices")
-            if unique_segments is not None and leaf_segment_indices is not None:
+            global_leaf_segment_indices = data.non_tensor_batch.get("leaf_segment_indices")
+            if global_unique_segments is not None and global_leaf_segment_indices is not None:
                 import torch.distributed as dist
                 rank = dist.get_rank() if dist.is_initialized() else 0
                 world_size = dist.get_world_size() if dist.is_initialized() else 1
 
+                # ==== REBUILD LOCAL SEGMENTS FROM GLOBAL ====
+                # Collect all segment indices referenced by this worker's leaves
+                used_global_seg_indices = set()
+                for path in global_leaf_segment_indices:
+                    for seg_idx in path:
+                        used_global_seg_indices.add(seg_idx)
+                used_global_seg_indices = sorted(used_global_seg_indices)
+
+                # Build mapping from global seg idx to local seg idx
+                global_segs_to_local = {
+                    global_seg_idx: local_seg_idx
+                    for local_seg_idx, global_seg_idx in enumerate(used_global_seg_indices)
+                }
+
+                # Build local unique_segments
+                local_unique_segments = [
+                    global_unique_segments[global_seg_idx]
+                    for global_seg_idx in used_global_seg_indices
+                ]
+
+                # Build local unique_segment_seq_ids if available
+                local_unique_segment_seq_ids = None
+                if "unique_segment_seq_ids" in data.non_tensor_batch:
+                    global_unique_segment_seq_ids = data.non_tensor_batch["unique_segment_seq_ids"]
+                    local_unique_segment_seq_ids = [
+                        global_unique_segment_seq_ids[global_seg_idx]
+                        for global_seg_idx in used_global_seg_indices
+                    ]
+
+                # Adjust leaf_segment_indices to use local indices
+                local_leaf_segment_indices = []
+                for path in global_leaf_segment_indices:
+                    adjusted_path = [global_segs_to_local[seg_idx] for seg_idx in path]
+                    local_leaf_segment_indices.append(adjusted_path)
+
                 print(f"[tree_segment] [Rank {rank}/{world_size}] Building segment tensors:")
                 print(f"[tree_segment] [Rank {rank}/{world_size}] - Batch size (leaves): {len(data)}")
-                print(f"[tree_segment] [Rank {rank}/{world_size}] - Unique segments (global): {len(unique_segments)}")
-                print(f"[tree_segment] [Rank {rank}/{world_size}] - leaf_segment_indices count: {len(leaf_segment_indices)}")
+                print(f"[tree_segment] [Rank {rank}/{world_size}] - Global unique segments: {len(global_unique_segments)}")
+                print(f"[tree_segment] [Rank {rank}/{world_size}] - Local unique segments: {len(local_unique_segments)}")
 
                 # Unpack TensorDict to plain dict so .get() works safely
                 data_inputs = {**data.batch, **data.non_tensor_batch}
                 print(f"[tree_segment] [Rank {rank}/{world_size}] - old_log_probs shape: {data_inputs['old_log_probs'].shape}")
 
                 # Check the first few path lengths
-                if len(leaf_segment_indices) > 0:
-                    avg_path_len = np.mean([len(p) for p in leaf_segment_indices])
-                    max_path_len = max([len(p) for p in leaf_segment_indices])
+                if len(local_leaf_segment_indices) > 0:
+                    avg_path_len = np.mean([len(p) for p in local_leaf_segment_indices])
+                    max_path_len = max([len(p) for p in local_leaf_segment_indices])
                     print(f"[tree_segment] [Rank {rank}/{world_size}] - Avg path length: {avg_path_len:.2f}, Max path length: {max_path_len}")
                 _, seg_old_log_prob, seg_advantages, seg_response_mask, seg_canonical, seg_lens, seg_rollout_is = build_segment_tensors(
                     log_prob=None,
                     old_log_prob=data_inputs["old_log_probs"],
                     advantages=data_inputs["advantages"],
                     response_mask=data_inputs["response_mask"],
-                    unique_segments=unique_segments,
-                    leaf_segment_indices=leaf_segment_indices,
+                    unique_segments=local_unique_segments,
+                    leaf_segment_indices=local_leaf_segment_indices,
                     rollout_is_weights=data_inputs.get("rollout_is_weights"),
                 )
-                global_tree_seg_targets = {
+                local_tree_seg_targets = {
                     "old_log_prob": seg_old_log_prob,
                     "advantages": seg_advantages,
                     "response_mask": seg_response_mask,
@@ -445,14 +480,14 @@ class DataParallelPPOActor(BasePPOActor):
                     "seg_lens": seg_lens,
                     "rollout_is_weights": seg_rollout_is,
                 }
-                print(f"[tree_segment] Global segment tensors built: seg_old_log_prob.shape={seg_old_log_prob.shape}")
+                print(f"[tree_segment] [Rank {rank}/{world_size}] Local segment tensors built: seg_old_log_prob.shape={seg_old_log_prob.shape}")
 
         # === New code: Check batch strategy for tree_segment loss ===
         tree_segment_batch_strategy = getattr(self.config, "tree_segment_batch_strategy", "leaf")
         use_segment_batching = (
             loss_mode == "tree_segment" and
             tree_segment_batch_strategy == "segment" and
-            global_tree_seg_targets is not None and
+            local_tree_seg_targets is not None and
             not self.config.use_dynamic_bsz  # Dynamic bsz not supported with segment batching yet
         )
 
@@ -462,12 +497,12 @@ class DataParallelPPOActor(BasePPOActor):
         if use_segment_batching:
             # === SEGMENT-BASED BATCHING STRATEGY ===
             ppo_micro_batch_segments = getattr(self.config, "ppo_micro_batch_segments", None)
-            total_segments = len(global_tree_seg_targets["seg_lens"])
+            total_segments = len(local_tree_seg_targets["seg_lens"])
 
             if ppo_micro_batch_segments is None:
                 # Default estimation: use similar ratio as leaf-based batching
                 if self.config.ppo_micro_batch_size_per_gpu is not None:
-                    avg_segments_per_leaf = total_segments / max(global_batch_size, 1)
+                    avg_segments_per_leaf = total_segments / max(local_batch_size, 1)
                     ppo_micro_batch_segments = max(8, int(self.config.ppo_micro_batch_size_per_gpu * avg_segments_per_leaf))
                 else:
                     ppo_micro_batch_segments = max(8, total_segments // 10)
@@ -479,7 +514,10 @@ class DataParallelPPOActor(BasePPOActor):
             else:
                 self.gradient_accumulation = 1
 
-            print(f"[tree_segment] Using segment-based batching: {total_segments} segments total, "
+            import torch.distributed as dist
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            world_size = dist.get_world_size() if dist.is_initialized() else 1
+            print(f"[tree_segment] [Rank {rank}/{world_size}] Using segment-based batching: {total_segments} segments total, "
                   f"{ppo_micro_batch_segments} segments per micro-batch, "
                   f"gradient accumulation over {self.gradient_accumulation} micro-batches")
 
@@ -503,7 +541,7 @@ class DataParallelPPOActor(BasePPOActor):
                         continue
 
                     # Collect all required leaves for these segments
-                    seg_canonical = global_tree_seg_targets["seg_canonical"]
+                    seg_canonical = local_tree_seg_targets["seg_canonical"]
                     required_leaves = list({seg_canonical[i][0] for i in seg_indices})
 
                     # Get the data for required leaves only
@@ -531,10 +569,10 @@ class DataParallelPPOActor(BasePPOActor):
                     print(f"[tree_segment] Micro-batch {m}: log_prob shape: {log_prob.shape}")
 
                     # Build segment log_probs
-                    max_seg_len = global_tree_seg_targets["old_log_prob"].shape[1]
+                    max_seg_len = local_tree_seg_targets["old_log_prob"].shape[1]
                     seg_log_prob_local = torch.zeros(len(seg_indices), max_seg_len, device=log_prob.device, dtype=log_prob.dtype)
 
-                    seg_lens = global_tree_seg_targets["seg_lens"]
+                    seg_lens = local_tree_seg_targets["seg_lens"]
                     for local_i, seg_idx in enumerate(seg_indices):
                         leaf_j, tok_offset = seg_canonical[seg_idx]
                         local_leaf_j = leaf_inverse_map[leaf_j]
@@ -547,11 +585,11 @@ class DataParallelPPOActor(BasePPOActor):
                     if on_policy:
                         seg_old_log_prob_local = seg_log_prob_local.detach()
                     else:
-                        seg_old_log_prob_local = global_tree_seg_targets["old_log_prob"][seg_indices].to(log_prob.device)
+                        seg_old_log_prob_local = local_tree_seg_targets["old_log_prob"][seg_indices].to(log_prob.device)
 
-                    seg_advantages_local = global_tree_seg_targets["advantages"][seg_indices].to(log_prob.device)
-                    seg_response_mask_local = global_tree_seg_targets["response_mask"][seg_indices].to(log_prob.device)
-                    seg_rollout_is_weights_local = global_tree_seg_targets["rollout_is_weights"]
+                    seg_advantages_local = local_tree_seg_targets["advantages"][seg_indices].to(log_prob.device)
+                    seg_response_mask_local = local_tree_seg_targets["response_mask"][seg_indices].to(log_prob.device)
+                    seg_rollout_is_weights_local = local_tree_seg_targets["rollout_is_weights"]
                     if seg_rollout_is_weights_local is not None:
                         seg_rollout_is_weights_local = seg_rollout_is_weights_local[seg_indices].to(log_prob.device)
 
@@ -560,8 +598,11 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch_metrics = {}
 
                     if m == 0:
-                        print(f"[tree_segment] Updating {len(seg_indices)} segments in this micro-batch, "
-                              f"requiring {len(required_leaves)} leaves out of {global_batch_size} total leaves")
+                        import torch.distributed as dist
+                        rank = dist.get_rank() if dist.is_initialized() else 0
+                        world_size = dist.get_world_size() if dist.is_initialized() else 1
+                        print(f"[tree_segment] [Rank {rank}/{world_size}] Updating {len(seg_indices)} segments in this micro-batch, "
+                              f"requiring {len(required_leaves)} leaves out of {local_batch_size} total leaves")
 
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
                         old_log_prob=seg_old_log_prob_local,
@@ -618,7 +659,7 @@ class DataParallelPPOActor(BasePPOActor):
             # See PPO paper for details. https://arxiv.org/abs/1707.06347
             mini_batches = data.split(self.config.ppo_mini_batch_size)
 
-            # Track global leaf index ranges for each mini_batch (to correctly map segments to micro_batches)
+            # Track local leaf index ranges for each mini_batch (to correctly map segments to micro_batches)
             mini_batch_ranges = []
             current_start = 0
             for mb in mini_batches:
@@ -630,13 +671,13 @@ class DataParallelPPOActor(BasePPOActor):
 
             for _ in range(self.config.ppo_epochs):
                 for batch_idx, mini_batch in enumerate(mini_batches):
-                    global_leaf_start, global_leaf_end = mini_batch_ranges[batch_idx]
+                    local_leaf_start, local_leaf_end = mini_batch_ranges[batch_idx]
                     if self.config.use_dynamic_bsz:
                         max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                         micro_batches, batch_idx_list = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
-                        # Adjust batch_idx_list to be GLOBAL leaf indices instead of mini_batch local indices
+                        # Adjust batch_idx_list to be LOCAL leaf indices instead of mini_batch local indices
                         if batch_idx_list is not None:
-                            batch_idx_list = [[global_leaf_start + local_idx for local_idx in sublist] for sublist in batch_idx_list]
+                            batch_idx_list = [[local_leaf_start + local_idx for local_idx in sublist] for sublist in batch_idx_list]
                     else:
                         self.gradient_accumulation = (
                             self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
@@ -644,9 +685,9 @@ class DataParallelPPOActor(BasePPOActor):
                         micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
                         batch_idx_list = None
 
-                    # Use pre-computed GLOBAL segment targets, don't rebuild at mini_batch level
-                    if loss_mode == "tree_segment" and global_tree_seg_targets is not None:
-                        mini_batch.meta_info["tree_seg_targets"] = global_tree_seg_targets
+                    # Use pre-computed LOCAL segment targets, don't rebuild at mini_batch level
+                    if loss_mode == "tree_segment" and local_tree_seg_targets is not None:
+                        mini_batch.meta_info["tree_seg_targets"] = local_tree_seg_targets
 
                     self.actor_optimizer.zero_grad()
 
@@ -701,14 +742,14 @@ class DataParallelPPOActor(BasePPOActor):
                                 seg_canonical = tree_seg_targets["seg_canonical"]
                                 seg_lens = tree_seg_targets["seg_lens"]
 
-                                # Determine which leaves are present in this micro-batch (using GLOBAL leaf indices)
+                                # Determine which leaves are present in this micro-batch (using LOCAL leaf indices)
                                 if self.config.use_dynamic_bsz:
                                     present_leaves = set(batch_idx_list[m])
                                 else:
-                                    # For non-dynamic bsz, compute the GLOBAL leaf indices in this micro_batch
-                                    global_micro_batch_start = global_leaf_start + m * self.config.ppo_micro_batch_size_per_gpu
-                                    global_micro_batch_end = min(global_micro_batch_start + self.config.ppo_micro_batch_size_per_gpu, global_leaf_end)
-                                    present_leaves = set(range(global_micro_batch_start, global_micro_batch_end))
+                                    # For non-dynamic bsz, compute the LOCAL leaf indices in this micro_batch
+                                    local_micro_batch_start = local_leaf_start + m * self.config.ppo_micro_batch_size_per_gpu
+                                    local_micro_batch_end = min(local_micro_batch_start + self.config.ppo_micro_batch_size_per_gpu, local_leaf_end)
+                                    present_leaves = set(range(local_micro_batch_start, local_micro_batch_end))
 
                                 # Select segments whose canonical leaf is in this micro-batch.
                                 # This guarantees each segment is updated exactly once.
@@ -720,17 +761,17 @@ class DataParallelPPOActor(BasePPOActor):
                                     ppo_kl = torch.tensor(0.0, device=log_prob.device)
                                     pg_clipfrac_lower = torch.tensor(0.0, device=log_prob.device)
                                 else:
-                                    # Build inverse map from GLOBAL leaf index to local micro-batch index
+                                    # Build inverse map from LOCAL leaf index to local micro-batch index
                                     if self.config.use_dynamic_bsz:
-                                        # batch_idx_list[m] already contains GLOBAL indices
+                                        # batch_idx_list[m] already contains LOCAL indices
                                         leaf_inverse_map = {global_idx: local_idx for local_idx, global_idx in enumerate(batch_idx_list[m])}
                                     else:
-                                        # Map from global leaf index to local micro_batch index
+                                        # Map from local leaf index to local micro_batch index
                                         leaf_inverse_map = {}
-                                        for local_idx, global_idx in enumerate(range(global_micro_batch_start, global_micro_batch_end)):
+                                        for local_idx, global_idx in enumerate(range(local_micro_batch_start, local_micro_batch_end)):
                                             leaf_inverse_map[global_idx] = local_idx
 
-                                    # Use the pre-computed global max_seg_len so shapes align with
+                                    # Use the pre-computed local max_seg_len so shapes align with
                                     # tree_seg_targets tensors (old_log_prob / advantages / mask).
                                     max_seg_len = tree_seg_targets["old_log_prob"].shape[1]
                                     seg_log_prob_local = torch.zeros(len(seg_indices), max_seg_len, device=log_prob.device, dtype=log_prob.dtype)
@@ -755,7 +796,10 @@ class DataParallelPPOActor(BasePPOActor):
                                         seg_rollout_is_weights_local = seg_rollout_is_weights_local[seg_indices].to(log_prob.device)
 
                                     if batch_idx == 0 and m == 0:  # Print once per epoch
-                                        print(f"[tree_segment] Updating {len(seg_indices)} segments in this micro_batch")
+                                        import torch.distributed as dist
+                                        rank = dist.get_rank() if dist.is_initialized() else 0
+                                        world_size = dist.get_world_size() if dist.is_initialized() else 1
+                                        print(f"[tree_segment] [Rank {rank}/{world_size}] Updating {len(seg_indices)} segments in this micro_batch")
 
                                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
                                         old_log_prob=seg_old_log_prob_local,
