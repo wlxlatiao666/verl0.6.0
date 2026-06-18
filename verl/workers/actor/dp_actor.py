@@ -407,6 +407,7 @@ class DataParallelPPOActor(BasePPOActor):
             unique_segments = data.non_tensor_batch.get("unique_segments")
             if unique_segments is None:
                 unique_segments = data.meta_info.get("metrics", {}).get("unique_segments")
+                print("get unique_segments from meta_info['metrics'] for tree_segment loss. This is the old location and may be None if not set properly in trainer.")
             leaf_segment_indices = data.non_tensor_batch.get("leaf_segment_indices")
             if unique_segments is not None and leaf_segment_indices is not None:
                 import torch.distributed as dist
@@ -523,6 +524,11 @@ class DataParallelPPOActor(BasePPOActor):
 
                     # Build leaf inverse map: from original local leaf index to local index in mini_batch
                     leaf_inverse_map = {global_idx: local_idx for local_idx, global_idx in enumerate(required_leaves)}
+                    print(f"[tree_segment] Micro-batch {m}: {len(seg_indices)} segments, {len(required_leaves)} required leaves")
+                    print(f"[tree_segment] Micro-batch {m}: {seg_indices}")
+                    print(f"[tree_segment] Micro-batch {m}: {required_leaves}")
+                    print(f"[tree_segment] Micro-batch {m}: leaf_inverse_map: {leaf_inverse_map}")
+                    print(f"[tree_segment] Micro-batch {m}: log_prob shape: {log_prob.shape}")
 
                     # Build segment log_probs
                     max_seg_len = global_tree_seg_targets["old_log_prob"].shape[1]

@@ -681,12 +681,70 @@ class DataProto:
             selected_batch = None
 
         selected_non_tensor = {}
+        # First, slice the leaf_segment_indices normally
+        sliced_leaf_segment_indices = None
         for key, val in self.non_tensor_batch.items():
-            if key in ("unique_segments", "unique_segment_seq_ids"):
-                # Keep these as-is - they are global segment collections, not per-leaf data
-                selected_non_tensor[key] = val
-            else:
+            if key == "leaf_segment_indices":
+                sliced_leaf_segment_indices = val[idxs_np]
+                selected_non_tensor[key] = sliced_leaf_segment_indices
+            elif key not in ("unique_segments", "unique_segment_seq_ids"):
                 selected_non_tensor[key] = val[idxs_np]
+
+        # Now handle unique_segments and unique_segment_seq_ids specially
+        has_unique_segments = "unique_segments" in self.non_tensor_batch
+        has_leaf_segments = sliced_leaf_segment_indices is not None
+
+        if has_unique_segments and has_leaf_segments:
+            # Rebuild local unique_segments based on the sliced leaves
+            global_unique_segments = self.non_tensor_batch["unique_segments"]
+
+            # Collect all segment indices referenced by the sliced leaves
+            used_global_seg_indices = set()
+            for path in sliced_leaf_segment_indices:
+                for seg_idx in path:
+                    used_global_seg_indices.add(seg_idx)
+
+            # Sort for deterministic behavior
+            used_global_seg_indices = sorted(used_global_seg_indices)
+
+            # Build mapping from global to local index
+            global_segs_to_local = {
+                global_seg_idx: local_seg_idx
+                for local_seg_idx, global_seg_idx in enumerate(used_global_seg_indices)
+            }
+
+            # Build local unique_segments
+            local_unique_segments = [
+                global_unique_segments[global_seg_idx]
+                for global_seg_idx in used_global_seg_indices
+            ]
+            selected_non_tensor["unique_segments"] = np.array(local_unique_segments, dtype=object)
+
+            # Build local unique_segment_seq_ids if available
+            if "unique_segment_seq_ids" in self.non_tensor_batch:
+                global_unique_seq_ids = self.non_tensor_batch["unique_segment_seq_ids"]
+                local_unique_seq_ids = [
+                    global_unique_seq_ids[global_seg_idx]
+                    for global_seg_idx in used_global_seg_indices
+                ]
+                selected_non_tensor["unique_segment_seq_ids"] = np.array(local_unique_seq_ids, dtype=np.int64)
+
+            # Now adjust leaf_segment_indices to use local indices
+            adjusted_leaf_segment_indices = []
+            for path in sliced_leaf_segment_indices:
+                adjusted_path = [global_segs_to_local[seg_idx] for seg_idx in path]
+                adjusted_leaf_segment_indices.append(adjusted_path)
+
+            # Update in the non_tensor_batch
+            leaf_seg_arr = np.empty(len(adjusted_leaf_segment_indices), dtype=object)
+            for i, v in enumerate(adjusted_leaf_segment_indices):
+                leaf_seg_arr[i] = v
+            selected_non_tensor["leaf_segment_indices"] = leaf_seg_arr
+        elif has_unique_segments:
+            # If no leaf_segment_indices but we have unique_segments, keep them as-is
+            selected_non_tensor["unique_segments"] = self.non_tensor_batch["unique_segments"]
+            if "unique_segment_seq_ids" in self.non_tensor_batch:
+                selected_non_tensor["unique_segment_seq_ids"] = self.non_tensor_batch["unique_segment_seq_ids"]
 
         return type(self)(batch=selected_batch, non_tensor_batch=selected_non_tensor, meta_info=self.meta_info)
 
@@ -730,12 +788,70 @@ class DataProto:
 
         # Handle the non-tensor batch data
         sliced_non_tensor = {}
+        # First, slice the leaf_segment_indices normally
+        sliced_leaf_segment_indices = None
         for key, val in self.non_tensor_batch.items():
-            if key in ("unique_segments", "unique_segment_seq_ids"):
-                # Keep these as-is - they are global segment collections, not per-leaf data
-                sliced_non_tensor[key] = val
-            else:
+            if key == "leaf_segment_indices":
+                sliced_leaf_segment_indices = val[slice_obj]
+                sliced_non_tensor[key] = sliced_leaf_segment_indices
+            elif key not in ("unique_segments", "unique_segment_seq_ids"):
                 sliced_non_tensor[key] = val[slice_obj]
+
+        # Now handle unique_segments and unique_segment_seq_ids specially
+        has_unique_segments = "unique_segments" in self.non_tensor_batch
+        has_leaf_segments = sliced_leaf_segment_indices is not None
+
+        if has_unique_segments and has_leaf_segments:
+            # Rebuild local unique_segments based on the sliced leaves
+            global_unique_segments = self.non_tensor_batch["unique_segments"]
+
+            # Collect all segment indices referenced by the sliced leaves
+            used_global_seg_indices = set()
+            for path in sliced_leaf_segment_indices:
+                for seg_idx in path:
+                    used_global_seg_indices.add(seg_idx)
+
+            # Sort for deterministic behavior
+            used_global_seg_indices = sorted(used_global_seg_indices)
+
+            # Build mapping from global to local index
+            global_segs_to_local = {
+                global_seg_idx: local_seg_idx
+                for local_seg_idx, global_seg_idx in enumerate(used_global_seg_indices)
+            }
+
+            # Build local unique_segments
+            local_unique_segments = [
+                global_unique_segments[global_seg_idx]
+                for global_seg_idx in used_global_seg_indices
+            ]
+            sliced_non_tensor["unique_segments"] = np.array(local_unique_segments, dtype=object)
+
+            # Build local unique_segment_seq_ids if available
+            if "unique_segment_seq_ids" in self.non_tensor_batch:
+                global_unique_seq_ids = self.non_tensor_batch["unique_segment_seq_ids"]
+                local_unique_seq_ids = [
+                    global_unique_seq_ids[global_seg_idx]
+                    for global_seg_idx in used_global_seg_indices
+                ]
+                sliced_non_tensor["unique_segment_seq_ids"] = np.array(local_unique_seq_ids, dtype=np.int64)
+
+            # Now adjust leaf_segment_indices to use local indices
+            adjusted_leaf_segment_indices = []
+            for path in sliced_leaf_segment_indices:
+                adjusted_path = [global_segs_to_local[seg_idx] for seg_idx in path]
+                adjusted_leaf_segment_indices.append(adjusted_path)
+
+            # Update in the non_tensor_batch
+            leaf_seg_arr = np.empty(len(adjusted_leaf_segment_indices), dtype=object)
+            for i, v in enumerate(adjusted_leaf_segment_indices):
+                leaf_seg_arr[i] = v
+            sliced_non_tensor["leaf_segment_indices"] = leaf_seg_arr
+        elif has_unique_segments:
+            # If no leaf_segment_indices but we have unique_segments, keep them as-is
+            sliced_non_tensor["unique_segments"] = self.non_tensor_batch["unique_segments"]
+            if "unique_segment_seq_ids" in self.non_tensor_batch:
+                sliced_non_tensor["unique_segment_seq_ids"] = self.non_tensor_batch["unique_segment_seq_ids"]
 
         # Return a new DataProto object
         return type(self)(batch=sliced_batch, non_tensor_batch=sliced_non_tensor, meta_info=self.meta_info)
