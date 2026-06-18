@@ -1370,25 +1370,6 @@ def build_segment_tensors(
     device = old_log_prob.device
     resp_len = old_log_prob.shape[1]
 
-    print(f"[tree_segment] old_log_prob shape: {old_log_prob.shape if old_log_prob is not None else None}")
-    print(f"[tree_segment] Building segment-level tensors for {n_unique} unique segments from {len(leaf_segment_indices)} leaves.")
-
-    # Debug: Print segment distribution statistics
-    path_lengths = [len(path) for path in leaf_segment_indices]
-    if path_lengths:
-        import numpy as np
-        print(f"[tree_segment] Path length stats: min={min(path_lengths)}, max={max(path_lengths)}, "
-              f"mean={np.mean(path_lengths):.2f}, median={np.median(path_lengths):.2f}")
-
-        # Count how many times each segment appears
-        seg_counts = {}
-        for path in leaf_segment_indices:
-            for seg_idx in path:
-                seg_counts[seg_idx] = seg_counts.get(seg_idx, 0) + 1
-
-        top_shared = sorted(seg_counts.items(), key=lambda x: -x[1])[:5]
-        print(f"[tree_segment] Top 5 most shared segments: {top_shared}")
-
     # For each unique segment, find the first leaf that contains it and the token offset
     # within that leaf's response where the segment starts.
     seg_canonical: list[tuple[int, int]] = [(-1, -1)] * n_unique
@@ -1447,12 +1428,6 @@ def build_segment_tensors(
         if seg_rollout_is is not None:
             seg_rollout_is[seg_idx, :actual_len] = rollout_is_weights[leaf_j, tok_offset:end]
 
-    # Print stats about advantages to help debug pg_loss magnitude
-    if n_unique > 0:
-        flat_adv = seg_advantages[seg_mask > 0]
-        if len(flat_adv) > 0:
-            print(f"[tree_segment] Segment advantages: min={flat_adv.min():.4f}, max={flat_adv.max():.4f}, mean={flat_adv.mean():.4f}, std={flat_adv.std():.4f}")
-
     return seg_log_prob, seg_old_log_prob, seg_advantages, seg_mask, seg_canonical, seg_lens, seg_rollout_is
 
 
@@ -1510,7 +1485,6 @@ def compute_policy_loss_tree_segment(
         pg_losses = pg_losses * rollout_is_weights
 
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-    print(f"[tree_segment] pg_loss: {pg_loss}, pg_clipfrac: {pg_clipfrac}, ppo_kl: {ppo_kl}, pg_clipfrac_lower: {pg_clipfrac_lower}")
 
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
