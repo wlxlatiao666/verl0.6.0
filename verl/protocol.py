@@ -380,7 +380,13 @@ class DataProto:
         # Case 3: Single integer - return DataProtoItem for backward compatibility
         elif isinstance(item, int | np.integer):
             tensor_data = self.batch[item] if self.batch is not None else None
-            non_tensor_data = {key: val[item] for key, val in self.non_tensor_batch.items()}
+            # 对非 per-leaf 元数据进行豁免，不索引
+            non_tensor_data = {}
+            for key, val in self.non_tensor_batch.items():
+                if key in ("unique_segments", "unique_segment_seq_ids", "worker_segments_offsets"):
+                    # 全局元数据不属于单个 leaf，跳过
+                    continue
+                non_tensor_data[key] = val[item]
             return DataProtoItem(batch=tensor_data, non_tensor_batch=non_tensor_data, meta_info=self.meta_info)
 
         # # Case 4: Unsupported type
