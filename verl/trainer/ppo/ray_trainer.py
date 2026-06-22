@@ -307,6 +307,21 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
     n_leaves = len(leaf_segment_indices)
     print(f"[DEBUG] [compute_tree_process_advantage] n_unique segments: {n_unique}, n_leaves: {n_leaves}")
 
+    # Get prompt indices for grouping (like GRPO)
+    index = data.non_tensor_batch.get("uid")  # Use uid to group by prompt
+    if index is None:
+        # Fall back: if no uid, check if we have tree_prompt_indices
+        tree_prompt_indices = data.non_tensor_batch.get("tree_prompt_indices")
+        if tree_prompt_indices is not None:
+            index = tree_prompt_indices  # Use prompt indices for grouping
+        else:
+            # If no grouping information, treat all leaves as one group (original behavior)
+            index = np.zeros(n_leaves, dtype=np.int64)
+
+    # Debug: Show grouping info
+    unique_prompt_ids = np.unique(index)
+    print(f"[DEBUG] [compute_tree_process_advantage] unique_prompt_ids={len(unique_prompt_ids)}, index_range=[{index.min()}, {index.max()}]")
+
     # Debug: Print tree structure stats
     import numpy as np
     path_lengths = [len(path) for path in leaf_segment_indices]
@@ -337,14 +352,17 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
     leaf_seg_to_leaf_idx: dict[int, int] = {}
     parent_of = np.full(n_unique, -1, dtype=np.int64)
     seg_depth = np.zeros(n_unique, dtype=np.int64)
+    seg_to_prompt_id: dict[int, int] = {}  # Map each segment to its prompt index
     for j, path in enumerate(leaf_segment_indices):
+        prompt_id = index[j]
         if len(path) > 0:
             leaf_seg_to_leaf_idx[path[-1]] = j
         for depth, seg_idx in enumerate(path):
             seg_depth[seg_idx] = depth
+            seg_to_prompt_id[seg_idx] = prompt_id  # Track which prompt this segment belongs to
             if depth > 0:
                 parent_of[seg_idx] = path[depth - 1]
-    print(f"[DEBUG] [compute_tree_process_advantage] leaf_seg_to_leaf_idx has {len(leaf_seg_to_leaf_idx)} entries")
+    print(f"[DEBUG] [compute_tree_process_advantage] leaf_seg_to_leaf_idx has {len(leaf_seg_to_leaf_idx)} entries, seg_to_prompt_id has {len(seg_to_prompt_id)} entries")
 
     # Assign leaf scores first
     node_scores = torch.zeros(n_unique, dtype=torch.float32, device=device)
@@ -394,12 +412,28 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
         parent_score = node_scores[p]
         seg_local_advantages[children_t] = (sibling_scores - parent_score) / (sib_std + 1e-6)
 
-    # Compute global advantage (relative to all leaf nodes)
-    leaf_indices = torch.tensor(list(leaf_seg_to_leaf_idx.keys()), dtype=torch.long, device=device)
-    leaf_node_scores = node_scores[leaf_indices]
-    mean_leaf_score = leaf_node_scores.mean()
-    std_leaf_score = leaf_node_scores.std() if len(leaf_node_scores) > 1 else torch.tensor(0.0, device=device)
-    seg_global_advantages = (node_scores - mean_leaf_score) / (std_leaf_score + 1e-6)
+    # Compute global advantage PER PROMPT GROUP (like GRPO)
+    seg_global_advantages = torch.zeros(n_unique, dtype=torch.float32, device=device)
+
+    # First, build a map from prompt id to list of leaf segment ids in this prompt
+    prompt_id_to_leaf_segs: dict[int, list[int]] = defaultdict(list)
+    for seg_idx in leaf_seg_to_leaf_idx.keys():
+        prompt_id = seg_to_prompt_id[seg_idx]
+        prompt_id_to_leaf_segs[prompt_id].append(seg_idx)
+
+    # Compute mean/std and global advantage per prompt
+    for prompt_id, prompt_leaf_segs in prompt_id_to_leaf_segs.items():
+        prompt_leaf_segs_t = torch.tensor(prompt_leaf_segs, dtype=torch.long, device=device)
+        prompt_leaf_node_scores = node_scores[prompt_leaf_segs_t]
+        mean_leaf_score = prompt_leaf_node_scores.mean()
+        std_leaf_score = prompt_leaf_node_scores.std() if len(prompt_leaf_node_scores) > 1 else torch.tensor(0.0, device=device)
+
+        # Get all segments in this prompt (not just leaf segments)
+        prompt_all_segs = [i for i in range(n_unique) if seg_to_prompt_id.get(i, None) == prompt_id]
+        prompt_all_segs_t = torch.tensor(prompt_all_segs, dtype=torch.long, device=device)
+
+        # Compute global advantage for all segments in this prompt
+        seg_global_advantages[prompt_all_segs_t] = (node_scores[prompt_all_segs_t] - mean_leaf_score) / (std_leaf_score + 1e-6)
 
     # Combine local and global advantages
     seg_advantages = local_adv_weight * seg_local_advantages + global_adv_weight * seg_global_advantages
