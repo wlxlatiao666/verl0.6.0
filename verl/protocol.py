@@ -892,6 +892,11 @@ class DataProto:
         Returns:
             List[DataProto]: a list of DataProto after splitting
         """
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank == 0:
+            print(f"[DEBUG] DataProto.chunk: chunks={chunks}, len(self)={len(self)}")
+
         if not self.is_padding_enabled():
             assert len(self) % chunks == 0, (
                 f"only support equal chunk. Got size of DataProto {len(self)} and chunk {chunks}."
@@ -902,16 +907,28 @@ class DataProto:
             batch_lst = self.batch.chunk(chunks=chunks, dim=0)
             bsz_in_batch = np.array([batch.batch_size[0] for batch in batch_lst])
             chunk_indices = np.cumsum(bsz_in_batch)[:-1]
+            if rank == 0:
+                print(f"[DEBUG] DataProto.chunk: bsz_in_batch={bsz_in_batch}, chunk_indices={chunk_indices}")
         else:
             batch_lst = [None for _ in range(chunks)]
 
         non_tensor_batch_lst = [{} for _ in range(chunks)]
+
+        # First, split the normal per-leaf data to get chunk boundaries
+        leaf_segment_indices_per_chunk = []
         for key, val in self.non_tensor_batch.items():
             assert isinstance(val, np.ndarray)
-            if key in ("unique_segments", "unique_segment_seq_ids"):
-                # These are global segment collections - copy the full array to each chunk
+            if key == "leaf_segment_indices":
+                if bsz_in_batch is not None:
+                    non_tensor_lst = np.array_split(val, chunk_indices.tolist())
+                else:
+                    non_tensor_lst = np.array_split(val, chunks)
+                leaf_segment_indices_per_chunk = non_tensor_lst
                 for i in range(chunks):
-                    non_tensor_batch_lst[i][key] = val
+                    non_tensor_batch_lst[i][key] = non_tensor_lst[i]
+            elif key in ("unique_segments", "unique_segment_seq_ids", "worker_segments_offsets"):
+                # We'll handle these after we see leaf_segment_indices
+                continue
             else:
                 # Normal per-leaf data - split across chunks
                 if bsz_in_batch is not None:
@@ -922,11 +939,88 @@ class DataProto:
                 for i in range(chunks):
                     non_tensor_batch_lst[i][key] = non_tensor_lst[i]
 
+        # Now handle unique_segments and unique_segment_seq_ids
+        # Check if we have worker_segments_offsets (from concat with local_workers=True)
+        worker_segments_offsets = self.non_tensor_batch.get("worker_segments_offsets")
+        unique_segments = self.non_tensor_batch.get("unique_segments")
+        unique_segment_seq_ids = self.non_tensor_batch.get("unique_segment_seq_ids")
+
+        if worker_segments_offsets is not None and unique_segments is not None:
+            # Case 1: We have per-worker offsets, use them to slice
+            if rank == 0:
+                print(f"[DEBUG] DataProto.chunk: Using worker_segments_offsets={worker_segments_offsets}")
+            assert len(worker_segments_offsets) == chunks + 1, f"Expected {chunks+1} offsets, got {len(worker_segments_offsets)}"
+            for i in range(chunks):
+                start_idx = worker_segments_offsets[i]
+                end_idx = worker_segments_offsets[i+1]
+                if rank == 0:
+                    print(f"[DEBUG] DataProto.chunk: chunk {i} segments [{start_idx}:{end_idx}]")
+                # Slice unique_segments for this chunk
+                chunk_unique_segments = unique_segments[start_idx:end_idx]
+                non_tensor_batch_lst[i]["unique_segments"] = chunk_unique_segments
+                # Slice unique_segment_seq_ids if available
+                if unique_segment_seq_ids is not None:
+                    chunk_unique_segment_seq_ids = unique_segment_seq_ids[start_idx:end_idx]
+                    non_tensor_batch_lst[i]["unique_segment_seq_ids"] = chunk_unique_segment_seq_ids
+                # Adjust leaf_segment_indices to be local again
+                chunk_lsi = leaf_segment_indices_per_chunk[i] if leaf_segment_indices_per_chunk else None
+                if chunk_lsi is not None and start_idx > 0:
+                    adjusted_lsi = np.empty(len(chunk_lsi), dtype=object)
+                    for j, path in enumerate(chunk_lsi):
+                        adjusted_path = [idx - start_idx for idx in path]
+                        adjusted_lsi[j] = adjusted_path
+                    non_tensor_batch_lst[i]["leaf_segment_indices"] = adjusted_lsi
+                    if rank == 0:
+                        print(f"[DEBUG] DataProto.chunk: chunk {i} adjusted leaf_segment_indices from offset {start_idx}")
+        elif unique_segments is not None and leaf_segment_indices_per_chunk:
+            # Case 2: Fall back - rebuild local segments for each chunk
+            if rank == 0:
+                print(f"[DEBUG] DataProto.chunk: Rebuilding local segments for each chunk")
+            for i in range(chunks):
+                chunk_lsi = leaf_segment_indices_per_chunk[i]
+                # Collect all segment indices used in this chunk's leaves
+                used_seg_indices = set()
+                for path in chunk_lsi:
+                    for seg_idx in path:
+                        used_seg_indices.add(seg_idx)
+                used_seg_indices = sorted(used_seg_indices)
+                if rank == 0:
+                    print(f"[DEBUG] DataProto.chunk: chunk {i} uses {len(used_seg_indices)} segments: {used_seg_indices[:10]}{'...' if len(used_seg_indices) > 10 else ''}")
+                # Build local unique_segments
+                chunk_unique_segments = np.array([unique_segments[idx] for idx in used_seg_indices], dtype=object)
+                non_tensor_batch_lst[i]["unique_segments"] = chunk_unique_segments
+                # Build local unique_segment_seq_ids if available
+                if unique_segment_seq_ids is not None:
+                    chunk_unique_segment_seq_ids = np.array([unique_segment_seq_ids[idx] for idx in used_seg_indices])
+                    non_tensor_batch_lst[i]["unique_segment_seq_ids"] = chunk_unique_segment_seq_ids
+                # Build mapping from global to local
+                global_to_local = {global_idx: local_idx for local_idx, global_idx in enumerate(used_seg_indices)}
+                # Adjust leaf_segment_indices
+                adjusted_lsi = np.empty(len(chunk_lsi), dtype=object)
+                for j, path in enumerate(chunk_lsi):
+                    adjusted_path = [global_to_local[idx] for idx in path]
+                    adjusted_lsi[j] = adjusted_path
+                non_tensor_batch_lst[i]["leaf_segment_indices"] = adjusted_lsi
+                if rank == 0:
+                    print(f"[DEBUG] DataProto.chunk: chunk {i} leaf_segment_indices adjusted")
+        elif unique_segments is not None:
+            # Fallback: copy all (original behavior) but warn
+            if rank == 0:
+                print(f"[DEBUG] DataProto.chunk: WARNING - falling back to copying all segments to each chunk")
+            for i in range(chunks):
+                non_tensor_batch_lst[i]["unique_segments"] = unique_segments
+                if unique_segment_seq_ids is not None:
+                    non_tensor_batch_lst[i]["unique_segment_seq_ids"] = unique_segment_seq_ids
+
         output = []
         for i in range(chunks):
             output.append(
                 type(self)(batch=batch_lst[i], non_tensor_batch=non_tensor_batch_lst[i], meta_info=self.meta_info)
             )
+            if rank == 0:
+                chunk_segs = len(non_tensor_batch_lst[i].get("unique_segments", []))
+                chunk_leaves = len(output[i])
+                print(f"[DEBUG] DataProto.chunk: chunk {i} has {chunk_leaves} leaves, {chunk_segs} segments")
 
         return output
 
@@ -942,16 +1036,27 @@ class DataProto:
         return [self[i : i + split_size] for i in range(0, len(self), split_size)]
 
     @staticmethod
-    def concat(data: list["DataProto"]) -> "DataProto":
+    def concat(data: list["DataProto"], keep_local_workers: bool = True) -> "DataProto":
         """Concat a list of DataProto. The batch is concatenated among dim=0.
         The meta_info is merged, with special handling for metrics from different workers.
 
         Args:
             data (List[DataProto]): list of DataProto
+            keep_local_workers (bool): If True, keep track of per-worker segment offsets
+                so chunk can restore local segments. Default: True.
 
         Returns:
             DataProto: concatenated DataProto
         """
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank == 0:
+            print(f"[DEBUG] DataProto.concat: {len(data)} DataProtos to concat")
+            for i, d in enumerate(data):
+                n_segs = len(d.non_tensor_batch.get("unique_segments", []))
+                n_leaves = len(d)
+                print(f"[DEBUG] DataProto.concat: worker {i} has {n_leaves} leaves, {n_segs} segments")
+
         batch_lst = []
         for batch in data:
             batch_lst.append(batch.batch)
@@ -968,6 +1073,7 @@ class DataProto:
         offset = 0
         all_unique_segments = []
         all_unique_segment_seq_ids = []
+        worker_segments_offsets = [0]  # Track start index of each worker's segments
         for d in data:
             # Try to get unique_segments from non_tensor_batch first (new location),
             # then fall back to meta_info['metrics'] (old location for compatibility)
@@ -984,13 +1090,20 @@ class DataProto:
                 for i, path in enumerate(lsi):
                     shifted[i] = [idx + offset for idx in path]
                 d.non_tensor_batch["leaf_segment_indices"] = shifted
+                if rank == 0:
+                    print(f"[DEBUG] DataProto.concat: shifted worker {len(all_unique_segments)} leaf_segment_indices by +{offset}")
 
             # Collect segments for global concatenation
             if seg_arr is not None:
                 all_unique_segments.append(seg_arr)
                 offset += len(seg_arr)
+                worker_segments_offsets.append(offset)
             if seq_ids_arr is not None:
                 all_unique_segment_seq_ids.append(seq_ids_arr)
+
+        if rank == 0:
+            print(f"[DEBUG] DataProto.concat: total {len(all_unique_segments)} workers, {offset} total segments")
+            print(f"[DEBUG] DataProto.concat: worker_segments_offsets={worker_segments_offsets}")
 
         non_tensor_batch = list_of_dict_to_dict_of_list(list_of_dict=[d.non_tensor_batch for d in data])
         for key, val in non_tensor_batch.items():
@@ -1011,6 +1124,12 @@ class DataProto:
             else:
                 # Normal concatenation for per-leaf non_tensor data
                 non_tensor_batch[key] = np.concatenate(val, axis=0)
+
+        # Add worker_segments_offsets to help chunk restore local segments
+        if keep_local_workers and len(worker_segments_offsets) > 1:
+            non_tensor_batch["worker_segments_offsets"] = np.array(worker_segments_offsets, dtype=np.int64)
+            if rank == 0:
+                print(f"[DEBUG] DataProto.concat: added worker_segments_offsets={worker_segments_offsets}")
 
         # Merge meta_info with special handling for metrics
         merged_meta_info = {}

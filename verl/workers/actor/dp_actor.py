@@ -415,10 +415,17 @@ class DataParallelPPOActor(BasePPOActor):
                 global_unique_segments = data.meta_info.get("metrics", {}).get("unique_segments")
                 print("get unique_segments from meta_info['metrics'] for tree_segment loss. This is the old location and may be None if not set properly in trainer.")
             global_leaf_segment_indices = data.non_tensor_batch.get("leaf_segment_indices")
+            worker_segments_offsets = data.non_tensor_batch.get("worker_segments_offsets")
+
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            world_size = dist.get_world_size() if dist.is_initialized() else 1
+
+            if worker_segments_offsets is not None:
+                print(f"[DEBUG] [tree_segment] Worker {rank}: found worker_segments_offsets={worker_segments_offsets}")
 
             if global_unique_segments is not None and global_leaf_segment_indices is not None:
-                rank = dist.get_rank() if dist.is_initialized() else 0
-                world_size = dist.get_world_size() if dist.is_initialized() else 1
+                print(f"[DEBUG] [tree_segment] Worker {rank}: start building local segments")
+                print(f"[DEBUG] [tree_segment] Worker {rank}: global_unique_segments={len(global_unique_segments)}, local_leaves={len(global_leaf_segment_indices)}")
 
                 # ==== REBUILD LOCAL SEGMENTS FROM GLOBAL ====
                 # Collect all segment indices referenced by this worker's leaves
@@ -427,6 +434,7 @@ class DataParallelPPOActor(BasePPOActor):
                     for seg_idx in path:
                         used_global_seg_indices.add(seg_idx)
                 used_global_seg_indices = sorted(used_global_seg_indices)
+                print(f"[DEBUG] [tree_segment] Worker {rank}: uses {len(used_global_seg_indices)} segments: {used_global_seg_indices[:10]}{'...' if len(used_global_seg_indices) > 10 else ''}")
 
                 # Build mapping from global seg idx to local seg idx (and reverse)
                 global_to_local_seg_idx_map = {
@@ -458,13 +466,13 @@ class DataParallelPPOActor(BasePPOActor):
                 for path in global_leaf_segment_indices:
                     adjusted_path = [global_to_local_seg_idx_map[seg_idx] for seg_idx in path]
                     local_leaf_segment_indices.append(adjusted_path)
+                print(f"[DEBUG] [tree_segment] Worker {rank}: leaf_segment_indices adjusted to local")
 
-                # Only print on rank 0 to avoid log spam
-                if rank == 0:
-                    print(f"[tree_segment] Building segment tensors:")
-                    print(f"[tree_segment] - Batch size (leaves): {len(data)}")
-                    print(f"[tree_segment] - Global unique segments: {len(global_unique_segments)}")
-                    print(f"[tree_segment] - Local unique segments: {len(local_unique_segments)}")
+                # Print detailed info on each rank (not just rank 0)
+                print(f"[DEBUG] [tree_segment] Worker {rank}: Building segment tensors:")
+                print(f"[DEBUG] [tree_segment] Worker {rank}: - Batch size (leaves): {len(data)}")
+                print(f"[DEBUG] [tree_segment] Worker {rank}: - Global unique segments: {len(global_unique_segments)}")
+                print(f"[DEBUG] [tree_segment] Worker {rank}: - Local unique segments: {len(local_unique_segments)}")
 
                 # Unpack TensorDict to plain dict so .get() works safely
                 data_inputs = {**data.batch, **data.non_tensor_batch}
@@ -488,8 +496,8 @@ class DataParallelPPOActor(BasePPOActor):
                     "local_to_global_seg_idx_map": local_to_global_seg_idx_map,
                 }
 
-                if rank == 0:
-                    print(f"[tree_segment] Local segment tensors built: seg_old_log_prob.shape={seg_old_log_prob.shape}")
+                print(f"[DEBUG] [tree_segment] Worker {rank}: Local segment tensors built: seg_old_log_prob.shape={seg_old_log_prob.shape}")
+                print(f"[DEBUG] [tree_segment] Worker {rank}: seg_advantages.shape={seg_advantages.shape}, seg_response_mask.shape={seg_response_mask.shape}")
 
         # === New code: Check batch strategy for tree_segment loss ===
         tree_segment_batch_strategy = getattr(self.config, "tree_segment_batch_strategy", "leaf")
@@ -504,26 +512,22 @@ class DataParallelPPOActor(BasePPOActor):
         metrics = {}
 
         if use_segment_batching:
-            # === SEGMENT-BASED BATCHING STRATEGY ===
+            # === SEGMENT-BASED BATCHING STRATEGY - LOCAL WORKER ONLY ===
             ppo_micro_batch_segments = getattr(self.config, "ppo_micro_batch_segments", None)
             total_segments = len(local_tree_seg_targets["seg_lens"])
 
             rank = dist.get_rank() if dist.is_initialized() else 0
             world_size = dist.get_world_size() if dist.is_initialized() else 1
 
-            # === FILTER: ONLY PROCESS SEGMENTS ASSIGNED TO THIS WORKER ===
-            # Use consistent hashing for load balancing: global_seg_idx % world_size == rank
-            local_to_global_seg_idx_map = local_tree_seg_targets["local_to_global_seg_idx_map"]
-            assigned_local_seg_indices = []
-            for local_seg_idx in range(total_segments):
-                global_seg_idx = local_to_global_seg_idx_map[local_seg_idx]
-                if global_seg_idx % world_size == rank:
-                    assigned_local_seg_indices.append(local_seg_idx)
+            print(f"[DEBUG] [tree_segment] Worker {rank}/{world_size}: start update_policy with segment batching")
+            print(f"[DEBUG] [tree_segment] Worker {rank}: local_batch_size={local_batch_size} leaves, total_segments={total_segments} segments")
+
+            # === NO FILTER: PROCESS ALL LOCAL SEGMENTS ON THIS WORKER ===
+            # Each worker processes ALL segments from its own rollout
+            assigned_local_seg_indices = list(range(total_segments))
             num_assigned_segments = len(assigned_local_seg_indices)
 
-            # Only print on rank 0 to avoid log spam
-            if rank == 0:
-                print(f"[tree_segment] Assigned {num_assigned_segments}/{total_segments} local segments")
+            print(f"[DEBUG] [tree_segment] Worker {rank}: processing ALL {num_assigned_segments} local segments (no global reallocation)")
 
             if ppo_micro_batch_segments is None:
                 # Default estimation: use similar ratio as leaf-based batching
@@ -540,25 +544,23 @@ class DataParallelPPOActor(BasePPOActor):
             else:
                 self.gradient_accumulation = 1
 
-            # Only print on rank 0 to avoid log spam
-            if rank == 0:
-                print(f"[tree_segment] Using segment-based batching: {num_assigned_segments} assigned segments, "
-                      f"{total_segments} local segments total, "
-                      f"{ppo_micro_batch_segments} segments per micro-batch, "
-                      f"gradient accumulation over {self.gradient_accumulation} micro-batches")
+            print(f"[DEBUG] [tree_segment] Worker {rank}: ppo_micro_batch_segments={ppo_micro_batch_segments}, gradient_accumulation={self.gradient_accumulation}")
 
             on_policy = num_assigned_segments <= ppo_micro_batch_segments and self.config.ppo_epochs == 1
 
-            for _ in range(self.config.ppo_epochs):
-                # Shuffle only the assigned segments
+            for epoch in range(self.config.ppo_epochs):
+                print(f"[DEBUG] [tree_segment] Worker {rank}: epoch {epoch+1}/{self.config.ppo_epochs}")
+                # Shuffle all local segments
                 segment_indices = assigned_local_seg_indices.copy()
                 random.shuffle(segment_indices)
+                print(f"[DEBUG] [tree_segment] Worker {rank}: shuffled {len(segment_indices)} segments")
 
                 # Split into micro-batches (we use gradient accumulation for multiple micro-batches per step)
                 segment_micro_batches = [
                     segment_indices[i:i+ppo_micro_batch_segments]
                     for i in range(0, len(segment_indices), ppo_micro_batch_segments)
                 ]
+                print(f"[DEBUG] [tree_segment] Worker {rank}: split into {len(segment_micro_batches)} micro-batches")
 
                 # Zero grad at the start of each mini-batch cycle
                 self.actor_optimizer.zero_grad()
@@ -570,6 +572,10 @@ class DataParallelPPOActor(BasePPOActor):
                     # Collect all required leaves for these segments
                     seg_canonical = local_tree_seg_targets["seg_canonical"]
                     required_leaves = list({seg_canonical[i][0] for i in seg_indices})
+                    if m == 0:
+                        print(f"[DEBUG] [tree_segment] Worker {rank}: micro-batch {m} has {len(seg_indices)} segments, requires {len(required_leaves)} leaves")
+                        print(f"[DEBUG] [tree_segment] Worker {rank}: seg_indices={seg_indices[:5]}{'...' if len(seg_indices) > 5 else ''}")
+                        print(f"[DEBUG] [tree_segment] Worker {rank}: required_leaves={required_leaves[:5]}{'...' if len(required_leaves) > 5 else ''}")
 
                     # Get the data for required leaves only
                     # Note: seg_canonical uses LOCAL leaf indices within this worker's data
@@ -586,6 +592,8 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy, log_prob = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
+                    if m == 0:
+                        print(f"[DEBUG] [tree_segment] Worker {rank}: forward done, log_prob.shape={log_prob.shape}")
 
                     # Build leaf inverse map: from original local leaf index to local index in mini_batch
                     leaf_inverse_map = {global_idx: local_idx for local_idx, global_idx in enumerate(required_leaves)}
@@ -614,6 +622,10 @@ class DataParallelPPOActor(BasePPOActor):
                     seg_rollout_is_weights_local = local_tree_seg_targets["rollout_is_weights"]
                     if seg_rollout_is_weights_local is not None:
                         seg_rollout_is_weights_local = seg_rollout_is_weights_local[seg_indices].to(log_prob.device)
+
+                    if m == 0:
+                        print(f"[DEBUG] [tree_segment] Worker {rank}: seg_advantages.shape={seg_advantages_local.shape}")
+                        print(f"[DEBUG] [tree_segment] Worker {rank}: seg_advantages range: [{seg_advantages_local.min():.4f}, {seg_advantages_local.max():.4f}]")
 
                     # Compute loss
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
@@ -649,6 +661,9 @@ class DataParallelPPOActor(BasePPOActor):
                         micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
+                    if m == 0:
+                        print(f"[DEBUG] [tree_segment] Worker {rank}: pg_loss={pg_loss.detach().item():.6f}, policy_loss={policy_loss.detach().item():.6f}")
+
                     # Backward pass with gradient accumulation
                     loss = policy_loss * loss_scale_factor
                     loss.backward()
@@ -665,6 +680,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                 # Optimizer step after gradient accumulation
                 grad_norm = self._optimizer_step()
+                print(f"[DEBUG] [tree_segment] Worker {rank}: optimizer step done, grad_norm={grad_norm.detach().item():.6f}")
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
 
