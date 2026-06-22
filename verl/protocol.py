@@ -348,8 +348,13 @@ class DataProto:
         if self.batch is not None:
             return self.batch.batch_size[0]
         elif self.non_tensor_batch is not None and len(self.non_tensor_batch) > 0:
-            random_key = list(self.non_tensor_batch.keys())[0]
-            return self.non_tensor_batch[random_key].shape[0]
+            # 跳过元数据字段，优先找 per-leaf 字段
+            metadata_keys = {"unique_segments", "unique_segment_seq_ids", "worker_segments_offsets"}
+            for key in self.non_tensor_batch.keys():
+                if key not in metadata_keys:
+                    return self.non_tensor_batch[key].shape[0]
+            # 如果全是元数据字段，返回 0
+            return 0
         else:
             return 0
 
