@@ -278,34 +278,39 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
         they belong to, then multiplied by response_mask to zero out padding.
         Segments shared across multiple leaves use the same pre-computed advantage.
     """
+    print(f"[DEBUG] [compute_tree_process_advantage] Start")
+
     if "response_mask" not in data.batch.keys():
         data.batch["response_mask"] = compute_response_mask(data)
 
     response_mask = data.batch["response_mask"]          # (n_leaves, resp_len)
     n_leaves, resp_len = response_mask.shape
     device = response_mask.device
+    print(f"[DEBUG] [compute_tree_process_advantage] n_leaves={n_leaves}, resp_len={resp_len}")
 
     # ── Step 1: back-propagate leaf scores to all nodes ──────────────────────
     leaf_scores = data.batch["token_level_rewards"].sum(dim=-1).float()  # (n_leaves,)
-    print(f"leave_scores:{leaf_scores}")
-    print(f"leave_scores.shape:{leaf_scores.shape}")
+    print(f"[DEBUG] [compute_tree_process_advantage] leaf_scores range: [{leaf_scores.min():.4f}, {leaf_scores.max():.4f}], mean={leaf_scores.mean():.4f}")
 
     # Try to get unique_segments from non_tensor_batch first (new location),
     # then fall back to meta_info['metrics'] (old location for compatibility)
     unique_segments = data.non_tensor_batch.get("unique_segments")
     if unique_segments is None:
         unique_segments = data.meta_info["metrics"]["unique_segments"]
-    # print(f"[process advantage] unique_segments: {unique_segments}")     # (n_unique,) of lists
     leaf_segment_indices = data.non_tensor_batch["leaf_segment_indices"]  # (n_leaves,) of lists
+    worker_segments_offsets = data.non_tensor_batch.get("worker_segments_offsets")
+
+    if worker_segments_offsets is not None:
+        print(f"[DEBUG] [compute_tree_process_advantage] worker_segments_offsets={worker_segments_offsets}")
 
     n_unique = len(unique_segments)
     n_leaves = len(leaf_segment_indices)
-    print(f"[compute_tree_process_advantage] n_unique segments: {n_unique}, n_leaves: {n_leaves}")
+    print(f"[DEBUG] [compute_tree_process_advantage] n_unique segments: {n_unique}, n_leaves: {n_leaves}")
 
     # Debug: Print tree structure stats
     import numpy as np
     path_lengths = [len(path) for path in leaf_segment_indices]
-    print(f"[compute_tree_process_advantage] Path length stats: min={min(path_lengths)}, max={max(path_lengths)}, "
+    print(f"[DEBUG] [compute_tree_process_advantage] Path length stats: min={min(path_lengths)}, max={max(path_lengths)}, "
           f"mean={np.mean(path_lengths):.2f}, median={np.median(path_lengths):.2f}")
 
     # Count segments at each depth
@@ -314,7 +319,7 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
     for path in leaf_segment_indices:
         for depth, _ in enumerate(path):
             depth_counts[depth] += 1
-    print(f"[compute_tree_process_advantage] Segment depth counts: {dict(depth_counts)}")
+    print(f"[DEBUG] [compute_tree_process_advantage] Segment depth counts: {dict(depth_counts)}")
 
     # Check for root nodes (segments with no parent)
     all_segments = set()
@@ -325,9 +330,8 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
             if i > 0:
                 child_segments.add(seg_idx)
     root_segments = all_segments - child_segments
-    print(f"[compute_tree_process_advantage] Number of root segments: {len(root_segments)}")
-
-    print("n_unique:",n_unique)
+    print(f"[DEBUG] [compute_tree_process_advantage] Number of root segments: {len(root_segments)}")
+    print(f"[DEBUG] [compute_tree_process_advantage] n_unique={n_unique}, all_segments={len(all_segments)}")
 
     # Map leaf segment -> leaf row index; build parent map in one pass
     leaf_seg_to_leaf_idx: dict[int, int] = {}
@@ -340,6 +344,7 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
             seg_depth[seg_idx] = depth
             if depth > 0:
                 parent_of[seg_idx] = path[depth - 1]
+    print(f"[DEBUG] [compute_tree_process_advantage] leaf_seg_to_leaf_idx has {len(leaf_seg_to_leaf_idx)} entries")
 
     # Assign leaf scores first
     node_scores = torch.zeros(n_unique, dtype=torch.float32, device=device)
@@ -356,6 +361,7 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
 
     # Get list of internal nodes (non-leaf nodes)
     internal_nodes = [i for i in range(n_unique) if i in children_of]
+    print(f"[DEBUG] [compute_tree_process_advantage] internal_nodes={len(internal_nodes)}, leaf_nodes={len(leaf_seg_to_leaf_idx)}")
 
     # Sort internal nodes by depth descending (compute deeper nodes first)
     internal_nodes_sorted = sorted(internal_nodes, key=lambda i: -seg_depth[i])
@@ -366,15 +372,7 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
         children_t = torch.tensor(children, dtype=torch.long, device=device)
         child_scores = node_scores[children_t]
         node_scores[i] = child_scores.mean()
-
-    # Compute children_sum and children_count (not strictly needed but kept for consistency)
-    # children_sum = torch.zeros(n_unique, dtype=torch.float32, device=device)
-    # children_count = torch.zeros(n_unique, dtype=torch.float32, device=device)
-    # for i in range(n_unique):
-    #     p = int(parent_of[i])
-    #     if p >= 0:
-    #         children_sum[p] += node_scores[i]
-    #         children_count[p] += 1
+    print(f"[DEBUG] [compute_tree_process_advantage] node_scores range: [{node_scores.min():.4f}, {node_scores.max():.4f}]")
 
     # ── Step 2: combine local and global advantages ──────────────────────────
     # Local advantage: adv_local(s) = (score(s) - score(parent(s))) / (std(siblings) + eps)
@@ -393,8 +391,6 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
         children_t = torch.tensor(children, dtype=torch.long, device=device)
         sibling_scores = node_scores[children_t]
         sib_std = sibling_scores.std() if len(children) > 1 else torch.tensor(0.0, device=device)
-        # print("sib_std:", sib_std)
-        # print("sibling_scores:", sibling_scores)
         parent_score = node_scores[p]
         seg_local_advantages[children_t] = (sibling_scores - parent_score) / (sib_std + 1e-6)
 
@@ -407,6 +403,8 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
 
     # Combine local and global advantages
     seg_advantages = local_adv_weight * seg_local_advantages + global_adv_weight * seg_global_advantages
+    print(f"[DEBUG] [compute_tree_process_advantage] seg_advantages range: [{seg_advantages.min():.4f}, {seg_advantages.max():.4f}], mean={seg_advantages.mean():.4f}")
+
     # ── Step 3: assemble token-level advantages per leaf ─────────────────────
     # Each leaf's response is the concatenation of its path segments in order.
     # We fill token positions with the advantage of the segment they belong to.
@@ -415,9 +413,11 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
     for path in leaf_segment_indices:
         for seg_idx in path:
             seg_leaf_count[seg_idx] += 1
-            
+
     total_response_tokens = int(response_mask.sum().item())
     mean_seg_len = total_response_tokens / max(n_unique, 1)
+    print(f"[DEBUG] [compute_tree_process_advantage] total_response_tokens={total_response_tokens}, mean_seg_len={mean_seg_len:.2f}")
+
     token_advantages = torch.zeros(n_leaves, resp_len, dtype=torch.float32, device=device)
     for j, path in enumerate(leaf_segment_indices):
         pos = 0
@@ -425,8 +425,6 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
             seg_len = len(unique_segments[seg_idx])
             end = min(pos + seg_len, resp_len)
             valid_seg_len = max(end - pos, 1)
-            # leaf_share = max(int(seg_leaf_count[seg_idx]), 1)
-            # print(f"proc_agg_mode: {proc_agg_mode}")
             if proc_agg_mode == "raw":
                 token_advantages[j, pos:end] = seg_advantages[seg_idx]
             elif proc_agg_mode == "length_balanced":
@@ -436,8 +434,11 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
                 break
 
     token_advantages = token_advantages * response_mask
+    print(f"[DEBUG] [compute_tree_process_advantage] token_advantages range: [{token_advantages.min():.4f}, {token_advantages.max():.4f}]")
+
     data.batch["advantages"] = token_advantages
     data.batch["returns"] = token_advantages  # returns not used downstream in this path
+    print(f"[DEBUG] [compute_tree_process_advantage] Done")
     return data
 
 
