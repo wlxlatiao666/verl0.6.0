@@ -323,7 +323,6 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
     print(f"[DEBUG] [compute_tree_process_advantage] unique_prompt_ids={len(unique_prompt_ids)}, index_range=[{index.min()}, {index.max()}]")
 
     # Debug: Print tree structure stats
-    import numpy as np
     path_lengths = [len(path) for path in leaf_segment_indices]
     print(f"[DEBUG] [compute_tree_process_advantage] Path length stats: min={min(path_lengths)}, max={max(path_lengths)}, "
           f"mean={np.mean(path_lengths):.2f}, median={np.median(path_lengths):.2f}")
