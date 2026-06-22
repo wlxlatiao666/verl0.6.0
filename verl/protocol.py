@@ -484,7 +484,7 @@ class DataProto:
                 # Skip length check for tree segment metadata - they are per-worker collections,
                 # not per-leaf data. unique_segments has length = number of unique tree nodes,
                 # not equal to batch size (number of leaves).
-                if key in ("unique_segments", "unique_segment_seq_ids"):
+                if key in ("unique_segments", "unique_segment_seq_ids", "worker_segments_offsets"):
                     continue
                 assert val.shape[0] == batch_size, (
                     f"key {key} length {len(val)} is not equal to batch size {batch_size}"
@@ -682,8 +682,8 @@ class DataProto:
 
         selected_non_tensor = {}
         for key, val in self.non_tensor_batch.items():
-            if key in ("unique_segments", "unique_segment_seq_ids"):
-                # Keep these as-is - they are global segment collections, not per-leaf data
+            if key in ("unique_segments", "unique_segment_seq_ids", "worker_segments_offsets"):
+                # Keep these as-is - they are global segment collections or worker offsets, not per-leaf data
                 selected_non_tensor[key] = val
             else:
                 selected_non_tensor[key] = val[idxs_np]
@@ -731,8 +731,8 @@ class DataProto:
         # Handle the non-tensor batch data
         sliced_non_tensor = {}
         for key, val in self.non_tensor_batch.items():
-            if key in ("unique_segments", "unique_segment_seq_ids"):
-                # Keep these as-is - they are global segment collections, not per-leaf data
+            if key in ("unique_segments", "unique_segment_seq_ids", "worker_segments_offsets"):
+                # Keep these as-is - they are global segment collections or worker offsets, not per-leaf data
                 sliced_non_tensor[key] = val
             else:
                 sliced_non_tensor[key] = val[slice_obj]
@@ -1107,7 +1107,7 @@ class DataProto:
 
         non_tensor_batch = list_of_dict_to_dict_of_list(list_of_dict=[d.non_tensor_batch for d in data])
         for key, val in non_tensor_batch.items():
-            if key in ("unique_segments", "unique_segment_seq_ids"):
+            if key in ("unique_segments", "unique_segment_seq_ids", "worker_segments_offsets"):
                 # These are not per-leaf data but per-worker collections;
                 # concatenate the collected arrays from all workers
                 if key == "unique_segments" and all_unique_segments:
@@ -1166,7 +1166,7 @@ class DataProto:
         self.batch = self.batch[indices]
         new_non_tensor_batch = {}
         for key, val in self.non_tensor_batch.items():
-            if key in ("unique_segments", "unique_segment_seq_ids"):
+            if key in ("unique_segments", "unique_segment_seq_ids", "worker_segments_offsets"):
                 # Keep these as-is - they are global segment collections
                 new_non_tensor_batch[key] = val
             else:
@@ -1206,7 +1206,7 @@ class DataProto:
 
         repeated_non_tensor_batch = {}
         for key, val in self.non_tensor_batch.items():
-            if key in ("unique_segments", "unique_segment_seq_ids"):
+            if key in ("unique_segments", "unique_segment_seq_ids", "worker_segments_offsets"):
                 # Keep these as-is - they are global segment collections
                 repeated_non_tensor_batch[key] = val
             else:
@@ -1300,7 +1300,7 @@ class DataProto:
 
         repeated_non_tensor_batch = {}
         for key, val in self.non_tensor_batch.items():
-            if key in ("unique_segments", "unique_segment_seq_ids"):
+            if key in ("unique_segments", "unique_segment_seq_ids", "worker_segments_offsets"):
                 # Keep these as-is - they are global segment collections
                 repeated_non_tensor_batch[key] = val
             else:
