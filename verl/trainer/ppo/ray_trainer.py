@@ -1416,13 +1416,13 @@ class RayPPOTrainer:
                     # ── Optimization: Temporarily remove tree segment data to reduce memory transfer ──
                     # Tree data (unique_segments, etc.) is only needed for compute_tree_process_advantage
                     # We remove it before compute_log_prob/compute_ref_log_prob/compute_values to save memory
+                    # NOTE: Keep worker_*_offsets because chunk() needs them to split correctly!
                     tree_data_cache = {}
-                    tree_segment_keys = ["unique_segments", "unique_segment_seq_ids", "leaf_segment_indices",
-                                        "worker_segments_offsets", "worker_leaves_offsets"]
-                    has_tree_data = any(key in batch.non_tensor_batch for key in tree_segment_keys)
+                    tree_segment_large_keys = ["unique_segments", "unique_segment_seq_ids", "leaf_segment_indices"]
+                    has_tree_data = any(key in batch.non_tensor_batch for key in tree_segment_large_keys)
                     if has_tree_data:
-                        print(f"[MemoryOpt] Temporarily removing tree data from batch for compute_log_prob/ref/values")
-                        for key in tree_segment_keys:
+                        print(f"[MemoryOpt] Temporarily removing large tree data from batch for compute_log_prob/ref/values")
+                        for key in tree_segment_large_keys:
                             if key in batch.non_tensor_batch:
                                 tree_data_cache[key] = batch.non_tensor_batch.pop(key)
 
@@ -1517,21 +1517,6 @@ class RayPPOTrainer:
                                 local_adv_weight=local_adv_weight,
                                 global_adv_weight=global_adv_weight
                             )
-
-                            # After compute_tree_process_advantage, we can clean up some tree data
-                            # worker_*_offsets are no longer needed
-                            for key in ["worker_segments_offsets", "worker_leaves_offsets"]:
-                                if key in batch.non_tensor_batch:
-                                    del batch.non_tensor_batch[key]
-                            print(f"[MemoryOpt] Cleaned up worker offsets after compute_tree_process_advantage")
-
-                            # Check if policy loss type is tree_segment - if not, we can clean up more data
-                            policy_loss_type = self.config.actor_rollout_ref.actor.get("policy_loss_type", "vanilla")
-                            if policy_loss_type != "tree_segment":
-                                for key in ["unique_segments", "unique_segment_seq_ids", "leaf_segment_indices"]:
-                                    if key in batch.non_tensor_batch:
-                                        del batch.non_tensor_batch[key]
-                                print(f"[MemoryOpt] Cleaned up all tree segment data (policy_loss_type={policy_loss_type})")
                         else:
                             # compute advantages, executed on the driver process
                             norm_adv_by_std_in_grpo = self.config.algorithm.get(
