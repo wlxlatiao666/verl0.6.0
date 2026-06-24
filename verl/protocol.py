@@ -1049,44 +1049,44 @@ class DataProto:
                         if rank == 0:
                             print(f"[DEBUG] DataProto.chunk: chunk {i} adjusted leaf_segment_indices from offset {start_idx}")
             elif unique_segments is not None and leaf_segment_indices_per_chunk:
-            # Case 2: Fall back - rebuild local segments for each chunk
-            if rank == 0:
-                print(f"[DEBUG] DataProto.chunk: Rebuilding local segments for each chunk")
-            for i in range(chunks):
-                chunk_lsi = leaf_segment_indices_per_chunk[i]
-                # Collect all segment indices used in this chunk's leaves
-                used_seg_indices = set()
-                for path in chunk_lsi:
-                    for seg_idx in path:
-                        used_seg_indices.add(seg_idx)
-                used_seg_indices = sorted(used_seg_indices)
+                # Case 2: Fall back - rebuild local segments for each chunk
                 if rank == 0:
-                    print(f"[DEBUG] DataProto.chunk: chunk {i} uses {len(used_seg_indices)} segments: {used_seg_indices[:10]}{'...' if len(used_seg_indices) > 10 else ''}")
-                # Build local unique_segments
-                chunk_unique_segments = np.array([unique_segments[idx] for idx in used_seg_indices], dtype=object)
-                non_tensor_batch_lst[i]["unique_segments"] = chunk_unique_segments
-                # Build local unique_segment_seq_ids if available
-                if unique_segment_seq_ids is not None:
-                    chunk_unique_segment_seq_ids = np.array([unique_segment_seq_ids[idx] for idx in used_seg_indices])
-                    non_tensor_batch_lst[i]["unique_segment_seq_ids"] = chunk_unique_segment_seq_ids
-                # Build mapping from global to local
-                global_to_local = {global_idx: local_idx for local_idx, global_idx in enumerate(used_seg_indices)}
-                # Adjust leaf_segment_indices
-                adjusted_lsi = np.empty(len(chunk_lsi), dtype=object)
-                for j, path in enumerate(chunk_lsi):
-                    adjusted_path = [global_to_local[idx] for idx in path]
-                    adjusted_lsi[j] = adjusted_path
-                non_tensor_batch_lst[i]["leaf_segment_indices"] = adjusted_lsi
+                    print(f"[DEBUG] DataProto.chunk: Rebuilding local segments for each chunk")
+                for i in range(chunks):
+                    chunk_lsi = leaf_segment_indices_per_chunk[i]
+                    # Collect all segment indices used in this chunk's leaves
+                    used_seg_indices = set()
+                    for path in chunk_lsi:
+                        for seg_idx in path:
+                            used_seg_indices.add(seg_idx)
+                    used_seg_indices = sorted(used_seg_indices)
+                    if rank == 0:
+                        print(f"[DEBUG] DataProto.chunk: chunk {i} uses {len(used_seg_indices)} segments: {used_seg_indices[:10]}{'...' if len(used_seg_indices) > 10 else ''}")
+                    # Build local unique_segments
+                    chunk_unique_segments = np.array([unique_segments[idx] for idx in used_seg_indices], dtype=object)
+                    non_tensor_batch_lst[i]["unique_segments"] = chunk_unique_segments
+                    # Build local unique_segment_seq_ids if available
+                    if unique_segment_seq_ids is not None:
+                        chunk_unique_segment_seq_ids = np.array([unique_segment_seq_ids[idx] for idx in used_seg_indices])
+                        non_tensor_batch_lst[i]["unique_segment_seq_ids"] = chunk_unique_segment_seq_ids
+                    # Build mapping from global to local
+                    global_to_local = {global_idx: local_idx for local_idx, global_idx in enumerate(used_seg_indices)}
+                    # Adjust leaf_segment_indices
+                    adjusted_lsi = np.empty(len(chunk_lsi), dtype=object)
+                    for j, path in enumerate(chunk_lsi):
+                        adjusted_path = [global_to_local[idx] for idx in path]
+                        adjusted_lsi[j] = adjusted_path
+                    non_tensor_batch_lst[i]["leaf_segment_indices"] = adjusted_lsi
+                    if rank == 0:
+                        print(f"[DEBUG] DataProto.chunk: chunk {i} leaf_segment_indices adjusted")
+            elif unique_segments is not None:
+                # Fallback: copy all (original behavior) but warn
                 if rank == 0:
-                    print(f"[DEBUG] DataProto.chunk: chunk {i} leaf_segment_indices adjusted")
-        elif unique_segments is not None:
-            # Fallback: copy all (original behavior) but warn
-            if rank == 0:
-                print(f"[DEBUG] DataProto.chunk: WARNING - falling back to copying all segments to each chunk")
-            for i in range(chunks):
-                non_tensor_batch_lst[i]["unique_segments"] = unique_segments
-                if unique_segment_seq_ids is not None:
-                    non_tensor_batch_lst[i]["unique_segment_seq_ids"] = unique_segment_seq_ids
+                    print(f"[DEBUG] DataProto.chunk: WARNING - falling back to copying all segments to each chunk")
+                for i in range(chunks):
+                    non_tensor_batch_lst[i]["unique_segments"] = unique_segments
+                    if unique_segment_seq_ids is not None:
+                        non_tensor_batch_lst[i]["unique_segment_seq_ids"] = unique_segment_seq_ids
 
         output = []
         for i in range(chunks):
