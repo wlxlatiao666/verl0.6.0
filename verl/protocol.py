@@ -495,7 +495,7 @@ class DataProto:
                 # Skip length check for tree segment metadata - they are per-worker collections,
                 # not per-leaf data. unique_segments has length = number of unique tree nodes,
                 # not equal to batch size (number of leaves).
-                if key in ("unique_segments", "unique_segment_seq_ids", "worker_segments_offsets"):
+                if key in ("unique_segments", "unique_segment_seq_ids", "worker_segments_offsets", "worker_leaves_offsets"):
                     continue
                 assert val.shape[0] == batch_size, (
                     f"key {key} length {len(val)} is not equal to batch size {batch_size}"
