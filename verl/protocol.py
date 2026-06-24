@@ -919,11 +919,14 @@ class DataProto:
                               len(worker_leaves_offsets) == chunks + 1 and
                               len(worker_segments_offsets) == chunks + 1)
 
-        if use_worker_offsets and not self.is_padding_enabled():
-            # Verify that the total leaves match
-            assert worker_leaves_offsets[-1] == len(self), (
-                f"worker_leaves_offsets[-1]={worker_leaves_offsets[-1]} != len(self)={len(self)}"
+        # Verify that the total leaves match, otherwise disable worker offsets
+        if use_worker_offsets and worker_leaves_offsets[-1] != len(self):
+            import logging
+            logging.warning(
+                f"worker_leaves_offsets[-1]={worker_leaves_offsets[-1]} != len(self)={len(self)}, "
+                "will use equal chunking instead of worker boundaries"
             )
+            use_worker_offsets = False
 
         non_tensor_batch_lst = [{} for _ in range(chunks)]
         batch_lst = [None for _ in range(chunks)]

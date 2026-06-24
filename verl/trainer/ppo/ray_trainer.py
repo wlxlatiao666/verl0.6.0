@@ -1397,14 +1397,18 @@ class RayPPOTrainer:
                     # but might affect the loss calculation (due to the change of mini-batching).
                     # TODO: Decouple the DP balancing and mini-batching.
                     if self.config.trainer.balance_batch:
-                        # Tree search may produce a batch size not divisible by world_size.
-                        # Trim excess samples so balanced partitioning works (drops at most world_size-1 samples).
-                        world_size = self.actor_rollout_wg.world_size
-                        bs = len(batch.batch)
-                        remainder = bs % world_size
-                        if remainder != 0:
-                            batch = batch[:bs - remainder]
-                        self._balance_batch(batch, metrics=metrics)
+                        # Check if we have tree SR worker offsets - if yes, skip trimming and balancing
+                        # because we want to keep each worker's leaves together
+                        has_worker_offsets = "worker_leaves_offsets" in batch.non_tensor_batch
+                        if not has_worker_offsets:
+                            # Tree search may produce a batch size not divisible by world_size.
+                            # Trim excess samples so balanced partitioning works (drops at most world_size-1 samples).
+                            world_size = self.actor_rollout_wg.world_size
+                            bs = len(batch.batch)
+                            remainder = bs % world_size
+                            if remainder != 0:
+                                batch = batch[:bs - remainder]
+                            self._balance_batch(batch, metrics=metrics)
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
