@@ -592,12 +592,45 @@ class DataParallelPPOActor(BasePPOActor):
                     segment_indices[i:i+ppo_micro_batch_segments]
                     for i in range(0, len(segment_indices), ppo_micro_batch_segments)
                 ]
-                print(f"[DEBUG] [tree_segment] Worker {rank}: split into {len(segment_micro_batches)} micro-batches")
+                num_micro_batches = len(segment_micro_batches)
+                print(f"[DEBUG] [tree_segment] Worker {rank}: split into {num_micro_batches} micro-batches")
+
+                # === ALIGN MICRO-BATCH COUNT ACROSS ALL WORKERS ===
+                # Gather micro-batch counts from all workers and find the maximum
+                max_micro_batches = num_micro_batches
+                if dist.is_initialized() and world_size > 1:
+                    # Create tensor to hold local count
+                    count_tensor = torch.tensor([num_micro_batches], dtype=torch.int64, device=get_device_id())
+                    # Gather counts from all workers
+                    gathered_counts = [torch.tensor([0], dtype=torch.int64, device=get_device_id()) for _ in range(world_size)]
+                    dist.all_gather(gathered_counts, count_tensor)
+                    # Find maximum count
+                    max_micro_batches = max([cnt.item() for cnt in gathered_counts])
+                    print(f"[DEBUG] [tree_segment] Worker {rank}: local={num_micro_batches}, max={max_micro_batches} micro-batches across {world_size} workers")
 
                 # Zero grad at the start of each mini-batch cycle
                 self.actor_optimizer.zero_grad()
 
-                for m, seg_indices in enumerate(segment_micro_batches):
+                # Process both real and dummy micro-batches up to max_micro_batches
+                for m in range(max_micro_batches):
+                    is_dummy = m >= num_micro_batches
+
+                    if is_dummy:
+                        # === DUMMY MICRO-BATCH: NO GRADIENT UPDATE ===
+                        # Skip computation entirely - just add dummy metrics
+                        # This maintains step count without extra computation
+                        print(f"[DEBUG] [tree_segment] Worker {rank}: micro-batch {m} (dummy, no gradient update)")
+                        micro_batch_metrics = {
+                            "actor/pg_loss": 0.0,
+                            "actor/pg_clipfrac": 0.0,
+                            "actor/ppo_kl": 0.0,
+                            "actor/pg_clipfrac_lower": 0.0,
+                        }
+                        append_to_dict(metrics, micro_batch_metrics)
+                        continue
+
+                    # === REAL MICRO-BATCH ===
+                    seg_indices = segment_micro_batches[m]
                     if not seg_indices:
                         continue
 
