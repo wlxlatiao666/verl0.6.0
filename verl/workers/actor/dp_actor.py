@@ -384,17 +384,16 @@ class DataParallelPPOActor(BasePPOActor):
 
             if is_dummy:
                 # === DUMMY MICRO-BATCH: ONLY FOR SYNCHRONIZATION ===
-                # Need to run a minimal forward pass to keep FSDP in sync
-                # but don't add results to the output lists
+                # Run full forward pass with dummy data to keep FSDP in sync
                 print(f"[DEBUG] Rank {rank}: Processing micro_batch {i}/{max_micro_batches} (dummy) at {time.time()}")
-                # Use the first batch as dummy data if available
+                # Use first batch as dummy data if available
                 if num_micro_batches > 0:
                     dummy_batch = micro_batches[0]
                     dummy_batch = dummy_batch.to(get_device_id())
                     model_inputs = {**dummy_batch.batch, **dummy_batch.non_tensor_batch}
                     with torch.no_grad():
-                        # Run forward but discard results
-                        self._forward_micro_batch(
+                        # Run full forward pass (this will trigger FSDP communication)
+                        _, _ = self._forward_micro_batch(
                             model_inputs, temperature=temperature, calculate_entropy=False
                         )
                 continue
@@ -653,15 +652,90 @@ class DataParallelPPOActor(BasePPOActor):
 
                     if is_dummy:
                         # === DUMMY MICRO-BATCH: NO GRADIENT UPDATE ===
-                        # Skip computation entirely - just add dummy metrics
-                        # This maintains step count without extra computation
+                        # Run full forward/backward with dummy data and 0 loss scale
+                        # This ensures FSDP communication patterns match across all workers
                         print(f"[DEBUG] [tree_segment] Worker {rank}: micro-batch {m} (dummy, no gradient update)")
+                        if num_micro_batches > 0 and local_batch_size > 0:
+                            # Reuse the first batch's data for dummy computation
+                            first_seg_indices = segment_micro_batches[0]
+                            first_seg_canonical = local_tree_seg_targets["seg_canonical"]
+                            first_required_leaves = list({first_seg_canonical[i][0] for i in first_seg_indices})
+                            mini_batch = data[first_required_leaves]
+                            mini_batch = mini_batch.to(get_device_id())
+                            model_inputs = {**mini_batch.batch, **mini_batch.non_tensor_batch}
+                            entropy_coeff = self.config.entropy_coeff
+                            # Use 0 loss scale to prevent actual gradient update
+                            loss_scale_factor = 0.0
+
+                            # Run normal forward pass
+                            calculate_entropy = entropy_coeff != 0
+                            entropy, log_prob = self._forward_micro_batch(
+                                model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                            )
+
+                            # Build dummy tensors for loss computation (just to keep same code path)
+                            max_seg_len = local_tree_seg_targets["old_log_prob"].shape[1]
+                            dummy_seg_indices = first_seg_indices
+                            # Build leaf inverse map
+                            leaf_inverse_map = {global_idx: local_idx for local_idx, global_idx in enumerate(first_required_leaves)}
+                            seg_log_prob_local = torch.zeros(len(dummy_seg_indices), max_seg_len, device=log_prob.device, dtype=log_prob.dtype)
+
+                            seg_lens = local_tree_seg_targets["seg_lens"]
+                            for local_i, seg_idx in enumerate(dummy_seg_indices):
+                                leaf_j, tok_offset = first_seg_canonical[seg_idx]
+                                local_leaf_j = leaf_inverse_map[leaf_j]
+                                seg_len = seg_lens[seg_idx]
+                                end_tok = min(tok_offset + seg_len, log_prob.shape[1])
+                                actual_len = end_tok - tok_offset
+                                seg_log_prob_local[local_i, :actual_len] = log_prob[local_leaf_j, tok_offset:end_tok]
+
+                            # Compute dummy loss
+                            seg_old_log_prob_local = seg_log_prob_local.detach()
+                            seg_advantages_local = torch.zeros_like(seg_old_log_prob_local)
+                            seg_response_mask_local = torch.zeros_like(seg_old_log_prob_local)
+
+                            policy_loss_fn = get_policy_loss_fn(loss_mode)
+                            pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                                old_log_prob=seg_old_log_prob_local,
+                                log_prob=seg_log_prob_local,
+                                advantages=seg_advantages_local,
+                                response_mask=seg_response_mask_local,
+                                loss_agg_mode=loss_agg_mode,
+                                config=self.config,
+                                rollout_is_weights=None,
+                            )
+
+                            # Entropy loss
+                            if entropy_coeff != 0:
+                                response_mask = model_inputs["response_mask"]
+                                entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                                policy_loss = pg_loss - entropy_loss * entropy_coeff
+                            else:
+                                policy_loss = pg_loss
+
+                            # KL loss
+                            if self.config.use_kl_loss:
+                                ref_log_prob = model_inputs["ref_log_prob"]
+                                response_mask = model_inputs["response_mask"]
+                                kld = kl_penalty(
+                                    logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
+                                )
+                                kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                                policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+
+                            # Backward pass with 0 loss scale - no actual gradient update
+                            loss = policy_loss * loss_scale_factor
+                            loss.backward()
+                        # Add dummy metrics
                         micro_batch_metrics = {
                             "actor/pg_loss": 0.0,
                             "actor/pg_clipfrac": 0.0,
                             "actor/ppo_kl": 0.0,
                             "actor/pg_clipfrac_lower": 0.0,
                         }
+                        if self.config.use_kl_loss:
+                            micro_batch_metrics["actor/kl_loss"] = 0.0
+                            micro_batch_metrics["actor/kl_coef"] = 0.0
                         append_to_dict(metrics, micro_batch_metrics)
                         continue
 
