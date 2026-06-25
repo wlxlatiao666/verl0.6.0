@@ -360,12 +360,48 @@ class DataParallelPPOActor(BasePPOActor):
             print(f"[DEBUG] Rank {rank}: use_dynamic_bsz=False, micro_batch_size={micro_batch_size}")
             micro_batches = data.split(micro_batch_size)
 
-        print(f"[DEBUG] Rank {rank}: Number of micro_batches: {len(micro_batches)}")
+        num_micro_batches = len(micro_batches)
+        print(f"[DEBUG] Rank {rank}: Number of micro_batches: {num_micro_batches}")
+
+        # === ALIGN MICRO-BATCH COUNT ACROSS ALL WORKERS ===
+        # Gather micro-batch counts from all workers and find the maximum
+        max_micro_batches = num_micro_batches
+        if dist.is_initialized() and world_size > 1:
+            # Create tensor to hold local count
+            count_tensor = torch.tensor([num_micro_batches], dtype=torch.int64, device=get_device_id())
+            # Gather counts from all workers
+            gathered_counts = [torch.tensor([0], dtype=torch.int64, device=get_device_id()) for _ in range(world_size)]
+            dist.all_gather(gathered_counts, count_tensor)
+            # Find maximum count
+            max_micro_batches = max([cnt.item() for cnt in gathered_counts])
+            print(f"[DEBUG] Rank {rank}: local={num_micro_batches}, max={max_micro_batches} micro-batches across {world_size} workers")
 
         log_probs_lst = []
         entropy_lst = []
-        for i, micro_batch in enumerate(micro_batches):
-            print(f"[DEBUG] Rank {rank}: Processing micro_batch {i}/{len(micro_batches)} at {time.time()}")
+        # Process both real and dummy micro-batches up to max_micro_batches
+        for i in range(max_micro_batches):
+            is_dummy = i >= num_micro_batches
+
+            if is_dummy:
+                # === DUMMY MICRO-BATCH: ONLY FOR SYNCHRONIZATION ===
+                # Need to run a minimal forward pass to keep FSDP in sync
+                # but don't add results to the output lists
+                print(f"[DEBUG] Rank {rank}: Processing micro_batch {i}/{max_micro_batches} (dummy) at {time.time()}")
+                # Use the first batch as dummy data if available
+                if num_micro_batches > 0:
+                    dummy_batch = micro_batches[0]
+                    dummy_batch = dummy_batch.to(get_device_id())
+                    model_inputs = {**dummy_batch.batch, **dummy_batch.non_tensor_batch}
+                    with torch.no_grad():
+                        # Run forward but discard results
+                        self._forward_micro_batch(
+                            model_inputs, temperature=temperature, calculate_entropy=False
+                        )
+                continue
+
+            # === REAL MICRO-BATCH ===
+            micro_batch = micro_batches[i]
+            print(f"[DEBUG] Rank {rank}: Processing micro_batch {i}/{max_micro_batches} at {time.time()}")
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             print(f"[DEBUG] Rank {rank}: micro_batch {i} moved to device, starting forward pass")
