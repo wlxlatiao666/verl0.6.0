@@ -635,6 +635,8 @@ class RayWorkerGroup(WorkerGroup):
         Returns:
             List of remote object references to the method executions
         """
+        import time
+        print(f"[DEBUG] execute_all_async: method {method_name} called at {time.time()}")
         # Here, we assume that if all arguments in args and kwargs are lists,
         # and their lengths match len(self._workers), we'll distribute each
         # element in these lists to the corresponding worker

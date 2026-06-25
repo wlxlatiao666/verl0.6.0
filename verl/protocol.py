@@ -22,6 +22,7 @@ import logging
 import math
 import os
 import pickle
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -906,7 +907,7 @@ class DataProto:
         import torch.distributed as dist
         rank = dist.get_rank() if dist.is_initialized() else 0
         if rank == 0:
-            print(f"[DEBUG] DataProto.chunk: chunks={chunks}, len(self)={len(self)}")
+            print(f"[DEBUG] DataProto.chunk: chunks={chunks}, len(self)={len(self)}, started at {time.time()}")
 
         # Check if we have worker_leaves_offsets (from concat with local_workers=True)
         worker_leaves_offsets = self.non_tensor_batch.get("worker_leaves_offsets")
@@ -1101,6 +1102,8 @@ class DataProto:
                 chunk_leaves = len(output[i])
                 print(f"[DEBUG] DataProto.chunk: chunk {i} has {chunk_leaves} leaves, {chunk_segs} segments")
 
+        if rank == 0:
+            print(f"[DEBUG] DataProto.chunk: finished at {time.time()}")
         return output
 
     def split(self, split_size: int) -> list["DataProto"]:

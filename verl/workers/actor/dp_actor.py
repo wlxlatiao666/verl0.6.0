@@ -98,6 +98,10 @@ class DataParallelPPOActor(BasePPOActor):
             entropy: # (bs, response_len)
             log_probs: # (bs, response_len)
         """
+        import time
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
         if "multi_modal_inputs" in micro_batch.keys():
@@ -105,11 +109,14 @@ class DataParallelPPOActor(BasePPOActor):
 
             multi_modal_inputs = extract_multi_modal_inputs(micro_batch["multi_modal_inputs"])
 
+        print(f"[DEBUG] Rank {rank}: _forward_micro_batch starting at {time.time()}")
+
         with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
             input_ids = micro_batch["input_ids"]
             batch_size, seqlen = input_ids.shape
             attention_mask = micro_batch["attention_mask"]
             position_ids = micro_batch["position_ids"]
+            print(f"[DEBUG] Rank {rank}: batch_size={batch_size}, seqlen={seqlen}")
             entropy = None
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
@@ -174,6 +181,7 @@ class DataParallelPPOActor(BasePPOActor):
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
 
+                print(f"[DEBUG] Rank {rank}: starting actor_module forward pass at {time.time()}")
                 output = self.actor_module(
                     input_ids=input_ids_rmpad,
                     attention_mask=None,
@@ -182,6 +190,7 @@ class DataParallelPPOActor(BasePPOActor):
                     use_cache=False,
                     **extra_args,
                 )  # prevent model thinks we are generating
+                print(f"[DEBUG] Rank {rank}: finished actor_module forward pass at {time.time()}")
 
                 if self.use_fused_kernels:
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
@@ -247,6 +256,7 @@ class DataParallelPPOActor(BasePPOActor):
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
 
             else:  # not using rmpad and no ulysses sp
+                print(f"[DEBUG] Rank {rank}: use_remove_padding=False, starting forward pass at {time.time()}")
                 extra_args = {}
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
@@ -260,6 +270,7 @@ class DataParallelPPOActor(BasePPOActor):
                     use_cache=False,
                     **extra_args,
                 )  # prevent model thinks we are generating
+                print(f"[DEBUG] Rank {rank}: use_remove_padding=False, forward pass done at {time.time()}")
 
                 if self.use_fused_kernels:
                     log_probs = output.log_probs[:, -response_length - 1 : -1]
@@ -277,6 +288,7 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
 
+            print(f"[DEBUG] Rank {rank}: _forward_micro_batch returning at {time.time()}")
             return entropy, log_probs
 
     def _optimizer_step(self):
@@ -319,6 +331,13 @@ class DataParallelPPOActor(BasePPOActor):
         Returns:
             torch.Tensor: the log_prob tensor
         """
+        import time
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+
+        print(f"[DEBUG] Rank {rank}/{world_size}: compute_log_prob started at {time.time()}")
+
         # set to eval
         self.actor_module.eval()
 
@@ -329,26 +348,37 @@ class DataParallelPPOActor(BasePPOActor):
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
+        print(f"[DEBUG] Rank {rank}: before data.select(), len(data)={len(data)}")
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
+        print(f"[DEBUG] Rank {rank}: after data.select()")
 
         if use_dynamic_bsz:
             max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
+            print(f"[DEBUG] Rank {rank}: use_dynamic_bsz=True, max_token_len={max_token_len}")
             micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
         else:
+            print(f"[DEBUG] Rank {rank}: use_dynamic_bsz=False, micro_batch_size={micro_batch_size}")
             micro_batches = data.split(micro_batch_size)
+
+        print(f"[DEBUG] Rank {rank}: Number of micro_batches: {len(micro_batches)}")
 
         log_probs_lst = []
         entropy_lst = []
-        for micro_batch in micro_batches:
+        for i, micro_batch in enumerate(micro_batches):
+            print(f"[DEBUG] Rank {rank}: Processing micro_batch {i}/{len(micro_batches)} at {time.time()}")
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+            print(f"[DEBUG] Rank {rank}: micro_batch {i} moved to device, starting forward pass")
             with torch.no_grad():
                 entropy, log_probs = self._forward_micro_batch(
                     model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                 )
+            print(f"[DEBUG] Rank {rank}: micro_batch {i} forward pass done at {time.time()}")
             log_probs_lst.append(log_probs)
             if calculate_entropy:
                 entropy_lst.append(entropy)
+
+        print(f"[DEBUG] Rank {rank}: All micro_batches done, starting concat at {time.time()}")
 
         log_probs = torch.concat(log_probs_lst, dim=0)
         entropys = None
@@ -359,6 +389,8 @@ class DataParallelPPOActor(BasePPOActor):
             log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
             if calculate_entropy:
                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
+
+        print(f"[DEBUG] Rank {rank}/{world_size}: compute_log_prob finished at {time.time()}")
 
         return log_probs, entropys
 

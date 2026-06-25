@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import inspect
+import time
 from functools import partial, wraps
 from types import FunctionType
 
@@ -270,6 +271,8 @@ def collect_nd_compute_dataproto(collect_mask: list[bool], worker_group, output)
 
 
 def dispatch_lazy_compute_data_proto(mesh_name, worker_group, *args, **kwargs):
+    print(f"[DEBUG] dispatch_lazy_compute_data_proto: mesh_name={mesh_name} started at {time.time()}")
+
     from verl.single_controller.base.worker_group import WorkerGroup
 
     assert isinstance(worker_group, WorkerGroup)
@@ -282,10 +285,14 @@ def dispatch_lazy_compute_data_proto(mesh_name, worker_group, *args, **kwargs):
     dp_rank_mapping = worker_group._dispatch_info[mesh_name]
     # perform dispatch
     dp_size = max(dp_rank_mapping) + 1
-    return dispatch_nd_compute_dataproto(dp_rank_mapping, dp_size, worker_group, *args, **kwargs)
+    result = dispatch_nd_compute_dataproto(dp_rank_mapping, dp_size, worker_group, *args, **kwargs)
+    print(f"[DEBUG] dispatch_lazy_compute_data_proto: finished at {time.time()}")
+    return result
 
 
 def collect_lazy_compute_data_proto(mesh_name, worker_group, *args, **kwargs):
+    print(f"[DEBUG] collect_lazy_compute_data_proto: mesh_name={mesh_name} started at {time.time()}")
+
     from verl.single_controller.base.worker_group import WorkerGroup
 
     assert isinstance(worker_group, WorkerGroup)
@@ -300,7 +307,9 @@ def collect_lazy_compute_data_proto(mesh_name, worker_group, *args, **kwargs):
     # a boolean of whether the dp_rank is used for collect
     collect_mask = worker_group._collect_info[mesh_name]
     # perform dispatch
-    return collect_nd_compute_dataproto(collect_mask, worker_group, *args, **kwargs)
+    result = collect_nd_compute_dataproto(collect_mask, worker_group, *args, **kwargs)
+    print(f"[DEBUG] collect_lazy_compute_data_proto: finished at {time.time()}")
+    return result
 
 
 def make_nd_compute_dataproto_dispatch_fn(mesh_name):
