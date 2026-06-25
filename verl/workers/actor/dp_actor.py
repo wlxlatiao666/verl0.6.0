@@ -338,6 +338,12 @@ class DataParallelPPOActor(BasePPOActor):
 
         print(f"[DEBUG] Rank {rank}/{world_size}: compute_log_prob started at {time.time()}")
 
+        # Barrier 1: 确保所有rank同时开始
+        if dist.is_initialized():
+            print(f"[DEBUG] Rank {rank}/{world_size}: compute_log_prob waiting at start barrier")
+            dist.barrier()
+            print(f"[DEBUG] Rank {rank}/{world_size}: compute_log_prob passed start barrier")
+
         # set to eval
         self.actor_module.eval()
 
@@ -391,13 +397,30 @@ class DataParallelPPOActor(BasePPOActor):
                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
 
         print(f"[DEBUG] Rank {rank}/{world_size}: compute_log_prob finished at {time.time()}")
+        # Barrier 2: 确保所有rank同时结束
+        if dist.is_initialized():
+            print(f"[DEBUG] Rank {rank}/{world_size}: compute_log_prob waiting at end barrier")
+            dist.barrier()
+            print(f"[DEBUG] Rank {rank}/{world_size}: compute_log_prob passed end barrier")
+
 
         return log_probs, entropys
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
+        import time
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        print(f"[DEBUG] Rank {rank}/{world_size}: update_policy started at {time.time()}")
+        # Barrier 1: 确保所有rank同时开始
+        if dist.is_initialized():
+            print(f"[DEBUG] Rank {rank}/{world_size}: update_policy waiting at start barrier")
+            dist.barrier()
+            print(f"[DEBUG] Rank {rank}/{world_size}: update_policy passed start barrier")
         # make sure we are in training mode
         self.actor_module.train()
+
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
 
@@ -957,4 +980,10 @@ class DataParallelPPOActor(BasePPOActor):
                     append_to_dict(metrics, mini_batch_metrics)
 
         self.actor_optimizer.zero_grad()
+        # Barrier 2: 确保所有rank同时结束
+        if dist.is_initialized():
+            print(f"[DEBUG] Rank {rank}/{world_size}: update_policy waiting at end barrier")
+            dist.barrier()
+            print(f"[DEBUG] Rank {rank}/{world_size}: update_policy passed end barrier")
+
         return metrics
