@@ -652,7 +652,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                     if is_dummy:
                         # === DUMMY MICRO-BATCH: NO GRADIENT UPDATE ===
-                        # Run forward pass under torch.no_grad() to avoid gradient computation
+                        # Run full forward/backward with dummy data and 0 loss scale
                         # This ensures FSDP communication patterns match across all workers
                         print(f"[DEBUG] [tree_segment] Worker {rank}: micro-batch {m} (dummy, no gradient update)")
                         if num_micro_batches > 0 and local_batch_size > 0:
@@ -663,13 +663,74 @@ class DataParallelPPOActor(BasePPOActor):
                             mini_batch = data[first_required_leaves]
                             mini_batch = mini_batch.to(get_device_id())
                             model_inputs = {**mini_batch.batch, **mini_batch.non_tensor_batch}
+                            entropy_coeff = self.config.entropy_coeff
+                            # Use 0 loss scale to prevent actual gradient update
+                            loss_scale_factor = 0.0
 
-                            # Run forward pass under torch.no_grad() - no gradients computed
-                            with torch.no_grad():
-                                calculate_entropy = self.config.entropy_coeff != 0
-                                entropy, log_prob = self._forward_micro_batch(
-                                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                            # Run normal forward pass
+                            calculate_entropy = entropy_coeff != 0
+                            entropy, log_prob = self._forward_micro_batch(
+                                model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                            )
+
+                            # Build dummy tensors for loss computation (just to keep same code path)
+                            max_seg_len = local_tree_seg_targets["old_log_prob"].shape[1]
+                            dummy_seg_indices = first_seg_indices
+                            # Build leaf inverse map
+                            leaf_inverse_map = {global_idx: local_idx for local_idx, global_idx in enumerate(first_required_leaves)}
+                            seg_log_prob_local = torch.zeros(len(dummy_seg_indices), max_seg_len, device=log_prob.device, dtype=log_prob.dtype)
+
+                            seg_lens = local_tree_seg_targets["seg_lens"]
+                            for local_i, seg_idx in enumerate(dummy_seg_indices):
+                                leaf_j, tok_offset = first_seg_canonical[seg_idx]
+                                local_leaf_j = leaf_inverse_map[leaf_j]
+                                seg_len = seg_lens[seg_idx]
+                                end_tok = min(tok_offset + seg_len, log_prob.shape[1])
+                                actual_len = end_tok - tok_offset
+                                seg_log_prob_local[local_i, :actual_len] = log_prob[local_leaf_j, tok_offset:end_tok]
+
+                            # Compute dummy loss - use real response_mask from first batch to avoid nan
+                            seg_old_log_prob_local = seg_log_prob_local.detach()
+                            seg_advantages_local = torch.zeros_like(seg_old_log_prob_local)
+                            # Use the actual response_mask from model_inputs instead of all zeros
+                            # This avoids division by zero in agg_loss while still being a dummy
+                            seg_response_mask_local = torch.zeros_like(seg_old_log_prob_local)
+                            # Set at least one token mask to 1 for each sequence to avoid division by zero
+                            if seg_response_mask_local.size(0) > 0 and seg_response_mask_local.size(1) > 0:
+                                seg_response_mask_local[:, 0] = 1.0
+
+                            policy_loss_fn = get_policy_loss_fn(loss_mode)
+                            pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                                old_log_prob=seg_old_log_prob_local,
+                                log_prob=seg_log_prob_local,
+                                advantages=seg_advantages_local,
+                                response_mask=seg_response_mask_local,
+                                loss_agg_mode=loss_agg_mode,
+                                config=self.config,
+                                rollout_is_weights=None,
+                            )
+
+                            # Entropy loss
+                            if entropy_coeff != 0:
+                                response_mask = model_inputs["response_mask"]
+                                entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                                policy_loss = pg_loss - entropy_loss * entropy_coeff
+                            else:
+                                policy_loss = pg_loss
+
+                            # KL loss
+                            if self.config.use_kl_loss:
+                                ref_log_prob = model_inputs["ref_log_prob"]
+                                response_mask = model_inputs["response_mask"]
+                                kld = kl_penalty(
+                                    logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
                                 )
+                                kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                                policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+
+                            # Backward pass with 0 loss scale - no actual gradient update
+                            loss = policy_loss * loss_scale_factor
+                            loss.backward()
                         # Add dummy metrics
                         micro_batch_metrics = {
                             "actor/pg_loss": 0.0,
