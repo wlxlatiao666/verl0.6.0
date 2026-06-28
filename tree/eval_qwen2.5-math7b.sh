@@ -62,9 +62,9 @@ VAL_FILES="['${MATH500_FILE}','${AMC_FILE}','${OLYMPIAD_FILE}']"
 
 # Default checkpoint root matches verl's default:
 #   checkpoints/<project_name>/<experiment_name>/global_step_N/actor/...
-PROJECT_NAME=${PROJECT_NAME:-"verl_grpo_tree_sr"}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-"qwen2.5_math7b_treerollout"}
-CHECKPOINT_DIR=${CHECKPOINT_DIR:-"/inspire/hdd/global_user/weilongxuan-253108120168/verl_data/checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}"}
+PROJECT_NAME=${PROJECT_NAME:-"verl_grpo_tree_latest"}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-"qwen2.5_math7b_treesr_260626"}
+CHECKPOINT_DIR=${CHECKPOINT_DIR:-"/inspire/qb-ilm2/project/neosmosis/weilongxuan-253108120168/verl_data/checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}"}
 
 # Build the list of global_step_* directories to evaluate.
 declare -a CKPT_PATHS
