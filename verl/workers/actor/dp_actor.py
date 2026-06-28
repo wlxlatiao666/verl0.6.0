@@ -683,20 +683,25 @@ class DataParallelPPOActor(BasePPOActor):
                             )
 
                             # Build dummy tensors for loss computation (just to keep same code path)
+                            # NOTE: Use torch.stack + F.pad to preserve gradient flow.
                             max_seg_len = local_tree_seg_targets["old_log_prob"].shape[1]
                             dummy_seg_indices = first_seg_indices
                             # Build leaf inverse map
                             leaf_inverse_map = {global_idx: local_idx for local_idx, global_idx in enumerate(first_required_leaves)}
-                            seg_log_prob_local = torch.zeros(len(dummy_seg_indices), max_seg_len, device=log_prob.device, dtype=log_prob.dtype)
-
                             seg_lens = local_tree_seg_targets["seg_lens"]
-                            for local_i, seg_idx in enumerate(dummy_seg_indices):
+                            log_prob_pieces = []
+                            for seg_idx in dummy_seg_indices:
                                 leaf_j, tok_offset = first_seg_canonical[seg_idx]
                                 local_leaf_j = leaf_inverse_map[leaf_j]
                                 seg_len = seg_lens[seg_idx]
                                 end_tok = min(tok_offset + seg_len, log_prob.shape[1])
-                                actual_len = end_tok - tok_offset
-                                seg_log_prob_local[local_i, :actual_len] = log_prob[local_leaf_j, tok_offset:end_tok]
+                                piece = log_prob[local_leaf_j, tok_offset:end_tok]
+                                if piece.shape[0] < max_seg_len:
+                                    piece = torch.nn.functional.pad(piece, (0, max_seg_len - piece.shape[0]))
+                                log_prob_pieces.append(piece)
+                            seg_log_prob_local = torch.stack(log_prob_pieces) if log_prob_pieces else torch.zeros(
+                                len(dummy_seg_indices), max_seg_len, device=log_prob.device, dtype=log_prob.dtype
+                            )
 
                             # Compute dummy loss - use real response_mask from first batch to avoid nan
                             seg_old_log_prob_local = seg_log_prob_local.detach()
@@ -791,17 +796,23 @@ class DataParallelPPOActor(BasePPOActor):
                     leaf_inverse_map = {global_idx: local_idx for local_idx, global_idx in enumerate(required_leaves)}
 
                     # Build segment log_probs
+                    # NOTE: Use torch.stack + F.pad instead of torch.zeros + in-place indexing
+                    # to preserve gradient flow from log_prob back to model parameters.
                     max_seg_len = local_tree_seg_targets["old_log_prob"].shape[1]
-                    seg_log_prob_local = torch.zeros(len(seg_indices), max_seg_len, device=log_prob.device, dtype=log_prob.dtype)
-
                     seg_lens = local_tree_seg_targets["seg_lens"]
-                    for local_i, seg_idx in enumerate(seg_indices):
+                    log_prob_pieces = []
+                    for seg_idx in seg_indices:
                         leaf_j, tok_offset = seg_canonical[seg_idx]
                         local_leaf_j = leaf_inverse_map[leaf_j]
                         seg_len = seg_lens[seg_idx]
                         end_tok = min(tok_offset + seg_len, log_prob.shape[1])
-                        actual_len = end_tok - tok_offset
-                        seg_log_prob_local[local_i, :actual_len] = log_prob[local_leaf_j, tok_offset:end_tok]
+                        piece = log_prob[local_leaf_j, tok_offset:end_tok]
+                        if piece.shape[0] < max_seg_len:
+                            piece = torch.nn.functional.pad(piece, (0, max_seg_len - piece.shape[0]))
+                        log_prob_pieces.append(piece)
+                    seg_log_prob_local = torch.stack(log_prob_pieces) if log_prob_pieces else torch.zeros(
+                        len(seg_indices), max_seg_len, device=log_prob.device, dtype=log_prob.dtype
+                    )
 
                     # Get other segment tensors
                     if on_policy:
@@ -1028,16 +1039,21 @@ class DataParallelPPOActor(BasePPOActor):
 
                                     # Use the pre-computed local max_seg_len so shapes align with
                                     # tree_seg_targets tensors (old_log_prob / advantages / mask).
+                                    # NOTE: Use torch.stack + F.pad to preserve gradient flow.
                                     max_seg_len = tree_seg_targets["old_log_prob"].shape[1]
-                                    seg_log_prob_local = torch.zeros(len(seg_indices), max_seg_len, device=log_prob.device, dtype=log_prob.dtype)
-
-                                    for local_i, seg_idx in enumerate(seg_indices):
+                                    log_prob_pieces = []
+                                    for seg_idx in seg_indices:
                                         leaf_j, tok_offset = seg_canonical[seg_idx]
                                         local_leaf_j = leaf_inverse_map[leaf_j]
                                         seg_len = seg_lens[seg_idx]
                                         end_tok = min(tok_offset + seg_len, log_prob.shape[1])
-                                        actual_len = end_tok - tok_offset
-                                        seg_log_prob_local[local_i, :actual_len] = log_prob[local_leaf_j, tok_offset:end_tok]
+                                        piece = log_prob[local_leaf_j, tok_offset:end_tok]
+                                        if piece.shape[0] < max_seg_len:
+                                            piece = torch.nn.functional.pad(piece, (0, max_seg_len - piece.shape[0]))
+                                        log_prob_pieces.append(piece)
+                                    seg_log_prob_local = torch.stack(log_prob_pieces) if log_prob_pieces else torch.zeros(
+                                        len(seg_indices), max_seg_len, device=log_prob.device, dtype=log_prob.dtype
+                                    )
 
                                     if on_policy:
                                         seg_old_log_prob_local = seg_log_prob_local.detach()
