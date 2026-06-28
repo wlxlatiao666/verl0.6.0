@@ -633,7 +633,11 @@ class DataParallelPPOActor(BasePPOActor):
                     for i in range(0, len(segment_indices), ppo_micro_batch_segments)
                 ]
                 num_micro_batches = len(segment_micro_batches)
-                print(f"[DEBUG] [tree_segment] Worker {rank}: split into {num_micro_batches} micro-batches")
+                # CRITICAL FIX: gradient accumulation must match actual number of segment micro-batches,
+                # not the leaf-based estimate. Otherwise loss_scale_factor is wrong and grad_norm explodes.
+                self.gradient_accumulation = num_micro_batches
+                print(f"[DEBUG] [tree_segment] Worker {rank}: split into {num_micro_batches} micro-batches, "
+                      f"gradient_accumulation corrected to {self.gradient_accumulation}")
 
                 # === ALIGN MICRO-BATCH COUNT ACROSS ALL WORKERS ===
                 # Gather micro-batch counts from all workers and find the maximum
