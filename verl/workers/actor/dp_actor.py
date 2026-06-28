@@ -23,6 +23,7 @@ import random
 
 import numpy as np
 import torch
+import math
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.tensor import DTensor
@@ -611,7 +612,11 @@ class DataParallelPPOActor(BasePPOActor):
             else:
                 self.gradient_accumulation = 1
 
-            print(f"[DEBUG] [tree_segment] Worker {rank}: ppo_micro_batch_segments={ppo_micro_batch_segments}, gradient_accumulation={self.gradient_accumulation}")
+            # Estimate actual number of micro-batches for validation
+            est_micro_batches = max(1, math.ceil(num_assigned_segments / ppo_micro_batch_segments))
+            print(f"[DEBUG] [tree_segment] Worker {rank}: ppo_micro_batch_segments={ppo_micro_batch_segments}, "
+                  f"gradient_accumulation={self.gradient_accumulation}, est_micro_batches={est_micro_batches}, "
+                  f"MATCH={self.gradient_accumulation == est_micro_batches}")
 
             on_policy = num_assigned_segments <= ppo_micro_batch_segments and self.config.ppo_epochs == 1
 
@@ -767,6 +772,9 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
                     loss_scale_factor = 1 / self.gradient_accumulation
+                    if m == 0:
+                        print(f"[DEBUG] [tree_segment] Worker {rank}: micro-batch {m}, loss_scale_factor={loss_scale_factor:.6f} "
+                              f"(gradient_accumulation={self.gradient_accumulation})")
 
                     calculate_entropy = entropy_coeff != 0
                     entropy, log_prob = self._forward_micro_batch(
@@ -895,6 +903,11 @@ class DataParallelPPOActor(BasePPOActor):
                         )
                         micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
                         batch_idx_list = None
+                        print(f"[DEBUG] [leaf] Worker {rank}: mini_batch_size={self.config.ppo_mini_batch_size}, "
+                              f"micro_batch_size_per_gpu={self.config.ppo_micro_batch_size_per_gpu}, "
+                              f"gradient_accumulation={self.gradient_accumulation}, "
+                              f"actual_micro_batches={len(micro_batches)}, "
+                              f"MATCH={self.gradient_accumulation == len(micro_batches)}")
 
                     # Use pre-computed LOCAL segment targets, don't rebuild at mini_batch level
                     if loss_mode == "tree_segment" and local_tree_seg_targets is not None:
@@ -917,6 +930,10 @@ class DataParallelPPOActor(BasePPOActor):
                             loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
                         else:
                             loss_scale_factor = 1 / self.gradient_accumulation
+
+                        if m == 0:
+                            print(f"[DEBUG] [leaf] Worker {rank}: micro-batch {m}, loss_scale_factor={loss_scale_factor:.6f} "
+                                  f"(dynamic_bsz={self.config.use_dynamic_bsz})")
 
                         # all return: (bsz, response_length)
                         calculate_entropy = False
