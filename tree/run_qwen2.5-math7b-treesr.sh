@@ -12,7 +12,7 @@ export NCCL_DEBUG=INFO
 HOME=/inspire/hdd/global_user/weilongxuan-253108120168
 verl_dir=/inspire/qb-ilm2/project/neosmosis/weilongxuan-253108120168/verl_data
 project_name=verl_grpo_tree_latest
-experiment_name=qwen2.5_math7b_treesr_260630
+experiment_name=qwen2.5_math7b_treesr_260704
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl0.6.0"}
 
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
@@ -69,7 +69,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.clip_ratio_low=0.2 \
     actor_rollout_ref.actor.clip_ratio_high=0.28 \
     actor_rollout_ref.model.path=/inspire/hdd/global_public/public_models/Qwen/Qwen2.5-Math-7B \
-    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.optim.lr=5e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=16 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
