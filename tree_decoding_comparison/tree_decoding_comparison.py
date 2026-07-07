@@ -854,9 +854,13 @@ def run_experiment(args):
 
     if args.auto_calibrate_thresholds:
         print(f"\n2.5. Auto-calibrating thresholds (using {args.calibration_quantile*100}th percentile)...")
+        # Only use first 10 prompts for calibration to avoid hanging
+        calibration_prompts = prompts[:10]
+        print(f"  Using {len(calibration_prompts)} prompts for calibration")
+        sys.stdout.flush()
         entropy_threshold, tau_importance = collect_threshold_stats(
             llm=llm,
-            prompts=prompts,
+            prompts=calibration_prompts,
             n=args.calibration_n,
             temperature=args.temperature,
             top_p=args.top_p,
