@@ -128,3 +128,5 @@ outputs
 .history
 core.*
 events.*
+tree_decoding_comparison/logs/
+tree_decoding_comparison/tree_decoding_results/
