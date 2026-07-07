@@ -77,9 +77,108 @@ def load_dapo_math_dataset(dataset_path: str) -> pd.DataFrame:
     return df
 
 
+def extract_unique_queries_streaming(dataset_path: str, num_samples: int = 500) -> List[MathExample]:
+    """
+    Extract unique queries from dataset using streaming, stop when enough samples are collected.
+
+    Args:
+        dataset_path: Path to dapo-math-17k.parquet
+        num_samples: Number of unique samples to extract
+
+    Returns:
+        List of MathExample objects
+    """
+    import pyarrow.parquet as pq
+
+    print(f"Starting streaming read from: {dataset_path}")
+    print(f"Target: collect {num_samples} unique samples")
+
+    seen_prompts = set()
+    examples = []
+    rows_processed = 0
+    batches_processed = 0
+
+    # Open the parquet file for streaming
+    parquet_file = pq.ParquetFile(dataset_path)
+    print(f"Total number of row groups: {parquet_file.num_row_groups}")
+    print(f"Total number of rows: {parquet_file.metadata.num_rows}")
+
+    for batch_idx in range(parquet_file.num_row_groups):
+        batches_processed += 1
+        if batches_processed % 10 == 0:
+            print(f"  Read {batches_processed}/{parquet_file.num_row_groups} batches, "
+                  f"{rows_processed} rows, {len(examples)}/{num_samples} unique samples")
+
+        # Read one row group
+        table = parquet_file.read_row_group(batch_idx)
+        df = table.to_pandas()
+        rows_processed += len(df)
+
+        # Process each row in the batch
+        for _, row in df.iterrows():
+            if len(examples) >= num_samples:
+                break
+
+            # Determine which column to use for deduplication
+            prompt_key = None
+            prompt_text = None
+            ground_truth = None
+            problem = None
+
+            if 'prompt' in df.columns and 'reward_model' in df.columns:
+                # Format from verl's preprocessed data
+                prompt = row['prompt']
+                if isinstance(prompt, list) and len(prompt) > 0:
+                    prompt_text = prompt[0].get('content', '')
+                else:
+                    prompt_text = str(prompt)
+                ground_truth = row.get('reward_model', {}).get('ground_truth', '')
+                problem = prompt_text
+                prompt_key = prompt_text
+
+            elif 'problem' in df.columns and 'solution' in df.columns:
+                # Original MATH dataset format
+                problem = row['problem']
+                solution = row['solution']
+                ground_truth = extract_answer_from_solution(solution)
+                # Add instruction following prompt
+                prompt_text = problem + " Let's think step by step and output the final answer within \\boxed{}."
+                prompt_key = problem
+
+            else:
+                # Try to infer from columns
+                problem = str(row.iloc[0])
+                prompt_text = problem
+                ground_truth = str(row.iloc[1]) if len(row) > 1 else ''
+                prompt_key = problem
+
+            # Skip if we've seen this prompt before
+            if prompt_key in seen_prompts:
+                continue
+
+            # Add to collection
+            seen_prompts.add(prompt_key)
+            examples.append(MathExample(
+                problem=problem,
+                ground_truth=ground_truth,
+                prompt=prompt_text,
+                idx=len(examples)
+            ))
+
+        if len(examples) >= num_samples:
+            print(f"  ✓ Collected enough samples, stopping early!")
+            break
+
+    print(f"\nDone! Processed {rows_processed} rows from {batches_processed} batches")
+    print(f"Extracted {len(examples)} unique examples")
+
+    return examples
+
+
 def extract_unique_queries(df: pd.DataFrame, num_samples: int = 500) -> List[MathExample]:
     """
-    Extract unique queries from dataset.
+    Extract unique queries from dataset (in-memory version).
+    Kept for backward compatibility, prefer extract_unique_queries_streaming.
 
     Args:
         df: Input dataframe
@@ -697,9 +796,6 @@ def run_experiment(args):
             f"Please set RAY_DATA_HOME environment variable or provide correct path."
         )
 
-    print(f"\n1. Loading dataset from: {dataset_path}")
-    df = load_dapo_math_dataset(dataset_path)
-
     if args.quick_test:
         print("\n" + "="*80)
         print("QUICK TEST MODE ENABLED - Using only 5 samples, 256 max tokens")
@@ -707,8 +803,9 @@ def run_experiment(args):
         args.num_samples = min(args.num_samples, 5)
         args.max_tokens = 256
 
-    print(f"\n2. Extracting {args.num_samples} unique queries...")
-    examples = extract_unique_queries(df, num_samples=args.num_samples)
+    print(f"\n1. Extracting {args.num_samples} unique queries from: {dataset_path}")
+    print("   Using streaming mode - will stop when enough samples are collected")
+    examples = extract_unique_queries_streaming(dataset_path, num_samples=args.num_samples)
 
     # Save examples for reference
     output_dir = Path(args.output_dir)
@@ -725,7 +822,7 @@ def run_experiment(args):
     print(f"   Saved sampled examples to: {examples_file}")
 
     # Initialize LLM
-    print(f"\n3. Initializing vLLM with model: {args.model_path}")
+    print(f"\n2. Initializing vLLM with model: {args.model_path}")
     print("   This may take 5-15 minutes depending on model size...")
     print("   - You should see GPU memory being used via nvidia-smi")
     print("   - If you don't see progress for >20 minutes, something is wrong")
@@ -756,7 +853,7 @@ def run_experiment(args):
     tau_importance = args.tau_importance
 
     if args.auto_calibrate_thresholds:
-        print(f"\n3.5. Auto-calibrating thresholds (using {args.calibration_quantile*100}th percentile)...")
+        print(f"\n2.5. Auto-calibrating thresholds (using {args.calibration_quantile*100}th percentile)...")
         entropy_threshold, tau_importance = collect_threshold_stats(
             llm=llm,
             prompts=prompts,
@@ -772,7 +869,7 @@ def run_experiment(args):
         print(f"  tau_importance:    {tau_importance:.4f}")
 
     # Run Base GRPO sampling
-    print(f"\n4. Generating with Base GRPO (n={args.n})...")
+    print(f"\n3. Generating with Base GRPO (n={args.n})...")
     start_time = time.time()
     base_generations = generate_base_grpo(
         llm=llm,
@@ -787,7 +884,7 @@ def run_experiment(args):
     print(f"   Base GRPO time: {base_time:.2f}s")
 
     # Evaluate Base GRPO
-    print("\n5. Evaluating Base GRPO generations...")
+    print("\n4. Evaluating Base GRPO generations...")
     base_results = []
     for gens, gt in zip(base_generations, ground_truths):
         results = evaluate_generations(gens, gt)
@@ -799,7 +896,7 @@ def run_experiment(args):
         print(f"     {k}: {v:.4f}")
 
     # Run Tree Decoding
-    print(f"\n6. Generating with Tree Decoding (branching_factor={args.branching_factor}, "
+    print(f"\n5. Generating with Tree Decoding (branching_factor={args.branching_factor}, "
           f"max_depth={args.max_tree_depth}, entropy_threshold={entropy_threshold:.4f}, "
           f"tau_importance={tau_importance:.4f})...")
     start_time = time.time()
@@ -820,7 +917,7 @@ def run_experiment(args):
     print(f"   Tree Decoding time: {tree_time:.2f}s")
 
     # Evaluate Tree Decoding
-    print("\n7. Evaluating Tree Decoding generations...")
+    print("\n6. Evaluating Tree Decoding generations...")
     tree_results = []
     for gens, gt in zip(tree_generations, ground_truths):
         results = evaluate_generations(gens, gt)
@@ -851,7 +948,7 @@ def run_experiment(args):
     }
     with open(generations_file, 'w') as f:
         json.dump(generations_data, f, indent=2)
-    print(f"\n8. Saved generations to: {generations_file}")
+    print(f"\n7. Saved generations to: {generations_file}")
 
     # Print comparison summary
     print("\n" + "=" * 80)
