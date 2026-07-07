@@ -579,13 +579,12 @@ class DataParallelPPOActor(BasePPOActor):
         on_policy = False
         metrics = {}
 
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
         if use_segment_batching:
             # === SEGMENT-BASED BATCHING STRATEGY - LOCAL WORKER ONLY ===
             ppo_micro_batch_segments = getattr(self.config, "ppo_micro_batch_segments", None)
             total_segments = len(local_tree_seg_targets["seg_lens"])
-
-            rank = dist.get_rank() if dist.is_initialized() else 0
-            world_size = dist.get_world_size() if dist.is_initialized() else 1
 
             print(f"[DEBUG] [tree_segment] Worker {rank}/{world_size}: start update_policy with segment batching")
             print(f"[DEBUG] [tree_segment] Worker {rank}: local_batch_size={local_batch_size} leaves, total_segments={total_segments} segments")
@@ -1000,9 +999,6 @@ class DataParallelPPOActor(BasePPOActor):
                                     # Select segments whose canonical leaf is in this micro-batch
                                     seg_indices = [i for i, (leaf_j, _) in enumerate(seg_canonical) if leaf_j in present_leaves]
                                 else:
-                                    rank = dist.get_rank() if dist.is_initialized() else 0
-                                    world_size = dist.get_world_size() if dist.is_initialized() else 1
-
                                     # Determine which leaves are present in this micro-batch (using LOCAL leaf indices)
                                     if self.config.use_dynamic_bsz:
                                         present_leaves = set(batch_idx_list[m])

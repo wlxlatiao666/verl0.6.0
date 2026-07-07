@@ -9,6 +9,7 @@
 #   ./run_comparison.sh --model-path /path/to/Qwen2.5-7B-Instruct
 #
 export VLLM_USE_V1=0
+MODEL_PATH=/inspire/hdd/global_public/public_models/Qwen/Qwen2.5-Math-7B
 HOME=/inspire/hdd/global_user/weilongxuan-253108120168
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl0.6.0"}
 # Set defaults
@@ -24,7 +25,7 @@ TOP_K=-1
 MAX_TOKENS=4096
 ENTROPY_THRESHOLD=1.0
 TAU_IMPORTANCE=0.0
-AUTO_CALIBRATE_THRESHOLDS=0
+AUTO_CALIBRATE_THRESHOLDS=1
 CALIBRATION_N=5
 CALIBRATION_MAX_TOKENS=200
 CALIBRATION_QUANTILE=0.8
