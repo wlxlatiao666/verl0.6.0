@@ -23,8 +23,11 @@ This script:
 5. Outputs comparison results
 """
 
-import argparse
+# Enable unbuffered output for better debugging
 import os
+os.environ['PYTHONUNBUFFERED'] = '1'
+
+import argparse
 import sys
 import json
 import time
@@ -697,6 +700,13 @@ def run_experiment(args):
     print(f"\n1. Loading dataset from: {dataset_path}")
     df = load_dapo_math_dataset(dataset_path)
 
+    if args.quick_test:
+        print("\n" + "="*80)
+        print("QUICK TEST MODE ENABLED - Using only 5 samples, 256 max tokens")
+        print("="*80)
+        args.num_samples = min(args.num_samples, 5)
+        args.max_tokens = 256
+
     print(f"\n2. Extracting {args.num_samples} unique queries...")
     examples = extract_unique_queries(df, num_samples=args.num_samples)
 
@@ -716,14 +726,27 @@ def run_experiment(args):
 
     # Initialize LLM
     print(f"\n3. Initializing vLLM with model: {args.model_path}")
-    llm = LLM(
-        model=args.model_path,
-        tensor_parallel_size=args.tensor_parallel_size,
-        dtype=args.dtype,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        enforce_eager=True,
-        max_model_len=args.max_model_len,
-    )
+    print("   This may take 5-15 minutes depending on model size...")
+    print("   - You should see GPU memory being used via nvidia-smi")
+    print("   - If you don't see progress for >20 minutes, something is wrong")
+    sys.stdout.flush()
+
+    try:
+        llm = LLM(
+            model=args.model_path,
+            tensor_parallel_size=args.tensor_parallel_size,
+            dtype=args.dtype,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            enforce_eager=True,
+            max_model_len=args.max_model_len,
+        )
+        print("   ✓ vLLM initialized successfully!")
+    except Exception as e:
+        print(f"\n✗ Failed to initialize vLLM: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    sys.stdout.flush()
 
     prompts = [ex.prompt for ex in examples]
     ground_truths = [ex.ground_truth for ex in examples]
@@ -914,6 +937,11 @@ def main():
         type=int,
         default=500,
         help="Number of unique queries to sample"
+    )
+    parser.add_argument(
+        "--quick-test",
+        action="store_true",
+        help="Run a quick test with only 5 samples and shorter generation"
     )
 
     # Model
