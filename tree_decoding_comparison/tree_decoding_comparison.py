@@ -741,7 +741,7 @@ def generate_tree_decoding(
         if all_filler_prompts:
             # Generate in batch (each with n=1)
             filler_sampling_params = SamplingParams(
-                temperature=temperature,  # Slightly higher temperature for diversity
+                temperature=temperature,
                 max_tokens=max_tokens,
                 n=1,
                 top_p=top_p,
@@ -900,6 +900,7 @@ def run_experiment(args):
         print(f"     {k}: {v:.4f}")
 
     # Run Tree Decoding
+    tau_importance=0
     print(f"\n5. Generating with Tree Decoding (branching_factor={args.branching_factor}, "
           f"max_depth={args.max_tree_depth}, entropy_threshold={entropy_threshold:.4f}, "
           f"tau_importance={tau_importance:.4f})...")
