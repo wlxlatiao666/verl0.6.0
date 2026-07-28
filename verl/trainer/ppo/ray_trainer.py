@@ -1403,10 +1403,13 @@ class RayPPOTrainer:
                     # but might affect the loss calculation (due to the change of mini-batching).
                     # TODO: Decouple the DP balancing and mini-batching.
                     if self.config.trainer.balance_batch:
-                        # Check if we have tree SR worker offsets - if yes, skip trimming and balancing
-                        # because we want to keep each worker's leaves together
-                        has_worker_offsets = "worker_leaves_offsets" in batch.non_tensor_batch
-                        if not has_worker_offsets:
+                        # Check if we need to keep worker offsets for tree_segment loss
+                        actor_loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
+                        keep_worker_offsets = (
+                            "worker_leaves_offsets" in batch.non_tensor_batch
+                            and actor_loss_mode == "tree_segment"
+                        )
+                        if not keep_worker_offsets:
                             # Tree search may produce a batch size not divisible by world_size.
                             # Trim excess samples so balanced partitioning works (drops at most world_size-1 samples).
                             world_size = self.actor_rollout_wg.world_size
@@ -1414,6 +1417,11 @@ class RayPPOTrainer:
                             remainder = bs % world_size
                             if remainder != 0:
                                 batch = batch[:bs - remainder]
+                                print(f"[DataSplitFix] Trimmed {remainder} samples to make batch size divisible by {world_size}")
+                            # Remove worker offsets if they exist (they cause unequal chunking)
+                            for key in ["worker_leaves_offsets", "worker_segments_offsets"]:
+                                if key in batch.non_tensor_batch:
+                                    del batch.non_tensor_batch[key]
                             self._balance_batch(batch, metrics=metrics)
 
                     # compute global_valid tokens
@@ -1566,23 +1574,6 @@ class RayPPOTrainer:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-
-                            # === CRITICAL FIX: Remove worker offsets before sending to actor ===
-                            # When loss_mode != "tree_segment", we use leaf-based batching which
-                            # requires equal chunking. worker_leaves_offsets and worker_segments_offsets
-                            # cause DataProto.chunk() to use unequal chunking (Case 1), leading to
-                            # different micro-batch counts across workers and FSDP communication mismatch.
-                            actor_loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
-                            if actor_loss_mode != "tree_segment":
-                                offset_keys_to_remove = ["worker_leaves_offsets", "worker_segments_offsets"]
-                                removed_offsets = False
-                                for key in offset_keys_to_remove:
-                                    if key in batch.non_tensor_batch:
-                                        del batch.non_tensor_batch[key]
-                                        removed_offsets = True
-                                if removed_offsets:
-                                    print(f"[DataSplitFix] Removed worker offsets before update_actor (loss_mode={actor_loss_mode}), will use equal chunking")
-
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
