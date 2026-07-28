@@ -1527,10 +1527,6 @@ class RayPPOTrainer:
                                 for key in tree_segment_large_keys:
                                     if key in batch.non_tensor_batch:
                                         batch.non_tensor_batch.pop(key)
-                                if "worker_segments_offsets" in batch.non_tensor_batch:
-                                    batch.non_tensor_batch.pop("worker_segments_offsets")
-                                if "worker_leaves_offsets" in batch.non_tensor_batch:
-                                    batch.non_tensor_batch.pop("worker_leaves_offsets")
                         else:
                             # compute advantages, executed on the driver process
                             norm_adv_by_std_in_grpo = self.config.algorithm.get(
