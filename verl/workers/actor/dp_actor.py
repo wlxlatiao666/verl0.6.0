@@ -917,13 +917,98 @@ class DataParallelPPOActor(BasePPOActor):
                               f"actual_micro_batches={len(micro_batches)}, "
                               f"MATCH={self.gradient_accumulation == len(micro_batches)}")
 
+                    # === ALIGN MICRO-BATCH COUNT ACROSS ALL WORKERS ===
+                    # Critical fix: when tree_process_reward=True, different workers may have
+                    # different numbers of leaves (due to worker_leaves_offsets-based chunking).
+                    # This leads to different numbers of micro-batches, causing FSDP communication
+                    # mismatch and NCCL timeout. We must align micro-batch counts across all workers.
+                    local_num_micro_batches = len(micro_batches)
+                    max_micro_batches = local_num_micro_batches
+                    if dist.is_initialized() and world_size > 1:
+                        count_tensor = torch.tensor([local_num_micro_batches], dtype=torch.int64, device=get_device_id())
+                        gathered_counts = [torch.tensor([0], dtype=torch.int64, device=get_device_id()) for _ in range(world_size)]
+                        dist.all_gather(gathered_counts, count_tensor)
+                        max_micro_batches = max([cnt.item() for cnt in gathered_counts])
+                        if rank == 0:
+                            print(f"[DEBUG] [leaf] Worker {rank}: local={local_num_micro_batches}, max={max_micro_batches} micro-batches across {world_size} workers")
+
+                    # Adjust gradient_accumulation to match actual max micro-batch count
+                    self.gradient_accumulation = max_micro_batches
+
                     # Use pre-computed LOCAL segment targets, don't rebuild at mini_batch level
                     if loss_mode == "tree_segment" and local_tree_seg_targets is not None:
                         mini_batch.meta_info["tree_seg_targets"] = local_tree_seg_targets
 
                     self.actor_optimizer.zero_grad()
 
-                    for m, micro_batch in enumerate(micro_batches):
+                    for m in range(max_micro_batches):
+                        is_dummy = m >= local_num_micro_batches
+
+                        if is_dummy:
+                            # === DUMMY MICRO-BATCH: NO GRADIENT UPDATE ===
+                            # This ensures FSDP communication patterns match across all workers
+                            if rank == 0:
+                                print(f"[DEBUG] [leaf] Worker {rank}: micro-batch {m} (dummy, no gradient update)")
+                            if local_num_micro_batches > 0:
+                                # Reuse the first micro-batch's data for dummy computation
+                                dummy_micro_batch = micro_batches[0]
+                                dummy_micro_batch = dummy_micro_batch.to(get_device_id())
+                                model_inputs = {**dummy_micro_batch.batch, **dummy_micro_batch.non_tensor_batch}
+                                entropy_coeff = self.config.entropy_coeff
+                                loss_scale_factor = 0.0
+
+                                calculate_entropy = entropy_coeff != 0
+                                entropy, log_prob = self._forward_micro_batch(
+                                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                                )
+
+                                # Compute dummy loss with 0 scale to prevent actual gradient update
+                                response_mask = model_inputs["response_mask"]
+                                old_log_prob = model_inputs["old_log_probs"]
+                                advantages = torch.zeros_like(old_log_prob)
+                                rollout_is_weights = model_inputs.get("rollout_is_weights", None)
+                                policy_loss_fn = get_policy_loss_fn(loss_mode)
+                                pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                                    old_log_prob=old_log_prob,
+                                    log_prob=log_prob,
+                                    advantages=advantages,
+                                    response_mask=response_mask,
+                                    loss_agg_mode=loss_agg_mode,
+                                    config=self.config,
+                                    rollout_is_weights=rollout_is_weights,
+                                )
+
+                                if entropy_coeff != 0:
+                                    entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                                    policy_loss = pg_loss - entropy_loss * entropy_coeff
+                                else:
+                                    policy_loss = pg_loss
+
+                                if self.config.use_kl_loss:
+                                    ref_log_prob = model_inputs["ref_log_prob"]
+                                    kld = kl_penalty(
+                                        logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
+                                    )
+                                    kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                                    policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+
+                                loss = policy_loss * loss_scale_factor
+                                loss.backward()
+
+                            # Add dummy metrics
+                            micro_batch_metrics = {
+                                "actor/pg_loss": 0.0,
+                                "actor/pg_clipfrac": 0.0,
+                                "actor/ppo_kl": 0.0,
+                                "actor/pg_clipfrac_lower": 0.0,
+                            }
+                            if self.config.use_kl_loss:
+                                micro_batch_metrics["actor/kl_loss"] = 0.0
+                            append_to_dict(metrics, micro_batch_metrics)
+                            continue
+
+                        # === REAL MICRO-BATCH ===
+                        micro_batch = micro_batches[m]
                         micro_batch = micro_batch.to(get_device_id())
                         micro_batch_metrics = {}
                         model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}

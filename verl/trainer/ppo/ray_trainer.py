@@ -1566,6 +1566,23 @@ class RayPPOTrainer:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+
+                            # === CRITICAL FIX: Remove worker offsets before sending to actor ===
+                            # When loss_mode != "tree_segment", we use leaf-based batching which
+                            # requires equal chunking. worker_leaves_offsets and worker_segments_offsets
+                            # cause DataProto.chunk() to use unequal chunking (Case 1), leading to
+                            # different micro-batch counts across workers and FSDP communication mismatch.
+                            actor_loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
+                            if actor_loss_mode != "tree_segment":
+                                offset_keys_to_remove = ["worker_leaves_offsets", "worker_segments_offsets"]
+                                removed_offsets = False
+                                for key in offset_keys_to_remove:
+                                    if key in batch.non_tensor_batch:
+                                        del batch.non_tensor_batch[key]
+                                        removed_offsets = True
+                                if removed_offsets:
+                                    print(f"[DataSplitFix] Removed worker offsets before update_actor (loss_mode={actor_loss_mode}), will use equal chunking")
+
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
