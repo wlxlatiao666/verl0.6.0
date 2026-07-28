@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import gc
 import os
 import uuid
 from collections import defaultdict
@@ -468,6 +469,12 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
 
     token_advantages = token_advantages * response_mask
     print(f"[DEBUG] [compute_tree_process_advantage] token_advantages range: [{token_advantages.min():.4f}, {token_advantages.max():.4f}]")
+
+    # ── Memory cleanup: free large tree data after token_advantages is assembled ──
+    # unique_segments and leaf_segment_indices are no longer needed once token_advantages is built
+    del unique_segments, leaf_segment_indices, unique_segment_seq_ids
+    del node_scores, seg_local_advantages, seg_global_advantages, seg_advantages
+    gc.collect()
 
     data.batch["advantages"] = token_advantages
     data.batch["returns"] = token_advantages  # returns not used downstream in this path
@@ -1527,6 +1534,11 @@ class RayPPOTrainer:
                                 for key in tree_segment_large_keys:
                                     if key in batch.non_tensor_batch:
                                         batch.non_tensor_batch.pop(key)
+                                if "metrics" in batch.meta_info:
+                                    for key in tree_segment_large_keys:
+                                        if key in batch.meta_info["metrics"]:
+                                            del batch.meta_info["metrics"][key]
+                                gc.collect()
                         else:
                             # compute advantages, executed on the driver process
                             norm_adv_by_std_in_grpo = self.config.algorithm.get(
