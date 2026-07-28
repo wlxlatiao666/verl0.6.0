@@ -456,10 +456,8 @@ class vLLMRollout(BaseRollout):
 
             response = []
             # unique_segments: one entry per unique tree node (deduped by seq_id)
-            # unique_segment_seq_ids: seq_id for each entry in unique_segments
             # leaf_segment_indices: for each leaf, the ordered list of indices into unique_segments representing its root→leaf path
             unique_segments: list[list[int]] = []
-            unique_segment_seq_ids: list[int] = []
             seq_id_to_segment_idx: dict[int, int] = {}
             leaf_segment_indices: list[list[int]] = []
             rollout_log_probs = []
@@ -495,7 +493,6 @@ class vLLMRollout(BaseRollout):
                                     if seq_id not in seq_id_to_segment_idx:
                                         seq_id_to_segment_idx[seq_id] = len(unique_segments)
                                         unique_segments.append(seg)
-                                        unique_segment_seq_ids.append(seq_id)
                                     path_indices.append(seq_id_to_segment_idx[seq_id])
                                 leaf_segment_indices.append(path_indices)
                     elif not has_tree:
@@ -536,20 +533,17 @@ class vLLMRollout(BaseRollout):
 
             # Store segment-level data for tree responses.
             # unique_segments: token list per unique tree node (deduped by seq_id), shape (n_unique_nodes,)
-            # unique_segment_seq_ids: seq_id for each entry in unique_segments, shape (n_unique_nodes,)
             # leaf_segment_indices: for each leaf, ordered indices into unique_segments for its root→leaf path
             #                       shape (n_leaves,) of variable-len index arrays
             if _tree_process_reward:
                 # Always write these keys (even if empty) so all workers have the same keys
-                # NOTE: unique_segments and unique_segment_seq_ids are stored in non_tensor_batch
+                # NOTE: unique_segments is stored in non_tensor_batch
                 # rather than meta_info['metrics'] so they are properly partitioned per-worker
                 if unique_segments:
                     non_tensor_batch["unique_segments"] = np.array(unique_segments, dtype=object)
-                    non_tensor_batch["unique_segment_seq_ids"] = np.array(unique_segment_seq_ids, dtype=np.int64)
                 else:
                     # Write empty arrays with the right dtype
                     non_tensor_batch["unique_segments"] = np.array([], dtype=object)
-                    non_tensor_batch["unique_segment_seq_ids"] = np.array([], dtype=np.int64)
                 # leaf_segment_indices aligns with batch dimension (one entry per leaf response)
                 if leaf_segment_indices:
                     leaf_seg_arr = np.empty(len(leaf_segment_indices), dtype=object)

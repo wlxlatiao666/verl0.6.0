@@ -464,8 +464,6 @@ class DataParallelPPOActor(BasePPOActor):
                 non_tensor_select_keys.append("leaf_segment_indices")
             if "unique_segments" in data.non_tensor_batch:
                 non_tensor_select_keys.append("unique_segments")
-            if "unique_segment_seq_ids" in data.non_tensor_batch:
-                non_tensor_select_keys.append("unique_segment_seq_ids")
             if "worker_segments_offsets" in data.non_tensor_batch:
                 non_tensor_select_keys.append("worker_segments_offsets")
             if "worker_leaves_offsets" in data.non_tensor_batch:
@@ -524,15 +522,6 @@ class DataParallelPPOActor(BasePPOActor):
                     global_unique_segments[global_seg_idx]
                     for global_seg_idx in used_global_seg_indices
                 ]
-
-                # Build local unique_segment_seq_ids if available
-                local_unique_segment_seq_ids = None
-                if "unique_segment_seq_ids" in data.non_tensor_batch:
-                    global_unique_segment_seq_ids = data.non_tensor_batch["unique_segment_seq_ids"]
-                    local_unique_segment_seq_ids = [
-                        global_unique_segment_seq_ids[global_seg_idx]
-                        for global_seg_idx in used_global_seg_indices
-                    ]
 
                 # Adjust leaf_segment_indices to use local indices
                 local_leaf_segment_indices = []

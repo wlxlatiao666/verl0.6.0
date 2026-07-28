@@ -472,7 +472,7 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
 
     # ── Memory cleanup: free large tree data after token_advantages is assembled ──
     # unique_segments and leaf_segment_indices are no longer needed once token_advantages is built
-    del unique_segments, leaf_segment_indices, unique_segment_seq_ids
+    del unique_segments, leaf_segment_indices
     del node_scores, seg_local_advantages, seg_global_advantages, seg_advantages
     gc.collect()
 
@@ -1315,9 +1315,9 @@ class RayPPOTrainer:
                                     metrics[k] = sum(v)  # sum across workers
                                 else:
                                     metrics[k] = sum(v) / len(v)  # average
-                            # For backward compatibility: if unique_segments/unique_segment_seq_ids are still
-                            # in metrics (from old code), preserve them there. In new code they are in non_tensor_batch.
-                            _segment_keys = ("unique_segments", "unique_segment_seq_ids")
+                            # For backward compatibility: if unique_segments is still
+                            # in metrics (from old code), preserve it there. In new code it is in non_tensor_batch.
+                            _segment_keys = ("unique_segments",)
                             _preserved = {}
                             for k in _segment_keys:
                                 if k not in _agg_metrics:
@@ -1334,7 +1334,6 @@ class RayPPOTrainer:
                                             if arr.ndim == 0 or arr.size == 0:
                                                 continue
                                             # For unique_segments (object dtype, typically 1D)
-                                            # For unique_segment_seq_ids (int dtype, typically 1D)
                                             if arr.ndim == 1:
                                                 valid_arrays.append(arr)
                                     if valid_arrays:
@@ -1425,7 +1424,7 @@ class RayPPOTrainer:
                     # We remove it before compute_log_prob/compute_ref_log_prob/compute_values to save memory
                     # NOTE: Keep worker_*_offsets because chunk() needs them to split correctly!
                     tree_data_cache = {}
-                    tree_segment_large_keys = ["unique_segments", "unique_segment_seq_ids", "leaf_segment_indices"]
+                    tree_segment_large_keys = ["unique_segments", "leaf_segment_indices"]
                     has_tree_data = any(key in batch.non_tensor_batch for key in tree_segment_large_keys)
                     if has_tree_data:
                         print(f"[MemoryOpt] Temporarily removing large tree data from batch for compute_log_prob/ref/values")
