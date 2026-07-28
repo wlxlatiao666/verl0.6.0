@@ -457,19 +457,24 @@ class DataParallelPPOActor(BasePPOActor):
         non_tensor_select_keys = []
         if has_multi_modal_inputs:
             non_tensor_select_keys.append("multi_modal_inputs")
-        if "leaf_segment_indices" in data.non_tensor_batch:
-            non_tensor_select_keys.append("leaf_segment_indices")
-        # Also select tree segment data if present
-        if "unique_segments" in data.non_tensor_batch:
-            non_tensor_select_keys.append("unique_segments")
-        if "unique_segment_seq_ids" in data.non_tensor_batch:
-            non_tensor_select_keys.append("unique_segment_seq_ids")
+
+        loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+        if loss_mode == "tree_segment":
+            if "leaf_segment_indices" in data.non_tensor_batch:
+                non_tensor_select_keys.append("leaf_segment_indices")
+            if "unique_segments" in data.non_tensor_batch:
+                non_tensor_select_keys.append("unique_segments")
+            if "unique_segment_seq_ids" in data.non_tensor_batch:
+                non_tensor_select_keys.append("unique_segment_seq_ids")
+            if "worker_segments_offsets" in data.non_tensor_batch:
+                non_tensor_select_keys.append("worker_segments_offsets")
+            if "worker_leaves_offsets" in data.non_tensor_batch:
+                non_tensor_select_keys.append("worker_leaves_offsets")
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys if non_tensor_select_keys else None)
 
         # Pre-compute LOCAL segment-level targets FIRST (before splitting into mini_batches) for tree_segment loss
         # Note: data is already sliced per-worker (each worker has its own leaves and segments)
-        loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
         local_tree_seg_targets = None
         local_batch_size = len(data)
         # We need to keep track of global seg indices for ownership check

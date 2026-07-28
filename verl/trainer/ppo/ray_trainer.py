@@ -1520,6 +1520,17 @@ class RayPPOTrainer:
                                 local_adv_weight=local_adv_weight,
                                 global_adv_weight=global_adv_weight
                             )
+
+                            loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
+                            if loss_mode != "tree_segment":
+                                print(f"[MemoryOpt] Removing tree data after compute_tree_process_advantage (loss_mode={loss_mode})")
+                                for key in tree_segment_large_keys:
+                                    if key in batch.non_tensor_batch:
+                                        batch.non_tensor_batch.pop(key)
+                                if "worker_segments_offsets" in batch.non_tensor_batch:
+                                    batch.non_tensor_batch.pop("worker_segments_offsets")
+                                if "worker_leaves_offsets" in batch.non_tensor_batch:
+                                    batch.non_tensor_batch.pop("worker_leaves_offsets")
                         else:
                             # compute advantages, executed on the driver process
                             norm_adv_by_std_in_grpo = self.config.algorithm.get(
