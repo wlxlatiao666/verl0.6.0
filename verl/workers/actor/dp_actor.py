@@ -453,6 +453,10 @@ class DataParallelPPOActor(BasePPOActor):
         if "rollout_is_weights" in data.batch.keys():
             select_keys.append("rollout_is_weights")
 
+        # Include tree-rollout inverse-sharing weights if present (added by vLLM tree rollout).
+        if "token_share_weights" in data.batch.keys():
+            select_keys.append("token_share_weights")
+
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = []
         if has_multi_modal_inputs:
@@ -1018,6 +1022,30 @@ class DataParallelPPOActor(BasePPOActor):
 
                         entropy_coeff = self.config.entropy_coeff
                         loss_agg_mode = self.config.loss_agg_mode
+
+                        # ------------------------------
+                        # Apply token-level inverse-sharing weight (tree-rollout only).
+                        # token_share_weights[t] = 1 / descendant_count(node_that_owns_token_t).
+                        # Multiplying into advantages is mathematically equivalent to multiplying
+                        # the final per-token pg_loss by the same weight; we do it here so we don't
+                        # need to touch every policy_loss_fn signature.
+                        # ------------------------------
+                        token_share_weights = model_inputs.get("token_share_weights", None)
+                        if token_share_weights is not None:
+                            if m == 0:
+                                try:
+                                    _w = token_share_weights
+                                    print(
+                                        f"[DEBUG][token_share_weights] Worker {rank} micro-batch {m}: "
+                                        f"weights.shape={tuple(_w.shape)} "
+                                        f"nonzero_tokens={int((_w > 0).sum().item())} "
+                                        f"w_min={float(_w.min().item()):.4f} "
+                                        f"w_max={float(_w.max().item()):.4f} "
+                                        f"w_mean_valid={float(_w.sum().item() / max((_w > 0).sum().item(), 1)):.4f}"
+                                    )
+                                except Exception as _e:
+                                    print(f"[DEBUG][token_share_weights] skipped debug: {_e}")
+                            advantages = advantages * token_share_weights.to(advantages.device, dtype=advantages.dtype)
 
                         if self.config.use_dynamic_bsz:
                             loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size

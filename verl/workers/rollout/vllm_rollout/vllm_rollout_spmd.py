@@ -462,9 +462,16 @@ class vLLMRollout(BaseRollout):
             leaf_segment_indices: list[list[int]] = []
             rollout_log_probs = []
             prompt_indices = []  # Track which prompt each response belongs to
+            # ----- Inverse-sharing weight support -----
+            # Intermediate storage for leaf records (collected in the first pass so we can
+            # compute node_descendant_count before producing per-token weights).
+            _leaf_records: list[tuple[list[tuple[int, list[int]]], list[int], int]] = []
+            _global_seq_map: dict[int, object] = {}
+            token_share_weights: list[list[float]] = []
 
             for out_idx, output in enumerate(outputs):
                 seq_map = {out.seq_id: out for out in output.outputs}
+                _global_seq_map.update(seq_map)
                 has_tree = any(getattr(s, 'is_leaf', False) for s in output.outputs)
 
                 samples_to_collect = output.outputs
@@ -495,17 +502,81 @@ class vLLMRollout(BaseRollout):
                                         unique_segments.append(seg)
                                     path_indices.append(seq_id_to_segment_idx[seq_id])
                                 leaf_segment_indices.append(path_indices)
+
+                            # Save the leaf record for second-pass processing
+                            _leaf_records.append((path_nodes, response_ids, out_idx))
                     elif not has_tree:
                         response_ids = sample.token_ids
-                    if response_ids:
-                        response.append(response_ids)
-                        if has_tree:
-                            prompt_indices.append(out_idx)
-                        if self.config.calculate_log_probs:
-                            curr_log_prob = []
-                            for i, logprob in enumerate(sample.logprobs):
-                                curr_log_prob.append(logprob[response_ids[i]].logprob)
-                            rollout_log_probs.append(curr_log_prob)
+                        if response_ids:
+                            response.append(response_ids)
+                            if self.config.calculate_log_probs:
+                                curr_log_prob = []
+                                for i, logprob in enumerate(sample.logprobs):
+                                    if i < len(response_ids):
+                                        tok = response_ids[i]
+                                        curr_log_prob.append(
+                                            logprob[tok].logprob if tok in logprob else 0.0
+                                        )
+                                    else:
+                                        curr_log_prob.append(0.0)
+                                rollout_log_probs.append(curr_log_prob)
+
+            # ----- Second pass: process tree leaves (count descendants + emit records) -----
+            if _leaf_records:
+                # 1. Count how many leaves are descendants of each node
+                _node_descendant_count: dict[int, int] = {}
+                for path_nodes, _, _ in _leaf_records:
+                    for seq_id, _ in path_nodes:
+                        _node_descendant_count[seq_id] = _node_descendant_count.get(seq_id, 0) + 1
+
+                # 2. Emit each leaf's response / prompt index / rollout_log_probs / token_share_weights
+                for path_nodes, response_ids, out_idx in _leaf_records:
+                    response.append(response_ids)
+                    prompt_indices.append(out_idx)
+
+                    if self.config.calculate_log_probs:
+                        curr_log_prob: list[float] = []
+                        for seg_id, seg_tokens in path_nodes:
+                            seg_sample = _global_seq_map.get(seg_id)
+                            if seg_sample is not None and getattr(seg_sample, 'logprobs', None) is not None:
+                                for j, logprob_entry in enumerate(seg_sample.logprobs):
+                                    if j < len(seg_tokens):
+                                        tok = seg_tokens[j]
+                                        if tok in logprob_entry:
+                                            curr_log_prob.append(logprob_entry[tok].logprob)
+                                        elif len(logprob_entry) > 0:
+                                            first_key = next(iter(logprob_entry.keys()))
+                                            curr_log_prob.append(logprob_entry[first_key].logprob)
+                                        else:
+                                            curr_log_prob.append(0.0)
+                                    else:
+                                        curr_log_prob.append(0.0)
+                            else:
+                                curr_log_prob.extend([0.0] * len(seg_tokens))
+                        rollout_log_probs.append(curr_log_prob)
+
+                    # Token-level inverse-sharing weight: 1 / descendant_count for each node's tokens
+                    leaf_weights: list[float] = []
+                    for seg_id, seg_tokens in path_nodes:
+                        cnt = float(_node_descendant_count.get(seg_id, 1))
+                        leaf_weights.extend([1.0 / cnt] * len(seg_tokens))
+                    assert len(leaf_weights) == len(response_ids), (
+                        f"[token_share_weights] length mismatch: "
+                        f"leaf_weights={len(leaf_weights)} response_ids={len(response_ids)}"
+                    )
+                    token_share_weights.append(leaf_weights)
+
+                # Optional debug stats (print first 3 leaves)
+                for _i, (_p, r, _o) in enumerate(_leaf_records[:3]):
+                    w = token_share_weights[_i]
+                    counts = [_node_descendant_count.get(s, 0) for s, _ in _p]
+                    segs = [(s, len(t), c) for (s, t), c in zip(_p, counts)]
+                    print(
+                        f"[DEBUG][token_share_weights] leaf {_i}: "
+                        f"resp_len={len(r)} n_segments={len(_p)} "
+                        f"segments(seg_id, seg_len, desc_count)={segs} "
+                        f"w_min={min(w):.4f} w_max={max(w):.4f} w_sum={sum(w):.4f}"
+                    )
 
             # When tree search produces more responses than prompts,
             # expand prompt tensors and non_tensor_batch to match
@@ -619,6 +690,23 @@ class vLLMRollout(BaseRollout):
                     rollout_log_probs, -1, max_length=self.config.response_length
                 ).to(idx.device)
                 rollout_log_probs = rollout_log_probs.to(torch.float32)
+            # ----- token_share_weights (inverse-sharing) -----
+            if token_share_weights:
+                # Pad with 0.0 so that padded positions contribute 0 in the loss weighting.
+                token_share_weights_t = pad_2d_list_to_length(
+                    token_share_weights, 0.0, max_length=self.config.response_length
+                ).to(idx.device)
+                token_share_weights_t = token_share_weights_t.to(torch.float32)
+                print(
+                    f"[DEBUG][token_share_weights] Emitted tensor: "
+                    f"shape={tuple(token_share_weights_t.shape)} "
+                    f"nonzero_rows={int((token_share_weights_t.sum(dim=-1) > 0).sum().item())} "
+                    f"w_sum_total={float(token_share_weights_t.sum().item()):.2f} "
+                    f"w_min={float(token_share_weights_t.min().item()):.4f} "
+                    f"w_max={float(token_share_weights_t.max().item()):.4f}"
+                )
+            else:
+                token_share_weights_t = None
 
             seq = torch.cat([idx, response], dim=-1)
 
@@ -653,6 +741,10 @@ class vLLMRollout(BaseRollout):
         if self.config.calculate_log_probs:
             # we will recompute old log prob with actor
             batch["rollout_log_probs"] = rollout_log_probs
+
+        # Write token_share_weights tensor (inverse-sharing weights) if tree search produced it.
+        if 'token_share_weights_t' in locals() and token_share_weights_t is not None:
+            batch["token_share_weights"] = token_share_weights_t
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info={"metrics": _tree_metrics})
 
