@@ -578,6 +578,140 @@ class vLLMRollout(BaseRollout):
                         f"w_min={min(w):.4f} w_max={max(w):.4f} w_sum={sum(w):.4f}"
                     )
 
+            # ── Step 2 (NEW): TOP-UP leaves with conventional sampling ──────
+            # Target = bf ** max_depth. For every prompt whose tree produced
+            # fewer leaves, we run conventional (non-branching) sampling with
+            # the SAME temperature / top_p / top_k / min_p / ... as the active
+            # rollout params, but with tree_search_params = None. These
+            # conventional samples are appended after tree leaves and share
+            # the same prompt uid so GRPO groups them together.
+            _topup_total = 0
+            _topup_per_prompt: dict[int, int] = {}
+            _tree_cfg = self.config.get("tree_search", None)
+            if has_tree and _tree_cfg is not None and _leaves_per_prompt:
+                _bf    = int(_tree_cfg.get("branching_factor", 2))
+                _md    = int(_tree_cfg.get("max_tree_depth",   3))
+                _tgt   = _bf ** _md
+                _topup_enable = bool(_tree_cfg.get("topup_leaves_to_target", True))
+                if _topup_enable and min(_leaves_per_prompt) < _tgt:
+                    # Build per-prompt deficit
+                    _tu_inputs: list[dict] = []
+                    _tu_n:      list[int]  = []
+                    _tu_map:    list[int]  = []
+                    for _p_out in range(len(outputs)):
+                        deficit = max(0, _tgt - _leaves_per_prompt[_p_out])
+                        if deficit > 0:
+                            _tu_inputs.append(vllm_inputs[_p_out])
+                            _tu_n.append(deficit)
+                            _tu_map.append(_p_out)
+                    if _tu_inputs:
+                        # Clone sampling params (no tree branching) + set n=need
+                        _base = self.sampling_params
+                        _lp_req = 1 if self.config.calculate_log_probs else 0
+                        _tu_sp_list = []
+                        for _def in _tu_n:
+                            _tu_sp_list.append(
+                                SamplingParams(
+                                    n=_def,
+                                    temperature=float(_base.temperature),
+                                    top_p=float(_base.top_p),
+                                    top_k=int(_base.top_k),
+                                    min_p=(float(_base.min_p)
+                                           if _base.min_p is not None else 0.0),
+                                    repetition_penalty=float(_base.repetition_penalty),
+                                    presence_penalty=float(_base.presence_penalty),
+                                    frequency_penalty=float(_base.frequency_penalty),
+                                    max_tokens=int(_base.max_tokens),
+                                    logprobs=_lp_req,
+                                    tree_search_params=None,
+                                )
+                            )
+                        logger.info(
+                            f"[TreeRollout][TopUp] bf={_bf}, depth={_md}, target={_tgt}/prompt. "
+                            f"Top-up needed for {len(_tu_inputs)}/{len(outputs)} prompts: "
+                            f"total {sum(_tu_n)} conventional samples."
+                        )
+                        with torch.no_grad():
+                            _tu_outputs = self.inference_engine.generate(
+                                prompts=_tu_inputs,
+                                sampling_params=_tu_sp_list,
+                                lora_request=None,
+                                use_tqdm=False,
+                            )
+
+                        _pre_leaf_count = len(response)
+
+                        for _rel, (_tu_out, p_out) in enumerate(
+                            zip(_tu_outputs, _tu_map)
+                        ):
+                            got = 0
+                            for _tu_sample in _tu_out.outputs:
+                                resp_ids = list(_tu_sample.token_ids)
+                                if not resp_ids:
+                                    continue
+
+                                # 1) responses + prompt routing (same prompt index)
+                                response.append(resp_ids)
+                                prompt_indices.append(p_out)
+                                got += 1
+
+                                # 2) rollout_log_probs (if required)
+                                if self.config.calculate_log_probs:
+                                    curr_lp: list[float] = []
+                                    for _j, _lpe in enumerate(
+                                        getattr(_tu_sample, "logprobs", []) or []
+                                    ):
+                                        if _j < len(resp_ids):
+                                            tok = resp_ids[_j]
+                                            if _lpe and tok in _lpe:
+                                                curr_lp.append(_lpe[tok].logprob)
+                                            elif _lpe:
+                                                k0 = next(iter(_lpe.keys()))
+                                                curr_lp.append(_lpe[k0].logprob)
+                                            else:
+                                                curr_lp.append(0.0)
+                                        else:
+                                            curr_lp.append(0.0)
+                                    pad_n = max(0, len(resp_ids) - len(curr_lp))
+                                    if pad_n:
+                                        curr_lp.extend([0.0] * pad_n)
+                                    rollout_log_probs.append(curr_lp)
+
+                                # 3) token_share_weights = 1.0 (only itself)
+                                token_share_weights.append([1.0] * len(resp_ids))
+
+                                # 4) tree_process_reward single synthetic segment
+                                if _tree_process_reward:
+                                    seg_idx = len(unique_segments)
+                                    unique_segments.append(list(resp_ids))
+                                    leaf_segment_indices.append([seg_idx])
+
+                            _topup_per_prompt[p_out] = got
+                            _leaves_per_prompt[p_out] += got
+                            _topup_total += got
+
+                        logger.info(
+                            f"[TreeRollout][TopUp] Done. Collected "
+                            f"{len(response) - _pre_leaf_count} samples "
+                            f"(requested {sum(_tu_n)}). "
+                            f"Total responses now: {len(response)}."
+                        )
+
+            # ── Summary print for top-up ──────────────────────────────────────
+            if has_tree and _tree_cfg is not None:
+                _bf = int(_tree_cfg.get("branching_factor", 2))
+                _md = int(_tree_cfg.get("max_tree_depth",   3))
+                _tgt = _bf ** _md
+                _hits = sum(1 for n in _leaves_per_prompt if n >= _tgt) if _leaves_per_prompt else 0
+                print(
+                    f"[TreeRollout][TopUp-Summary] target_leaves/prompt={_tgt} (bf={_bf}, depth={_md}). "
+                    f"Prompts at target: {_hits}/{len(_leaves_per_prompt) if _leaves_per_prompt else 0}. "
+                    f"Top-up samples total: {_topup_total}. "
+                    f"Per-prompt leaves: min={min(_leaves_per_prompt) if _leaves_per_prompt else 0}, "
+                    f"max={max(_leaves_per_prompt) if _leaves_per_prompt else 0}, "
+                    f"mean={(sum(_leaves_per_prompt)/len(_leaves_per_prompt)) if _leaves_per_prompt else 0:.2f}."
+                )
+
             # When tree search produces more responses than prompts,
             # expand prompt tensors and non_tensor_batch to match
             if len(response) != batch_size:
@@ -625,7 +759,9 @@ class vLLMRollout(BaseRollout):
             # ── Compute tree search metrics ──
             _tree_total, _tree_leaves = 0, 0
             _depth_sum, _depth_max = 0, 0
-            _leaves_per_prompt = []
+            # NOTE: _leaves_per_prompt already contains tree leaves + top-ups; we
+            # just need tree-only stats (_tree_leaves) and quality signals.
+            _tree_only_leaves: list[int] = []
             _leaf_resp_lens = []
 
             # Debug: Print per-prompt tree statistics
@@ -649,19 +785,33 @@ class vLLMRollout(BaseRollout):
                         prompt_leaf_count += 1
                         _leaf_resp_lens.append(len(_s.token_ids))
                 _tree_leaves += prompt_leaf_count
-                _leaves_per_prompt.append(prompt_leaf_count)
+                _tree_only_leaves.append(prompt_leaf_count)
                 _depth_sum += prompt_max_depth
                 _depth_max = max(_depth_max, prompt_max_depth)
 
                 # Debug per-prompt tree info
                 prompt_new_segments = len(unique_segments) - prompt_segments_before
+                _tu = _topup_per_prompt.get(_out_idx, 0) if '_topup_per_prompt' in locals() else 0
                 print(f"[TreeRollout] Prompt {_out_idx}: {prompt_total_nodes} total nodes, "
-                      f"{prompt_leaf_count} leaves, max_depth={prompt_max_depth}, "
+                      f"{prompt_leaf_count} tree-leaves + {_tu} topup = {prompt_leaf_count+_tu} total, "
+                      f"max_depth={prompt_max_depth}, "
                       f"{prompt_new_segments} new segments (segments/leaf ratio: {prompt_total_nodes / max(prompt_leaf_count, 1):.2f})")
 
             n_prompts = max(len(outputs), 1)
             _tree_branch_pts = _tree_total - _tree_leaves
-            avg_leaves = _tree_leaves / n_prompts
+            _all_n_leaves = _leaves_per_prompt if _leaves_per_prompt else [0]
+            avg_leaves = sum(_all_n_leaves) / len(_all_n_leaves)
+            _min_l  = min(_all_n_leaves) if _all_n_leaves else 0
+            _max_l  = max(_all_n_leaves) if _all_n_leaves else 0
+            _avg_tree = (sum(_tree_only_leaves) / len(_tree_only_leaves)) if _tree_only_leaves else 0
+
+            # Metrics: merge top-up info (produced earlier if any, defaults 0)
+            _tree_metrics["tree/topup_samples"] = _topup_total if '_topup_total' in locals() else 0
+            _tree_metrics["tree/prompts_need_topup"] = (
+                sum(1 for _p in range(len(outputs))
+                    if (_topup_per_prompt.get(_p, 0) if '_topup_per_prompt' in locals() else 0) > 0)
+            )
+
             _tree_metrics.update({
                 # -- Structure: how large/deep is the tree? --
                 "tree/total_nodes": _tree_total,
@@ -671,15 +821,16 @@ class vLLMRollout(BaseRollout):
                 "tree/global_max_depth": _depth_max,
                 # -- Efficiency: branching budget utilisation --
                 "tree/branching_rate": round(_tree_branch_pts / max(_tree_total, 1), 4),
+                "tree/avg_tree_leaves_per_prompt": round(_avg_tree, 2),
                 "tree/avg_leaves_per_prompt": round(avg_leaves, 2),
-                "tree/min_leaves_per_prompt": min(_leaves_per_prompt) if _leaves_per_prompt else 0,
-                "tree/max_leaves_per_prompt": max(_leaves_per_prompt) if _leaves_per_prompt else 0,
-                # -- Response quality signals --
-                "tree/avg_leaf_resp_len": round(sum(_leaf_resp_lens) / max(len(_leaf_resp_lens), 1), 1),
+                "tree/min_leaves_per_prompt": _min_l,
+                "tree/max_leaves_per_prompt": _max_l,
+                # -- Response quality signals (tree leaves only) --
+                "tree/avg_leaf_resp_len": round(sum(_leaf_resp_lens) / max(len(_leaf_resp_lens), 1), 1) if _leaf_resp_lens else 0,
                 "tree/min_leaf_resp_len": min(_leaf_resp_lens) if _leaf_resp_lens else 0,
                 "tree/max_leaf_resp_len": max(_leaf_resp_lens) if _leaf_resp_lens else 0,
-                # -- Expansion ratio (useful for batch size planning) --
-                "tree/expansion_ratio": round(avg_leaves, 2),  # how many times batch grows
+                # -- Expansion ratio (tree leaves + top-ups) --
+                "tree/expansion_ratio": round(avg_leaves, 2),
             })
 
             response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(
