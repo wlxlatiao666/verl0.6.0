@@ -587,7 +587,6 @@ def generate_tree_decoding(
     prompts: List[str],
     branching_factor: int = 2,
     max_tree_depth: int = 3,
-    target_n: int = 8,
     entropy_threshold: float = 1.0,
     tau_importance: Optional[float] = 0.0,
     temperature: float = 1.0,
@@ -622,6 +621,7 @@ def generate_tree_decoding(
     Returns:
         List where each element is a list of target_n generations for that prompt
     """
+    target_n = branching_factor ** max_tree_depth
     tree_params = SamplingParams(
         temperature=temperature,
         max_tokens=max_tokens,
@@ -910,7 +910,6 @@ def run_experiment(args):
         prompts=prompts,
         branching_factor=args.branching_factor,
         max_tree_depth=args.max_tree_depth,
-        target_n=args.n,
         entropy_threshold=entropy_threshold,
         tau_importance=tau_importance,
         temperature=args.temperature,
