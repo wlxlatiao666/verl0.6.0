@@ -109,6 +109,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     reward_model.reward_manager=dapo \
     +reward_model.reward_kwargs.overlong_buffer_cfg.enable=False \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.len=512 \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=1.0 \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
     +reward_model.reward_kwargs.max_resp_len=$((MAX_RESP_LEN * 2)) \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb","tensorboard"]' \
