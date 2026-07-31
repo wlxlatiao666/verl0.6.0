@@ -61,7 +61,7 @@ mkdir -p "${WANDB_DIR}"
 # 公式对齐: seq-mean-token-mean (1/G * Σ_i * 1/|o_i| * Σ_t), clip=0.2, kl_coef=0.01
 TRAIN_BATCH_SIZE=64
 ROLLOUT_N=64
-PPO_MINI_BATCH_SIZE=64
+PPO_MINI_BATCH_SIZE=16
 PPO_MICRO_BATCH_PER_GPU=2
 LR=1e-6
 CLIP_RATIO=0.2
@@ -108,6 +108,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     reward_model.reward_manager=dapo \
     +reward_model.reward_kwargs.overlong_buffer_cfg.enable=False \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.len=512 \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=1.0 \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
     +reward_model.reward_kwargs.max_resp_len=$((MAX_RESP_LEN * 2)) \
     trainer.critic_warmup=0 \
     trainer.logger='["console","wandb","tensorboard"]' \
