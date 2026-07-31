@@ -462,6 +462,9 @@ class vLLMRollout(BaseRollout):
             leaf_segment_indices: list[list[int]] = []
             rollout_log_probs = []
             prompt_indices = []  # Track which prompt each response belongs to
+            # Per-prompt leaf counts (tree leaves now; top-ups added later at line ~690).
+            # Indexed by prompt position within `outputs`.
+            _leaves_per_prompt = [0] * len(outputs)
             # ----- Inverse-sharing weight support -----
             # Intermediate storage for leaf records (collected in the first pass so we can
             # compute node_descendant_count before producing per-token weights).
@@ -533,6 +536,7 @@ class vLLMRollout(BaseRollout):
                 for path_nodes, response_ids, out_idx in _leaf_records:
                     response.append(response_ids)
                     prompt_indices.append(out_idx)
+                    _leaves_per_prompt[out_idx] += 1
 
                     if self.config.calculate_log_probs:
                         curr_log_prob: list[float] = []
