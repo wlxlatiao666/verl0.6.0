@@ -19,15 +19,15 @@ export RAY_DEDUP_LOGS=0
 export NCCL_SHM_DISABLE=1
 export NCCL_DEBUG=INFO
 
-HOME="${HOME:-/inspire/hdd/global_user/weilongxuan-253108120168}"
-verl_dir="${verl_dir:-/inspire/qb-ilm2/project/neosmosis/weilongxuan-253108120168/verl_data}"
+HOME=/inspire/hdd/global_user/weilongxuan-253108120168
+verl_dir=/inspire/qb-ilm2/project/neosmosis/weilongxuan-253108120168/verl_data
 project_name="verl_ablation_qwen25_3b"
 experiment_name="gsm8k_pure_grpo"
 
 RAY_DATA_HOME="${RAY_DATA_HOME:-${HOME}/verl0.6.0}"
 DATA_DIR="${DATA_DIR:-${RAY_DATA_HOME}/data}"
-TRAIN_FILE="${TRAIN_FILE:-${DATA_DIR}/gsm8k_train.parquet}"
-TEST_FILE="${TEST_FILE:-${DATA_DIR}/gsm8k_val.parquet}"
+TRAIN_FILE="${TRAIN_FILE:-${DATA_DIR}/gsm8k/train.parquet}"
+TEST_FILE="${TEST_FILE:-${DATA_DIR}/gsm8k/test.parquet}"
 MODEL_PATH="${MODEL_PATH:-/inspire/hdd/global_public/public_models/Qwen/Qwen2.5-3B-Instruct}"
 
 LOG_DIR="${HOME}/verl_logs"
