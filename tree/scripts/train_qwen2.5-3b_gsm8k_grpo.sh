@@ -19,8 +19,8 @@ export RAY_DEDUP_LOGS=0
 export NCCL_SHM_DISABLE=1
 export NCCL_DEBUG=INFO
 
-HOME="${HOME:-/home/user}"
-verl_dir="${verl_dir:-${HOME}/verl_data}"
+HOME="${HOME:-/inspire/hdd/global_user/weilongxuan-253108120168}"
+verl_dir="${verl_dir:-/inspire/qb-ilm2/project/neosmosis/weilongxuan-253108120168/verl_data}"
 project_name="verl_ablation_qwen25_3b"
 experiment_name="gsm8k_pure_grpo"
 
@@ -28,7 +28,7 @@ RAY_DATA_HOME="${RAY_DATA_HOME:-${HOME}/verl0.6.0}"
 DATA_DIR="${DATA_DIR:-${RAY_DATA_HOME}/data}"
 TRAIN_FILE="${TRAIN_FILE:-${DATA_DIR}/gsm8k_train.parquet}"
 TEST_FILE="${TEST_FILE:-${DATA_DIR}/gsm8k_val.parquet}"
-MODEL_PATH="${MODEL_PATH:-/path/to/Qwen/Qwen2.5-3B-Instruct}"
+MODEL_PATH="${MODEL_PATH:-/inspire/hdd/global_public/public_models/Qwen/Qwen2.5-3B-Instruct}"
 
 LOG_DIR="${HOME}/verl_logs"
 mkdir -p "${LOG_DIR}"
@@ -61,7 +61,7 @@ mkdir -p "${WANDB_DIR}"
 # 公式对齐: seq-mean-token-mean (1/G * Σ_i * 1/|o_i| * Σ_t), clip=0.2, kl_coef=0.01
 TRAIN_BATCH_SIZE=64
 ROLLOUT_N=64
-PPO_MINI_BATCH_SIZE=64
+PPO_MINI_BATCH_SIZE=16
 PPO_MICRO_BATCH_PER_GPU=2
 LR=1e-6
 CLIP_RATIO=0.2

@@ -1,10 +1,10 @@
-"""Generate GSM8K and MATH (lighteval/MATH) parquet train/val datasets for verl PPO training.
+"""Generate GSM8K and MATH (EleutherAI/hendrycks_math) parquet train/val datasets for verl PPO training.
 
 Output format (each parquet file contains these columns, compatible with verl's
 DAPORewardManager default compute_score):
 
   - prompts:       str, the instruction / question
-  - data_source:   str, one of {"openai/gsm8k", "lighteval/MATH"}
+  - data_source:   str, one of {"openai/gsm8k", "EleutherAI/hendrycks_math"}
                    (matches verl.utils.reward_score.default_compute_score branches)
   - reward_model:  dict with key "ground_truth" -> list[str] or str (the gold answer)
                    verl DAPORewardManager reads non_tensor_batch["reward_model"]["ground_truth"]
@@ -101,12 +101,12 @@ def build_gsm8k(train_limit: int | None, val_limit: int | None, seed: int):
 
 
 # ---------------------------------------------------------------------------
-# MATH (lighteval/MATH) 处理
+# MATH (EleutherAI/hendrycks_math) 处理
 # ---------------------------------------------------------------------------
 def build_math(train_limit: int | None, val_limit: int | None, seed: int):
     """返回 (train_df, val_df)。"""
-    print("[MATH] loading from HuggingFace datasets (lighteval/MATH)...")
-    ds = load_dataset("lighteval/MATH", "all", trust_remote_code=True)
+    print("[MATH] loading from HuggingFace datasets (EleutherAI/hendrycks_math)...")
+    ds = load_dataset("EleutherAI/hendrycks_math", "all", trust_remote_code=True)
     train_df = ds["train"].to_pandas()
     test_df  = ds["test" ].to_pandas()
     print(f"[MATH] raw sizes: train={len(train_df)}, test={len(test_df)}")
@@ -148,7 +148,7 @@ def build_math(train_limit: int | None, val_limit: int | None, seed: int):
             }
             rows.append({
                 "prompts":      problem,
-                "data_source":  "lighteval/MATH",
+                "data_source":  "EleutherAI/hendrycks_math",
                 "reward_model": _build_reward_model(ans),
                 "extra_info":   extra,
             })
