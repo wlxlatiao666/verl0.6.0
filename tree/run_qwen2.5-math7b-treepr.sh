@@ -9,8 +9,9 @@ export VERL_DEBUG_LOG_PATH=/inspire/hdd/global_user/weilongxuan-253108120168
 export NCCL_SHM_DISABLE=1
 export NCCL_DEBUG=INFO
 HOME=/inspire/hdd/global_user/weilongxuan-253108120168
+verl_dir=/inspire/hdd/global_user/weilongxuan-253108120168/verl_data
 project_name=verl_grpo_tree_latest
-experiment_name=qwen2.5_math7b_tree_pr_waad_leaf_share
+experiment_name=qwen2.5_math7b_tree_pr_waad_leaf_share_new
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl0.6.0"}
 
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
@@ -87,7 +88,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.tree_search.enable=True \
     actor_rollout_ref.rollout.tree_search.entropy_threshold=0.8 \
     actor_rollout_ref.rollout.tree_search.branching_factor=2 \
-    actor_rollout_ref.rollout.tree_search.max_tree_depth=3 \
+    actor_rollout_ref.rollout.tree_search.max_tree_depth=6 \
     actor_rollout_ref.rollout.tree_search.tau_importance=0.0 \
     actor_rollout_ref.rollout.tree_search.tree_process_reward=True \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
@@ -103,14 +104,14 @@ python3 -m verl.trainer.main_ppo \
     trainer.logger='["console","wandb","tensorboard"]' \
     trainer.project_name=${project_name} \
     trainer.experiment_name=${experiment_name} \
-    trainer.n_gpus_per_node=4 \
+    trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
     trainer.test_freq=2 \
     trainer.total_epochs=1 \
-    trainer.default_local_dir="/inspire/qb-ilm2/project/neosmosis/weilongxuan-253108120168/verl_data/checkpoints/${project_name}/${experiment_name}" \
-    trainer.rollout_data_dir="/inspire/qb-ilm2/project/neosmosis/weilongxuan-253108120168/verl_data/rollout_data/${project_name}/${experiment_name}" \
-    trainer.validation_data_dir="/inspire/qb-ilm2/project/neosmosis/weilongxuan-253108120168/verl_data/validation_data/${project_name}/${experiment_name}" \
+    trainer.default_local_dir="${verl_dir}/checkpoints/${project_name}/${experiment_name}" \
+    trainer.rollout_data_dir="${verl_dir}/rollout_data/${project_name}/${experiment_name}" \
+    trainer.validation_data_dir="${verl_dir}/validation_data/${project_name}/${experiment_name}" \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=False\
     $@ 2>&1 | tee -a "${LOG_FILE}"

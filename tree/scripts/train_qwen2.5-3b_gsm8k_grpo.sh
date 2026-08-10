@@ -54,7 +54,7 @@ if [[ -z "${WANDB_API_KEY:-}" ]] && [[ -n "${_WANDB_API_KEY_INLINE}" ]]; then
 fi
 export WANDB_KEY="${WANDB_API_KEY:-}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
-export WANDB_DIR="${HOME}/wandb_offline"
+export WANDB_DIR="${HOME}/wandb_offline/qwen3b"
 mkdir -p "${WANDB_DIR}"
 
 # ===== 统一 GRPO 超参 (所有 6 个脚本保持一致) =====
@@ -121,7 +121,7 @@ python3 -m verl.trainer.main_ppo \
     +ray_kwargs.ray_init.log_to_driver=True \
     trainer.save_freq=20 \
     trainer.test_freq=2 \
-    trainer.total_epochs=1 \
+    trainer.total_epochs=10 \
     trainer.default_local_dir="${verl_dir}/checkpoints/${project_name}/${experiment_name}" \
     trainer.rollout_data_dir="${verl_dir}/rollout_data/${project_name}/${experiment_name}" \
     trainer.validation_data_dir="${verl_dir}/validation_data/${project_name}/${experiment_name}" \

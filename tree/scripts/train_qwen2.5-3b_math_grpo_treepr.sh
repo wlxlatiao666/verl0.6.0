@@ -18,16 +18,16 @@ export RAY_DEDUP_LOGS=0
 export NCCL_SHM_DISABLE=1
 export NCCL_DEBUG=INFO
 
-HOME="${HOME:-/home/user}"
-verl_dir="${verl_dir:-${HOME}/verl_data}"
+HOME=/inspire/hdd/global_user/weilongxuan-253108120168
+verl_dir=/inspire/hdd/global_user/weilongxuan-253108120168/verl_data
 project_name="verl_ablation_qwen25_3b"
 experiment_name="math_grpo_treepr"
 
 RAY_DATA_HOME="${RAY_DATA_HOME:-${HOME}/verl0.6.0}"
 DATA_DIR="${DATA_DIR:-${RAY_DATA_HOME}/data}"
-TRAIN_FILE="${TRAIN_FILE:-${DATA_DIR}/math_train.parquet}"
-TEST_FILE="${TEST_FILE:-${DATA_DIR}/math_val.parquet}"
-MODEL_PATH="${MODEL_PATH:-/path/to/Qwen/Qwen2.5-3B-Instruct}"
+TRAIN_FILE="${TRAIN_FILE:-${DATA_DIR}/math/train.parquet}"
+TEST_FILE="${TEST_FILE:-${DATA_DIR}/math/test.parquet}"
+MODEL_PATH="${MODEL_PATH:-/inspire/hdd/global_public/public_models/Qwen/Qwen2.5-3B-Instruct}"
 
 LOG_DIR="${HOME}/verl_logs"
 mkdir -p "${LOG_DIR}"
@@ -53,7 +53,7 @@ if [[ -z "${WANDB_API_KEY:-}" ]] && [[ -n "${_WANDB_API_KEY_INLINE}" ]]; then
 fi
 export WANDB_KEY="${WANDB_API_KEY:-}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
-export WANDB_DIR="${HOME}/wandb_offline"
+export WANDB_DIR="${HOME}/wandb_offline/qwen3b"
 mkdir -p "${WANDB_DIR}"
 
 # ===== 与 pure-GRPO 保持一致的超参 =====
@@ -77,7 +77,7 @@ python3 -m verl.trainer.main_ppo \
     data.train_files="$TRAIN_FILE" \
     data.val_files="$TEST_FILE" \
     data.train_batch_size=${TRAIN_BATCH_SIZE} \
-    data.max_prompt_length=1024 \
+    data.max_prompt_length=2048 \
     data.max_response_length=${MAX_RESP_LEN} \
     data.filter_overlong_prompts=False \
     data.truncation='error' \
@@ -125,7 +125,7 @@ python3 -m verl.trainer.main_ppo \
     +ray_kwargs.ray_init.log_to_driver=True \
     trainer.save_freq=20 \
     trainer.test_freq=2 \
-    trainer.total_epochs=1 \
+    trainer.total_epochs=10 \
     trainer.default_local_dir="${verl_dir}/checkpoints/${project_name}/${experiment_name}" \
     trainer.rollout_data_dir="${verl_dir}/rollout_data/${project_name}/${experiment_name}" \
     trainer.validation_data_dir="${verl_dir}/validation_data/${project_name}/${experiment_name}" \

@@ -6,20 +6,19 @@ export PYTHONUNBUFFERED=1
 export VLLM_USE_V1=0
 export VERL_LOGGING_LEVEL="${VERL_LOGGING_LEVEL:-INFO}"
 export VERL_DEBUG_LOG_PATH=/inspire/hdd/global_user/weilongxuan-253108120168
-export RAY_DEDUP_LOGS=0
 export NCCL_SHM_DISABLE=1
 export NCCL_DEBUG=INFO
 HOME=/inspire/hdd/global_user/weilongxuan-253108120168
-verl_dir=/inspire/qb-ilm2/project/neosmosis/weilongxuan-253108120168/verl_data
+verl_dir=/inspire/hdd/global_user/weilongxuan-253108120168/verl_data
 project_name=verl_grpo_tree_latest
-experiment_name=qwen2.5_math7b_treerollout_260708
+experiment_name=qwen2.5_math7b_treerollout_0807
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl0.6.0"}
 
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
 TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
 
 # Real-time log file: each line is written immediately; data is not lost if the job is killed
-LOG_DIR="${HOME}/verl_logs"
+LOG_DIR="${HOME}/logs"
 mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/train_$(date +%Y%m%d_%H%M%S).log"
 
@@ -80,7 +79,6 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
-    actor_rollout_ref.actor.ppo_micro_batch_segments=2 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
@@ -90,7 +88,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.tree_search.enable=True \
     actor_rollout_ref.rollout.tree_search.entropy_threshold=0.8 \
     actor_rollout_ref.rollout.tree_search.branching_factor=2 \
-    actor_rollout_ref.rollout.tree_search.max_tree_depth=3 \
+    actor_rollout_ref.rollout.tree_search.max_tree_depth=6 \
     actor_rollout_ref.rollout.tree_search.tau_importance=0.0 \
     actor_rollout_ref.rollout.tree_search.tree_process_reward=False \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
@@ -106,9 +104,8 @@ python3 -m verl.trainer.main_ppo \
     trainer.logger='["console","wandb","tensorboard"]' \
     trainer.project_name=${project_name} \
     trainer.experiment_name=${experiment_name} \
-    trainer.n_gpus_per_node=4 \
+    trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
-    +ray_kwargs.ray_init.log_to_driver=True \
     trainer.save_freq=20 \
     trainer.test_freq=2 \
     trainer.total_epochs=1 \
