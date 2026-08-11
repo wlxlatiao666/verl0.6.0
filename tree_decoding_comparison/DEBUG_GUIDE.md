@@ -10,16 +10,16 @@
 
 ```bash
 # 进入工作目录
-cd /Users/weilongxuan/codes/verl0.6.0/tree_decoding_comparison
+cd /Users/bytedance/codes/verl0.6.0/tree_decoding_comparison
 
 # 首先运行快速诊断脚本
-python test_vllm_quick.py --model-path /path/to/your/model
+python3 test_vllm_quick.py --model-path /path/to/your/model
 ```
 
 或者运行交互式版本：
 
 ```bash
-python test_vllm_simple.py
+python3 test_vllm_simple.py
 ```
 
 这会告诉你：
@@ -44,19 +44,18 @@ nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used,memory.total --form
 运行时加上 `PYTHONUNBUFFERED=1`：
 
 ```bash
-PYTHONUNBUFFERED=1 python tree_decoding_comparison.py --model-path /path/to/model --quick-test
+PYTHONUNBUFFERED=1 python3 tree_decoding_comparison.py --model-path /path/to/model --quick-test
 ```
 
 ### 第四步：使用 Quick Test 模式
 
 ```bash
 # 只跑 5 个样本，每个生成 256 tokens
-python tree_decoding_comparison.py --model-path /path/to/model --quick-test
+python3 tree_decoding_comparison.py --model-path /path/to/model --quick-test
 
 # 或者用 bash 脚本
-cd /Users/weilongxuan/codes/verl0.6.0
-tree_decoding_comparison/run_comparison.sh --model-path /path/to/model
-# (需要编辑 run_comparison.sh 添加 --quick-test)
+cd /Users/bytedance/codes/verl0.6.0
+tree_decoding_comparison/run_comparison.sh --model-path /path/to/model --quick-test
 ```
 
 ### 第五步：检查数据集路径
@@ -75,7 +74,7 @@ ls -lh ${RAY_DATA_HOME}/data/dapo-math-17k.parquet
 
 ```python
 import sys
-sys.path.insert(0, '/Users/weilongxuan/codes/vllm')
+sys.path.insert(0, '/Users/bytedance/codes/vllm')
 from vllm import LLM, SamplingParams
 import torch
 
@@ -138,13 +137,13 @@ print(outputs[0].outputs[0].text)
 **解决方案：**
 ```bash
 # 检查 vLLM 路径是否正确
-ls -la /Users/weilongxuan/codes/vllm
+ls -la /Users/bytedance/codes/vllm
 
 # 检查是否是 git repo
-cd /Users/weilongxuan/codes/vllm && git status
+cd /Users/bytedance/codes/vllm && git status
 
 # 检查 Python 版本兼容性
-python --version
+python3 --version
 ```
 
 ## 推荐测试流程
@@ -152,15 +151,15 @@ python --version
 ### 测试 1: 环境检查
 
 ```bash
-cd /Users/weilongxuan/codes/verl0.6.0/tree_decoding_comparison
-python test_vllm_quick.py --model-path /path/to/model --test-generation
+cd /Users/bytedance/codes/verl0.6.0/tree_decoding_comparison
+python3 test_vllm_quick.py --model-path /path/to/model --test-generation
 ```
 
 ### 测试 2: Quick Test 完整流程
 
 ```bash
-cd /Users/weilongxuan/codes/verl0.6.0
-python tree_decoding_comparison/tree_decoding_comparison.py \
+cd /Users/bytedance/codes/verl0.6.0
+python3 tree_decoding_comparison/tree_decoding_comparison.py \
     --model-path /path/to/model \
     --num-samples 5 \
     --max-tokens 128 \
@@ -178,13 +177,13 @@ python tree_decoding_comparison/tree_decoding_comparison.py \
 ```bash
 # 保存系统信息
 nvidia-smi > nvidia-smi.log
-python --version > python-version.log
+python3 --version > python-version.log
 
 # 保存环境变量
 env > env.log
 
 # 尝试运行并保存完整输出
-python -u tree_decoding_comparison.py --model-path /path/to/model --quick-test 2>&1 | tee debug.log
+python3 -u tree_decoding_comparison.py --model-path /path/to/model --quick-test 2>&1 | tee debug.log
 ```
 
 然后用这些日志文件来诊断问题。

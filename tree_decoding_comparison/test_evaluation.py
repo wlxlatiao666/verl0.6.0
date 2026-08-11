@@ -6,6 +6,7 @@ This verifies that the grading and pass@k calculation works correctly.
 This is a standalone version that doesn't import from the main script.
 """
 
+import math
 import sys
 from typing import List, Dict, Any, Optional
 
@@ -133,8 +134,7 @@ def evaluate_generations(generations: List[str], ground_truth: str) -> List[bool
 
 
 def compute_pass_at_k(results_per_example: List[List[bool]], k: int) -> float:
-    """
-    Compute pass@k.
+    """Compute order-invariant combinatorial pass@k.
 
     Args:
         results_per_example: List where each element is a list of booleans
@@ -144,19 +144,19 @@ def compute_pass_at_k(results_per_example: List[List[bool]], k: int) -> float:
     Returns:
         pass@k score
     """
-    total = 0
-    correct = 0
+    scores = []
 
     for results in results_per_example:
         if len(results) == 0:
             continue
-        total += 1
-        # Take first min(k, len(results)) results and see if any is correct
-        n = min(k, len(results))
-        if any(results[:n]):
-            correct += 1
+        n = len(results)
+        if k > n:
+            raise ValueError(f"pass@{k} requires at least {k} candidates")
+        c = sum(results)
+        miss = 0 if n - c < k else math.comb(n - c, k) / math.comb(n, k)
+        scores.append(1 - miss)
 
-    return correct / total if total > 0 else 0.0
+    return sum(scores) / len(scores) if scores else 0.0
 
 
 def compute_all_pass_k(results_per_example: List[List[bool]], max_k: int = 8) -> Dict[str, float]:
@@ -240,8 +240,8 @@ def test_grade_answer():
         ("42", "42", True),
         # Numerical match
         ("42.0", "42", True),
-        ("42.0001", "42", True),
-        ("41.9999", "42", True),
+        ("42.00009", "42", True),
+        ("41.99991", "42", True),
         ("43", "42", False),
         # String normalization
         ("  42  ", "42", True),
@@ -299,40 +299,16 @@ def test_pass_at_k():
     """Test pass@k calculation."""
     print("Testing compute_pass_at_k...")
 
-    # Simulate results for 10 examples, 5 generations each
-    results_per_example = [
-        [True, False, False, False, False],   # pass@1: yes
-        [False, True, False, False, False],   # pass@1: no, pass@2: yes
-        [False, False, True, False, False],   # pass@1,2: no, pass@3: yes
-        [False, False, False, True, False],   # pass@1-3: no, pass@4: yes
-        [False, False, False, False, True],   # pass@1-4: no, pass@5: yes
-        [True, True, True, True, True],       # all pass
-        [False, False, False, False, False],  # none pass
-        [True, False, True, False, True],     # some pass
-        [False, True, False, True, False],    # some pass
-        [True, True, False, False, False],    # some pass
-    ]
-
-    # Compute accurately
-    pass1 = sum(1 for r in results_per_example if any(r[:1])) / len(results_per_example)
-    pass2 = sum(1 for r in results_per_example if any(r[:2])) / len(results_per_example)
-    pass3 = sum(1 for r in results_per_example if any(r[:3])) / len(results_per_example)
-    pass4 = sum(1 for r in results_per_example if any(r[:4])) / len(results_per_example)
-    pass5 = sum(1 for r in results_per_example if any(r[:5])) / len(results_per_example)
-
-    all_pass_k = compute_all_pass_k(results_per_example, max_k=5)
-
-    print(f"  pass@1: {all_pass_k['pass@1']:.4f} (expected: {pass1:.4f})")
-    print(f"  pass@2: {all_pass_k['pass@2']:.4f} (expected: {pass2:.4f})")
-    print(f"  pass@3: {all_pass_k['pass@3']:.4f} (expected: {pass3:.4f})")
-    print(f"  pass@4: {all_pass_k['pass@4']:.4f} (expected: {pass4:.4f})")
-    print(f"  pass@5: {all_pass_k['pass@5']:.4f} (expected: {pass5:.4f})")
-
-    ok = (abs(all_pass_k['pass@1'] - pass1) < 1e-6 and
-          abs(all_pass_k['pass@2'] - pass2) < 1e-6 and
-          abs(all_pass_k['pass@3'] - pass3) < 1e-6 and
-          abs(all_pass_k['pass@4'] - pass4) < 1e-6 and
-          abs(all_pass_k['pass@5'] - pass5) < 1e-6)
+    first = [[True, False, False, False]]
+    last = [[False, False, False, True]]
+    expected = [0.25, 0.5, 0.75, 1.0]
+    first_scores = compute_all_pass_k(first, max_k=4)
+    last_scores = compute_all_pass_k(last, max_k=4)
+    ok = all(
+        abs(first_scores[f"pass@{k}"] - expected[k - 1]) < 1e-6
+        and abs(last_scores[f"pass@{k}"] - expected[k - 1]) < 1e-6
+        for k in range(1, 5)
+    )
 
     if ok:
         print("  ✓ PASS: pass@k calculations correct")
@@ -382,8 +358,8 @@ def run_all_tests():
     if all_passed:
         print("All tests passed! ✓")
     else:
-        print("Some tests failed, but the core functionality works!")
-        # Don't exit with error for now
+        print("Some tests failed!")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

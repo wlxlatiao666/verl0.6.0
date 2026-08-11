@@ -1,234 +1,312 @@
 #!/usr/bin/env python3
-"""
-Analyze and visualize results from Tree Decoding vs Base GRPO comparison.
-
-Usage:
-    python analyze_results.py --results-dir ./tree_decoding_results
-"""
+"""Analyze four-way tree-decoding comparison results (and legacy two-way runs)."""
 
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, Any
+from typing import Any, Dict, List
 
-import pandas as pd
 import numpy as np
+import pandas as pd
+
+
+METHOD_LABELS = {
+    "base_grpo": "Base GRPO",
+    "random_tree": "Random tree",
+    "entropy_only_tree": "Entropy-only tree",
+    "entropy_waad_tree": "Entropy+WAAD tree",
+    # Backward compatibility for schema_version=1 result directories.
+    "tree_decoding": "Tree decoding (legacy)",
+}
+SCHEMA_V2_METHODS = {
+    "base_grpo",
+    "random_tree",
+    "entropy_only_tree",
+    "entropy_waad_tree",
+}
 
 
 def load_results(results_dir: Path) -> Dict[str, Any]:
-    """Load results from directory."""
-    summary_file = results_dir / "results_summary.json"
-    generations_file = results_dir / "generations.json"
-
+    """Load all result artifacts present in a directory."""
     results = {}
-    if summary_file.exists():
-        with open(summary_file, 'r') as f:
-            results['summary'] = json.load(f)
-
-    if generations_file.exists():
-        with open(generations_file, 'r') as f:
-            results['generations'] = json.load(f)
-
+    for key, filename in (
+        ("summary", "results_summary.json"),
+        ("generations", "generations.json"),
+    ):
+        path = results_dir / filename
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as handle:
+                results[key] = json.load(handle)
     return results
 
 
-def print_detailed_summary(results: Dict[str, Any]):
-    """Print detailed summary of results."""
-    if 'summary' not in results:
+def available_methods(payload: Dict[str, Any]) -> List[str]:
+    """Return methods in stable display order."""
+    return [key for key in METHOD_LABELS if key in payload]
+
+
+def validate_summary_schema(summary: Dict[str, Any]) -> None:
+    """Reject incomplete v2 artifacts instead of plotting missing data as 0."""
+    if int(summary.get("schema_version", 1)) < 2:
+        return
+    missing_methods = SCHEMA_V2_METHODS - set(summary)
+    if missing_methods:
+        raise ValueError(
+            f"Schema v2 summary is missing methods: {sorted(missing_methods)}")
+    n = int(summary.get("config", {}).get("n", 0))
+    if n < 1:
+        raise ValueError("Schema v2 summary has an invalid candidate budget n.")
+    for method in SCHEMA_V2_METHODS:
+        pass_k = summary[method].get("pass_k", {})
+        missing_metrics = [
+            f"pass@{k}" for k in range(1, n + 1)
+            if f"pass@{k}" not in pass_k
+        ]
+        if missing_metrics:
+            raise ValueError(
+                f"Schema v2 method {method} is missing metrics: "
+                f"{missing_metrics}")
+
+
+def validate_generation_schema(generations: Dict[str, Any]) -> None:
+    """Ensure every v2 method contains one result row per example."""
+    if int(generations.get("schema_version", 1)) < 2:
+        return
+    missing_methods = SCHEMA_V2_METHODS - set(generations)
+    if missing_methods:
+        raise ValueError(
+            f"Schema v2 generations are missing methods: "
+            f"{sorted(missing_methods)}")
+    candidate_budget = int(generations.get("candidate_budget_n", 0))
+    if candidate_budget < 1:
+        raise ValueError(
+            "Schema v2 generations have an invalid candidate budget n.")
+    expected_rows = len(generations.get("examples", []))
+    for method in SCHEMA_V2_METHODS:
+        result_rows = generations[method].get("results", [])
+        candidate_rows = generations[method].get("generations", [])
+        metadata_rows = generations[method].get("candidate_metadata", [])
+        if not (
+            len(result_rows) == len(candidate_rows) == len(metadata_rows)
+            == expected_rows
+        ):
+            raise ValueError(
+                f"Schema v2 method {method} has inconsistent row counts: "
+                f"results={len(result_rows)}, candidates={len(candidate_rows)}, "
+                f"metadata={len(metadata_rows)}, examples={expected_rows}.")
+        for row_idx, (results, candidates, metadata) in enumerate(zip(
+                result_rows, candidate_rows, metadata_rows)):
+            source_count = len(metadata.get("candidate_sources", []))
+            total_count = int(metadata.get("total_count", -1))
+            if not (
+                len(results) == len(candidates) == source_count
+                == total_count == candidate_budget
+            ):
+                raise ValueError(
+                    f"Schema v2 method {method} row {row_idx} violates "
+                    f"candidate budget {candidate_budget}: results="
+                    f"{len(results)}, candidates={len(candidates)}, "
+                    f"sources={source_count}, total_count={total_count}.")
+
+
+def validate_artifact_pair(results: Dict[str, Any]) -> None:
+    """Reject schema-v2 summary/generation files from different runs."""
+    summary = results.get("summary")
+    generations = results.get("generations")
+    if not summary or not generations:
+        return
+    summary_version = int(summary.get("schema_version", 1))
+    generations_version = int(generations.get("schema_version", 1))
+    if summary_version < 2 and generations_version < 2:
+        return
+    if (summary_version < 2) != (generations_version < 2):
+        raise ValueError(
+            "results_summary.json and generations.json use incompatible "
+            f"schema versions: {summary_version} and {generations_version}.")
+
+    summary_run_id = summary.get("run_id")
+    generations_run_id = generations.get("run_id")
+    if not summary_run_id or not generations_run_id:
+        raise ValueError(
+            "Schema v2 artifacts must both contain a non-empty run_id.")
+    if summary_run_id != generations_run_id:
+        raise ValueError(
+            "results_summary.json and generations.json belong to different "
+            "experiment runs.")
+
+    summary_budget = int(summary.get("config", {}).get("n", 0))
+    generation_budget = int(generations.get("candidate_budget_n", 0))
+    if summary_budget != generation_budget:
+        raise ValueError(
+            "Summary and generation candidate budgets differ: "
+            f"{summary_budget} != {generation_budget}.")
+
+
+def print_detailed_summary(results: Dict[str, Any]) -> None:
+    """Print configuration, pass@k, timing, and budget composition."""
+    summary = results.get("summary")
+    if not summary:
         print("No summary found")
         return
+    validate_summary_schema(summary)
 
-    summary = results['summary']
-    base = summary['base_grpo']
-    tree = summary['tree_decoding']
-    config = summary['config']
+    methods = available_methods(summary)
+    if "base_grpo" not in methods:
+        raise ValueError("results_summary.json does not contain base_grpo.")
+    config = summary.get("config", {})
+    n = int(config.get("n", 8))
 
-    print("=" * 80)
+    print("=" * 100)
     print("TREE DECODING vs BASE GRPO - DETAILED ANALYSIS")
-    print("=" * 80)
+    print("=" * 100)
+    print(f"Pass@k definition: {summary.get('pass_at_k_definition', 'legacy prefix')}")
+    for key in (
+        "model", "num_samples", "n", "branching_factor", "max_tree_depth",
+        "min_seg_length", "random_branch_probability", "entropy_threshold",
+        "tau_importance", "temperature", "top_p", "top_k", "max_tokens",
+        "seed", "vllm_module",
+    ):
+        if key in config:
+            print(f"  {key}: {config[key]}")
 
-    print("\nCONFIGURATION")
-    print("-" * 40)
-    print(f"  Model:               {config.get('model', 'N/A')}")
-    print(f"  Number of samples:   {config.get('num_samples', 'N/A')}")
-    print(f"  Sequences per query: {config.get('n', 'N/A')}")
-    print(f"  Branching factor:    {config.get('branching_factor', 'N/A')}")
-    print(f"  Max tree depth:      {config.get('max_tree_depth', 'N/A')}")
-    print(f"  Entropy threshold:   {config.get('entropy_threshold', 'N/A')}")
-    print(f"  Temperature:         {config.get('temperature', 'N/A')}")
-    print(f"  Max tokens:          {config.get('max_tokens', 'N/A')}")
-
+    width = 23
     print("\nPASS@K COMPARISON")
-    print("-" * 40)
-
-    print(f"\n{'k':<4} {'Base GRPO':<12} {'Tree Decoding':<12} {'Abs Improv':<12} {'Rel Improv':<12}")
-    print("-" * 52)
-
-    n = config.get('n', 8)
-    base_pass_k = base.get('pass_k', {})
-    tree_pass_k = tree.get('pass_k', {})
-
-    best_k = None
-    best_improvement = -1
-
+    print(f"{'Metric':<12}" + "".join(
+        f"{METHOD_LABELS[key]:<{width}}" for key in methods))
+    print("-" * (12 + width * len(methods)))
     for k in range(1, n + 1):
-        base_score = base_pass_k.get(f'pass@{k}', 0)
-        tree_score = tree_pass_k.get(f'pass@{k}', 0)
-        abs_imp = tree_score - base_score
-        rel_imp = (abs_imp / base_score * 100) if base_score > 0 else 0
+        metric = f"pass@{k}"
+        print(f"{metric:<12}" + "".join(
+            f"{summary[key].get('pass_k', {}).get(metric, 0):<{width}.4f}"
+            for key in methods))
 
-        if abs_imp > best_improvement:
-            best_improvement = abs_imp
-            best_k = k
+    print("\nTIMING AND TREE/FILLER COMPOSITION")
+    base_time = float(summary["base_grpo"].get("time", 0))
+    for key in methods:
+        method = summary[key]
+        elapsed = float(method.get("time", 0))
+        budget = method.get("budget", {})
+        ratio = elapsed / base_time if base_time > 0 else float("nan")
+        print(
+            f"  {METHOD_LABELS[key]:<24} {elapsed:>10.2f}s "
+            f"({ratio:>6.2f}x base), mean leaves="
+            f"{budget.get('tree_leaf_count_mean', 0):.2f}, mean fillers="
+            f"{budget.get('filler_count_mean', 0):.2f}")
 
-        print(f"{k:<4} {base_score:<12.4f} {tree_score:<12.4f} {abs_imp:<+12.4f} {rel_imp:<+12.1f}%")
-
-    print("\nTIMING")
-    print("-" * 40)
-    base_time = base.get('time', 0)
-    tree_time = tree.get('time', 0)
-    print(f"  Base GRPO:     {base_time:.2f}s")
-    print(f"  Tree Decoding: {tree_time:.2f}s")
-    print(f"  Difference:    {tree_time - base_time:+.2f}s")
-    print(f"  Ratio:         {tree_time / base_time:.2f}x")
-
-    print("\nKEY FINDINGS")
-    print("-" * 40)
-    if best_k is not None:
-        print(f"  Best improvement at k={best_k}: +{best_improvement:.4f} (+{best_improvement/base_pass_k.get(f'pass@{best_k}',1)*100:.1f}%)")
-
-    # Check if tree is better across all k
-    all_better = all(tree_pass_k.get(f'pass@{k}', 0) > base_pass_k.get(f'pass@{k}', 0) for k in range(1, n + 1))
-    if all_better:
-        print("  Tree Decoding is better across all pass@k!")
-
-    # Average improvement
-    avg_abs_imp = np.mean([tree_pass_k.get(f'pass@{k}', 0) - base_pass_k.get(f'pass@{k}', 0) for k in range(1, n + 1)])
-    avg_rel_imp = np.mean([(tree_pass_k.get(f'pass@{k}', 0) - base_pass_k.get(f'pass@{k}', 0)) / base_pass_k.get(f'pass@{k}', 1) * 100 for k in range(1, n + 1)])
-    print(f"  Average absolute improvement: {avg_abs_imp:+.4f}")
-    print(f"  Average relative improvement: {avg_rel_imp:+.1f}%")
+    print("\nDELTA FROM BASE")
+    base_pass_k = summary["base_grpo"].get("pass_k", {})
+    for key in methods:
+        if key == "base_grpo":
+            continue
+        deltas = [
+            summary[key].get("pass_k", {}).get(f"pass@{k}", 0)
+            - base_pass_k.get(f"pass@{k}", 0)
+            for k in range(1, n + 1)
+        ]
+        best_k = int(np.argmax(deltas)) + 1
+        print(
+            f"  {METHOD_LABELS[key]:<24} mean={np.mean(deltas):+.4f}, "
+            f"best=pass@{best_k} {deltas[best_k - 1]:+.4f}")
 
 
-def analyze_generations(results: Dict[str, Any]):
-    """Analyze generation details."""
-    if 'generations' not in results:
+def analyze_generations(results: Dict[str, Any]) -> None:
+    """Compare each candidate pool with base without relying on list position."""
+    generations = results.get("generations")
+    if not generations or "base_grpo" not in generations:
+        return
+    validate_generation_schema(generations)
+
+    methods = available_methods(generations)
+    base_results = generations["base_grpo"].get("results", [])
+    if not base_results:
         return
 
-    gens = results['generations']
-    base_results = gens.get('base_grpo', {}).get('results', [])
-    tree_results = gens.get('tree_decoding', {}).get('results', [])
-    examples = gens.get('examples', [])
+    print("\nGENERATION-POOL ANALYSIS")
+    base_success = [any(row) for row in base_results]
+    for key in methods:
+        rows = generations[key].get("results", [])
+        if not rows:
+            continue
+        pool_success = [any(row) for row in rows]
+        candidate_accuracy = float(np.mean([
+            float(np.mean(row)) if row else 0.0 for row in rows
+        ]))
+        if key == "base_grpo":
+            print(
+                f"  {METHOD_LABELS[key]:<24} solved={sum(pool_success):>4}/"
+                f"{len(pool_success)}, candidate accuracy="
+                f"{candidate_accuracy:.4f}")
+            continue
 
-    if not base_results or not tree_results:
+        method_only = sum(
+            method_ok and not base_ok
+            for method_ok, base_ok in zip(pool_success, base_success))
+        base_only = sum(
+            base_ok and not method_ok
+            for method_ok, base_ok in zip(pool_success, base_success))
+        print(
+            f"  {METHOD_LABELS[key]:<24} solved={sum(pool_success):>4}/"
+            f"{len(pool_success)}, candidate accuracy={candidate_accuracy:.4f}, "
+            f"method-only={method_only}, base-only={base_only}")
+
+
+def create_comparison_table(
+    results: Dict[str, Any], output_dir: Path,
+) -> None:
+    """Write a detailed dynamic CSV and print a Markdown table."""
+    summary = results.get("summary")
+    if not summary:
         return
+    validate_summary_schema(summary)
+    methods = available_methods(summary)
+    config = summary.get("config", {})
+    n = int(config.get("n", 8))
 
-    print("\nGENERATION ANALYSIS")
-    print("-" * 40)
-
-    # Find problems where tree did better
-    tree_better = []
-    base_better = []
-    same = []
-
-    for idx, (base_res, tree_res, ex) in enumerate(zip(base_results, tree_results, examples)):
-        base_has_correct = any(base_res)
-        tree_has_correct = any(tree_res)
-
-        if tree_has_correct and not base_has_correct:
-            tree_better.append((idx, ex))
-        elif base_has_correct and not tree_has_correct:
-            base_better.append((idx, ex))
-        else:
-            same.append((idx, ex, base_has_correct))
-
-    print(f"  Problems where Tree succeeded but Base failed: {len(tree_better)}")
-    print(f"  Problems where Base succeeded but Tree failed: {len(base_better)}")
-    print(f"  Problems with same outcome:                  {len(same)}")
-
-    # Per-position correctness
-    print("\nPER-POSITION CORRECTNESS")
-    print("-" * 40)
-
-    n = len(base_results[0]) if base_results else 8
-
-    print(f"\n{'Position':<10} {'Base GRPO':<12} {'Tree Decoding':<12}")
-    print("-" * 34)
-
-    for pos in range(n):
-        base_correct = sum(1 for res in base_results if pos < len(res) and res[pos])
-        tree_correct = sum(1 for res in tree_results if pos < len(res) and res[pos])
-        base_rate = base_correct / len(base_results) if base_results else 0
-        tree_rate = tree_correct / len(tree_results) if tree_results else 0
-        print(f"{pos + 1:<10} {base_rate:<12.4f} {tree_rate:<12.4f}")
-
-
-def create_comparison_table(results: Dict[str, Any], output_dir: Path):
-    """Create detailed comparison tables."""
-    if 'summary' not in results:
-        return
-
-    summary = results['summary']
-    base = summary['base_grpo']
-    tree = summary['tree_decoding']
-    config = summary['config']
-
-    n = config.get('n', 8)
-
-    # Create DataFrame
     rows = []
     for k in range(1, n + 1):
-        base_score = base['pass_k'].get(f'pass@{k}', 0)
-        tree_score = tree['pass_k'].get(f'pass@{k}', 0)
-        rows.append({
-            'k': k,
-            'base_grpo': base_score,
-            'tree_decoding': tree_score,
-            'absolute_improvement': tree_score - base_score,
-            'relative_improvement': (tree_score - base_score) / base_score * 100 if base_score > 0 else 0,
-        })
+        metric = f"pass@{k}"
+        row = {"k": k}
+        for key in methods:
+            row[key] = summary[key].get("pass_k", {}).get(metric, 0)
+            if key != "base_grpo":
+                row[f"{key}_minus_base"] = row[key] - row["base_grpo"]
+        rows.append(row)
 
-    df = pd.DataFrame(rows)
-
-    # Save detailed CSV
+    dataframe = pd.DataFrame(rows)
     detailed_csv = output_dir / "results_detailed.csv"
-    df.to_csv(detailed_csv, index=False)
+    dataframe.to_csv(detailed_csv, index=False)
     print(f"\nSaved detailed results to: {detailed_csv}")
 
-    # Print markdown table
     print("\nMARKDOWN SUMMARY TABLE")
-    print("-" * 40)
-    print("\n| k | Base GRPO | Tree Decoding | Abs Improv | Rel Improv |")
-    print("|---|-----------|---------------|------------|------------|")
-    for _, row in df.iterrows():
-        print(f"| {row['k']} | {row['base_grpo']:.4f} | {row['tree_decoding']:.4f} | {row['absolute_improvement']:+.4f} | {row['relative_improvement']:+.1f}% |")
+    headers = ["k"] + [METHOD_LABELS[key] for key in methods]
+    print("| " + " | ".join(headers) + " |")
+    print("|" + "|".join(["---"] * len(headers)) + "|")
+    for row in rows:
+        values = [str(row["k"])] + [f"{row[key]:.4f}" for key in methods]
+        print("| " + " | ".join(values) + " |")
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Analyze Tree Decoding vs Base GRPO results"
-    )
+        description="Analyze Tree Decoding vs Base GRPO results")
     parser.add_argument(
         "--results-dir",
         type=str,
         default="./tree_decoding_results",
-        help="Directory with results"
+        help="Directory with results",
     )
     args = parser.parse_args()
 
     results_dir = Path(args.results_dir)
     if not results_dir.exists():
-        print(f"Results directory not found: {results_dir}")
-        return
+        raise FileNotFoundError(f"Results directory not found: {results_dir}")
 
     results = load_results(results_dir)
-
+    validate_artifact_pair(results)
     print_detailed_summary(results)
     analyze_generations(results)
     create_comparison_table(results, results_dir)
-
-    print("\n" + "=" * 80)
-    print("Analysis complete!")
-    print("=" * 80)
+    print("\nAnalysis complete!")
 
 
 if __name__ == "__main__":

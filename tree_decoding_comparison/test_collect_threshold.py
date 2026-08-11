@@ -5,7 +5,8 @@
 import sys
 import os
 from pathlib import Path
-sys.path.insert(0, '/Users/weilongxuan/codes/vllm')
+sys.path.insert(0, os.environ.get(
+    "VLLM_SOURCE_PATH", "/Users/bytedance/codes/vllm"))
 
 os.environ['PYTHONUNBUFFERED'] = '1'
 
@@ -34,6 +35,7 @@ try:
         gpu_memory_utilization=0.8,
         enforce_eager=True,
         max_model_len=4096,
+        enable_chunked_prefill=False,
     )
     print("✓ vLLM 初始化成功")
 except Exception as e:
@@ -89,24 +91,30 @@ try:
     print("✓ collect_threshold_stats 模式调用返回了！")
 
     print(f"\n4. 检查输出属性...")
+    entropy_count = 0
+    importance_count = 0
     for i, output in enumerate(outputs_collect):
         print(f"\n  Prompt {i}:")
         for j, o in enumerate(output.outputs):
             print(f"    [{j}] has entropy_list: {hasattr(o, 'entropy_list')}")
             if hasattr(o, 'entropy_list'):
+                entropy_count += len(o.entropy_list)
                 print(f"        entropy_list len: {len(o.entropy_list)}, first 3: {o.entropy_list[:3]}")
             print(f"    [{j}] has importance_list: {hasattr(o, 'importance_list')}")
             if hasattr(o, 'importance_list'):
                 lst = [x for x in o.importance_list if x is not None]
+                importance_count += len(lst)
                 print(f"        importance_list len: {len(lst)}, first 3: {lst[:3]}")
+    if entropy_count == 0 or importance_count == 0:
+        raise RuntimeError(
+            f"统计为空: entropy={entropy_count}, WAAD={importance_count}")
 
 except Exception as e:
     print(f"✗ collect_threshold_stats 模式失败: {e}")
     import traceback
     traceback.print_exc()
     print("\n" + "="*80)
-    print("建议: 暂时不要用 --auto-calibrate-thresholds")
-    print("使用默认的 entropy_threshold=1.0, tau_importance=0.0")
+    print("建议: 检查 custom vLLM 与 decode-only batching；不要用 tau=0 静默替代失败的 WAAD 标定")
     print("="*80)
     sys.exit(1)
 

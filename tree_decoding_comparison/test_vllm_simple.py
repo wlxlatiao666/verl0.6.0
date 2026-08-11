@@ -8,7 +8,8 @@ print(f"Python executable: {sys.executable}")
 print(f"Python version: {sys.version}")
 
 # Add vllm to path
-sys.path.insert(0, '/Users/weilongxuan/codes/vllm')
+sys.path.insert(0, os.environ.get(
+    "VLLM_SOURCE_PATH", "/Users/bytedance/codes/vllm"))
 print(f"sys.path: {sys.path[:5]}")
 
 print("\n" + "="*80)

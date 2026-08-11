@@ -9,7 +9,8 @@ import argparse
 os.environ['PYTHONUNBUFFERED'] = '1'
 
 # Add vllm to path
-sys.path.insert(0, '/Users/weilongxuan/codes/vllm')
+sys.path.insert(0, os.environ.get(
+    "VLLM_SOURCE_PATH", "/Users/bytedance/codes/vllm"))
 
 print("=" * 80)
 print("Tree Decoding - Quick Diagnostic Test")
