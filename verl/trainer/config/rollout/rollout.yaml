@@ -292,6 +292,10 @@ tree_search:
   # Tau for importance.
   tau_importance: 0.0
 
+  # Fill each prompt to branching_factor ** max_tree_depth responses with
+  # conventional samples. This fixed target is also used for PPO batch sizing.
+  topup_leaves_to_target: True
+
   # When True, collect all tree nodes (not just leaves) and compute process reward.
   # Non-leaf reward = mean(children rewards); advantage = node_reward - parent_reward.
   tree_process_reward: False

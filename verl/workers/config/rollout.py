@@ -101,6 +101,11 @@ class TreeSearchConfig(BaseConfig):
     branching_factor: int = 3
     max_tree_depth: int = 3
     tau_importance: float = 0.0
+    # Fill a partially expanded tree with conventional samples until every
+    # prompt has branching_factor ** max_tree_depth responses. Besides keeping
+    # the rollout group size fixed, this also defines the effective rollout
+    # multiplicity used to normalize PPO mini-batches.
+    topup_leaves_to_target: bool = True
     # When True, collect all tree nodes (not just leaves) and compute
     # process reward: non-leaf reward = mean(children rewards),
     # advantage = node_reward - parent_reward (root advantage = 0).

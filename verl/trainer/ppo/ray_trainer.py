@@ -61,6 +61,7 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
+from verl.utils.tree_training import get_ppo_rollout_batch_multiplier, is_tree_process_reward_enabled
 
 
 @dataclass
@@ -1372,13 +1373,48 @@ class RayPPOTrainer:
                             batch.batch["reward_baselines"] = reward_baseline_tensor
 
                             del gen_baseline_batch, gen_baseline_output
+                    # A fixed-size tree batch must keep the response
+                    # multiplicity used by FSDP's PPO mini-batch normalization,
+                    # including when the data came from skip_rollout cache.
+                    _tree_rollout_enabled = bool(
+                        _tree_cfg is not None and _tree_cfg.get("enable", False)
+                    )
+                    _fixed_tree_rollout = bool(
+                        _tree_rollout_enabled and _tree_cfg.get("topup_leaves_to_target", True)
+                    )
+                    _expected_tree_leaves = (
+                        get_ppo_rollout_batch_multiplier(self.config.actor_rollout_ref.rollout)
+                        if _fixed_tree_rollout
+                        else None
+                    )
+
                     # repeat to align with repeated responses in rollout
                     if "tree_prompt_indices" in gen_batch_output.non_tensor_batch:
+                        if not _tree_rollout_enabled:
+                            raise RuntimeError(
+                                "Conventional rollout config received tree routing metadata. Regenerate an "
+                                "incompatible skip_rollout cache."
+                            )
+                        missing_routing_fields = [
+                            key
+                            for key in ("tree_num_leaves", "tree_num_prompts")
+                            if key not in gen_batch_output.non_tensor_batch
+                        ]
+                        if missing_routing_fields:
+                            raise RuntimeError(
+                                "Tree rollout/cache is missing routing fields "
+                                f"{missing_routing_fields}. Regenerate the cache."
+                            )
                         # Tree search: each prompt may have a variable number of leaf responses.
                         # Reconstruct global prompt indices from per-worker local indices.
                         local_idx = gen_batch_output.non_tensor_batch["tree_prompt_indices"].astype(int)
                         num_leaves = gen_batch_output.non_tensor_batch["tree_num_leaves"].astype(int)
                         num_prompts = gen_batch_output.non_tensor_batch["tree_num_prompts"].astype(int)
+                        if not (len(local_idx) == len(num_leaves) == len(num_prompts)):
+                            raise RuntimeError(
+                                "Tree routing metadata must have one entry per response, got "
+                                f"indices={len(local_idx)}, leaves={len(num_leaves)}, prompts={len(num_prompts)}."
+                            )
                         global_idx = np.empty_like(local_idx)
                         prompt_offset = 0
                         i = 0
@@ -1386,13 +1422,85 @@ class RayPPOTrainer:
                             # Each worker chunk has the same num_leaves value repeated
                             chunk_leaves = int(num_leaves[i])
                             chunk_prompts = int(num_prompts[i])
+                            if chunk_leaves < 1 or chunk_prompts < 1 or i + chunk_leaves > len(local_idx):
+                                raise RuntimeError(
+                                    "Invalid tree routing chunk: "
+                                    f"start={i}, leaves={chunk_leaves}, prompts={chunk_prompts}, "
+                                    f"total_responses={len(local_idx)}."
+                                )
+                            chunk_slice = slice(i, i + chunk_leaves)
+                            if not np.all(num_leaves[chunk_slice] == chunk_leaves) or not np.all(
+                                num_prompts[chunk_slice] == chunk_prompts
+                            ):
+                                raise RuntimeError("Tree routing metadata changed within a worker output chunk.")
+                            chunk_prompt_indices = local_idx[chunk_slice]
+                            if np.any(chunk_prompt_indices < 0) or np.any(chunk_prompt_indices >= chunk_prompts):
+                                raise RuntimeError(
+                                    "Tree routing contains a prompt index outside its worker-local prompt range."
+                                )
+                            if _expected_tree_leaves is not None:
+                                leaves_per_prompt = np.bincount(
+                                    chunk_prompt_indices,
+                                    minlength=chunk_prompts,
+                                )
+                                if np.any(leaves_per_prompt != _expected_tree_leaves):
+                                    raise RuntimeError(
+                                        "Fixed tree rollout/cache does not match PPO batch sizing: expected "
+                                        f"{_expected_tree_leaves} leaves per prompt, got "
+                                        f"{leaves_per_prompt.tolist()}. Regenerate the rollout cache."
+                                    )
                             for j in range(i, i + chunk_leaves):
                                 global_idx[j] = local_idx[j] + prompt_offset
                             prompt_offset += chunk_prompts
                             i += chunk_leaves
+                        if prompt_offset != len(batch):
+                            raise RuntimeError(
+                                "Tree rollout/cache prompt count does not match the current training batch: "
+                                f"routing_prompts={prompt_offset}, batch_prompts={len(batch)}. Regenerate the cache."
+                            )
                         batch = batch[global_idx]
                     else:
+                        if _tree_rollout_enabled:
+                            raise RuntimeError(
+                                "Tree rollout requires tree routing metadata. Regenerate an incompatible "
+                                "skip_rollout cache instead of training with the wrong response multiplicity."
+                            )
                         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+
+                    # Process-reward fields form one data contract.  This also
+                    # protects skip-rollout caches from being consumed under a
+                    # different tree mode: plain treerollout must not inherit
+                    # process advantages, and treepr must not silently fall
+                    # back to ordinary GRPO.
+                    _tree_process_reward_enabled = is_tree_process_reward_enabled(_tree_cfg)
+                    _process_non_tensor_keys = (
+                        "unique_segments",
+                        "leaf_segment_indices",
+                        "worker_segments_offsets",
+                        "worker_leaves_offsets",
+                    )
+                    if _tree_process_reward_enabled:
+                        missing_process_fields = []
+                        if "token_share_weights" not in gen_batch_output.batch.keys():
+                            missing_process_fields.append("token_share_weights")
+                        for key in ("unique_segments", "leaf_segment_indices"):
+                            if key not in gen_batch_output.non_tensor_batch:
+                                missing_process_fields.append(key)
+                        if missing_process_fields:
+                            raise RuntimeError(
+                                "tree_process_reward=True requires a matching tree-process rollout, but fields "
+                                f"{missing_process_fields} are missing. Regenerate the rollout instead of reusing "
+                                "an incompatible skip_rollout cache."
+                            )
+                    else:
+                        if "token_share_weights" in gen_batch_output.batch.keys():
+                            gen_batch_output.batch.pop("token_share_weights")
+                        for key in _process_non_tensor_keys:
+                            gen_batch_output.non_tensor_batch.pop(key, None)
+                        rollout_metrics = gen_batch_output.meta_info.get("metrics", {})
+                        if isinstance(rollout_metrics, dict):
+                            for key in ("unique_segments", "leaf_segment_indices"):
+                                rollout_metrics.pop(key, None)
                     batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
@@ -1524,7 +1632,7 @@ class RayPPOTrainer:
 
                         has_unique_segments = "unique_segments" in batch.non_tensor_batch or \
                                               "unique_segments" in batch.meta_info.get("metrics", {})
-                        if has_unique_segments:
+                        if _tree_process_reward_enabled and has_unique_segments:
                             proc_agg_mode = self.config.algorithm.get("proc_agg_mode", "raw")
                             local_adv_weight = self.config.algorithm.get("local_adv_weight", 0.5)
                             global_adv_weight = self.config.algorithm.get("global_adv_weight", 0.5)

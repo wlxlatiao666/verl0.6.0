@@ -18,12 +18,12 @@ Single Process Actor
 """
 
 import logging
+import math
 import os
 import random
 
 import numpy as np
 import torch
-import math
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.tensor import DTensor
@@ -40,6 +40,7 @@ from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
 from verl.utils.torch_functional import logprobs_from_logits
+from verl.utils.tree_training import build_optimizer_micro_batches
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
@@ -453,7 +454,7 @@ class DataParallelPPOActor(BasePPOActor):
         if "rollout_is_weights" in data.batch.keys():
             select_keys.append("rollout_is_weights")
 
-        # Include tree-rollout inverse-sharing weights if present (added by vLLM tree rollout).
+        # Include tree-process-reward inverse-sharing weights if present.
         if "token_share_weights" in data.batch.keys():
             select_keys.append("token_share_weights")
 
@@ -576,6 +577,8 @@ class DataParallelPPOActor(BasePPOActor):
 
         on_policy = False
         metrics = {}
+        optimizer_step_count = 0
+        expected_optimizer_step_count = None
 
         rank = dist.get_rank() if dist.is_initialized() else 0
         world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -602,20 +605,45 @@ class DataParallelPPOActor(BasePPOActor):
                 else:
                     ppo_micro_batch_segments = max(8, num_assigned_segments // 10)
 
-            # Determine gradient accumulation: how many micro-batches per optimizer step
-            # This should match the leaf-based strategy logic
-            if self.config.ppo_micro_batch_size_per_gpu is not None and self.config.ppo_mini_batch_size is not None:
-                self.gradient_accumulation = max(1, self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu)
-            else:
-                self.gradient_accumulation = 1
+            # Match the number of logical optimizer updates used by the normal
+            # leaf path. After FSDP normalization, ppo_mini_batch_size is the
+            # per-rank number of responses in one base-GRPO optimizer update.
+            local_target_optimizer_steps = max(
+                1, math.ceil(local_batch_size / self.config.ppo_mini_batch_size)
+            )
+            target_optimizer_steps = local_target_optimizer_steps
+            segment_counts = [num_assigned_segments]
+            if dist.is_initialized() and world_size > 1:
+                batching_state = torch.tensor(
+                    [local_target_optimizer_steps, num_assigned_segments],
+                    dtype=torch.int64,
+                    device=get_device_id(),
+                )
+                gathered_states = [torch.zeros_like(batching_state) for _ in range(world_size)]
+                dist.all_gather(gathered_states, batching_state)
+                target_optimizer_steps = max(int(state[0].item()) for state in gathered_states)
+                segment_counts = [int(state[1].item()) for state in gathered_states]
 
-            # Estimate actual number of micro-batches for validation
+            if min(segment_counts) < target_optimizer_steps:
+                raise ValueError(
+                    "tree segment batching needs at least one segment per rank and optimizer step, "
+                    f"got segment_counts={segment_counts}, steps={target_optimizer_steps}"
+                )
+            expected_optimizer_step_count = target_optimizer_steps * self.config.ppo_epochs
+
             est_micro_batches = max(1, math.ceil(num_assigned_segments / ppo_micro_batch_segments))
-            print(f"[DEBUG] [tree_segment] Worker {rank}: ppo_micro_batch_segments={ppo_micro_batch_segments}, "
-                  f"gradient_accumulation={self.gradient_accumulation}, est_micro_batches={est_micro_batches}, "
-                  f"MATCH={self.gradient_accumulation == est_micro_batches}")
+            print(
+                f"[DEBUG] [tree_segment] Worker {rank}: "
+                f"ppo_micro_batch_segments={ppo_micro_batch_segments}, "
+                f"target_optimizer_steps={target_optimizer_steps}, "
+                f"est_micro_batches={est_micro_batches}"
+            )
 
-            on_policy = num_assigned_segments <= ppo_micro_batch_segments and self.config.ppo_epochs == 1
+            on_policy = (
+                target_optimizer_steps == 1
+                and num_assigned_segments <= ppo_micro_batch_segments
+                and self.config.ppo_epochs == 1
+            )
 
             for epoch in range(self.config.ppo_epochs):
                 print(f"[DEBUG] [tree_segment] Worker {rank}: epoch {epoch+1}/{self.config.ppo_epochs}")
@@ -624,37 +652,72 @@ class DataParallelPPOActor(BasePPOActor):
                 random.shuffle(segment_indices)
                 print(f"[DEBUG] [tree_segment] Worker {rank}: shuffled {len(segment_indices)} segments")
 
-                # Split into micro-batches (we use gradient accumulation for multiple micro-batches per step)
-                segment_micro_batches = [
-                    segment_indices[i:i+ppo_micro_batch_segments]
-                    for i in range(0, len(segment_indices), ppo_micro_batch_segments)
-                ]
-                num_micro_batches = len(segment_micro_batches)
-                # CRITICAL FIX: gradient accumulation must match actual number of segment micro-batches,
-                # not the leaf-based estimate. Otherwise loss_scale_factor is wrong and grad_norm explodes.
-                self.gradient_accumulation = num_micro_batches
-                print(f"[DEBUG] [tree_segment] Worker {rank}: split into {num_micro_batches} micro-batches, "
-                      f"gradient_accumulation corrected to {self.gradient_accumulation}")
-
-                # === ALIGN MICRO-BATCH COUNT ACROSS ALL WORKERS ===
-                # Gather micro-batch counts from all workers and find the maximum
-                max_micro_batches = num_micro_batches
+                # First form the same number of optimizer groups as base GRPO,
+                # then split every group into segment micro-batches. Counts are
+                # padded independently per optimizer group so all FSDP ranks
+                # cross the optimizer-step boundary at exactly the same time.
+                local_optimizer_micro_batches = build_optimizer_micro_batches(
+                    segment_indices,
+                    num_optimizer_steps=target_optimizer_steps,
+                    micro_batch_size=ppo_micro_batch_segments,
+                )
+                local_micro_counts = [len(group) for group in local_optimizer_micro_batches]
+                max_micro_counts = local_micro_counts.copy()
                 if dist.is_initialized() and world_size > 1:
-                    # Create tensor to hold local count
-                    count_tensor = torch.tensor([num_micro_batches], dtype=torch.int64, device=get_device_id())
-                    # Gather counts from all workers
-                    gathered_counts = [torch.tensor([0], dtype=torch.int64, device=get_device_id()) for _ in range(world_size)]
+                    count_tensor = torch.tensor(local_micro_counts, dtype=torch.int64, device=get_device_id())
+                    gathered_counts = [torch.zeros_like(count_tensor) for _ in range(world_size)]
                     dist.all_gather(gathered_counts, count_tensor)
-                    # Find maximum count
-                    max_micro_batches = max([cnt.item() for cnt in gathered_counts])
-                    print(f"[DEBUG] [tree_segment] Worker {rank}: local={num_micro_batches}, max={max_micro_batches} micro-batches across {world_size} workers")
+                    max_micro_counts = [
+                        max(int(rank_counts[group_idx].item()) for rank_counts in gathered_counts)
+                        for group_idx in range(target_optimizer_steps)
+                    ]
 
-                # Zero grad at the start of each mini-batch cycle
-                self.actor_optimizer.zero_grad()
+                segment_micro_batches: list[list[int] | None] = []
+                optimizer_step_ends = []
+                for group_idx, local_micro_batches in enumerate(local_optimizer_micro_batches):
+                    segment_micro_batches.extend(local_micro_batches)
+                    segment_micro_batches.extend(
+                        [None] * (max_micro_counts[group_idx] - len(local_micro_batches))
+                    )
+                    optimizer_step_ends.append(len(segment_micro_batches))
 
-                # Process both real and dummy micro-batches up to max_micro_batches
-                for m in range(max_micro_batches):
-                    is_dummy = m >= num_micro_batches
+                num_micro_batches = sum(local_micro_counts)
+                max_micro_batches = len(segment_micro_batches)
+                fallback_seg_indices = local_optimizer_micro_batches[0][0]
+                print(
+                    f"[DEBUG] [tree_segment] Worker {rank}: "
+                    f"local_micro_counts={local_micro_counts}, "
+                    f"max_micro_counts={max_micro_counts}, "
+                    f"scheduled_micro_batches={max_micro_batches}"
+                )
+
+                optimizer_group_idx = 0
+                optimizer_step_starts = [0, *optimizer_step_ends[:-1]]
+
+                def _finish_segment_optimizer_group(micro_batch_idx: int):
+                    nonlocal optimizer_group_idx, optimizer_step_count
+                    if micro_batch_idx + 1 != optimizer_step_ends[optimizer_group_idx]:
+                        return
+                    grad_norm = self._optimizer_step()
+                    optimizer_step_count += 1
+                    print(
+                        f"[DEBUG] [tree_segment] Worker {rank}: optimizer step "
+                        f"{optimizer_group_idx + 1}/{target_optimizer_steps} done, "
+                        f"grad_norm={grad_norm.detach().item():.6f}"
+                    )
+                    append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
+                    optimizer_group_idx += 1
+
+                # Process real and dummy micro-batches. Each optimizer group
+                # has its own zero_grad/gradient accumulation/optimizer step.
+                for m, scheduled_seg_indices in enumerate(segment_micro_batches):
+                    if m == optimizer_step_starts[optimizer_group_idx]:
+                        self.actor_optimizer.zero_grad()
+                        # Preserve the previous per-rank mean-loss semantics;
+                        # padded dummy micro-batches synchronize FSDP only and
+                        # must not dilute this rank's real segment gradients.
+                        self.gradient_accumulation = local_micro_counts[optimizer_group_idx]
+                    is_dummy = scheduled_seg_indices is None
 
                     if is_dummy:
                         # === DUMMY MICRO-BATCH: NO GRADIENT UPDATE ===
@@ -663,7 +726,7 @@ class DataParallelPPOActor(BasePPOActor):
                         print(f"[DEBUG] [tree_segment] Worker {rank}: micro-batch {m} (dummy, no gradient update)")
                         if num_micro_batches > 0 and local_batch_size > 0:
                             # Reuse the first batch's data for dummy computation
-                            first_seg_indices = segment_micro_batches[0]
+                            first_seg_indices = fallback_seg_indices
                             first_seg_canonical = local_tree_seg_targets["seg_canonical"]
                             first_required_leaves = list({first_seg_canonical[i][0] for i in first_seg_indices})
                             mini_batch = data[first_required_leaves]
@@ -753,12 +816,13 @@ class DataParallelPPOActor(BasePPOActor):
                             micro_batch_metrics["actor/kl_loss"] = 0.0
                             micro_batch_metrics["actor/kl_coef"] = 0.0
                         append_to_dict(metrics, micro_batch_metrics)
+                        _finish_segment_optimizer_group(m)
                         continue
 
                     # === REAL MICRO-BATCH ===
-                    seg_indices = segment_micro_batches[m]
+                    seg_indices = scheduled_seg_indices
                     if not seg_indices:
-                        continue
+                        raise RuntimeError("real segment micro-batches must be non-empty")
 
                     # Collect all required leaves for these segments
                     seg_canonical = local_tree_seg_targets["seg_canonical"]
@@ -877,18 +941,20 @@ class DataParallelPPOActor(BasePPOActor):
                         }
                     )
                     append_to_dict(metrics, micro_batch_metrics)
+                    _finish_segment_optimizer_group(m)
 
-                # Optimizer step after gradient accumulation
-                grad_norm = self._optimizer_step()
-                print(f"[DEBUG] [tree_segment] Worker {rank}: optimizer step done, grad_norm={grad_norm.detach().item():.6f}")
-                mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
-                append_to_dict(metrics, mini_batch_metrics)
+                if optimizer_group_idx != target_optimizer_steps:
+                    raise RuntimeError(
+                        f"expected {target_optimizer_steps} tree-segment optimizer steps, "
+                        f"completed {optimizer_group_idx}"
+                    )
 
         else:
             # === ORIGINAL LEAF-BASED BATCHING STRATEGY ===
             # Split to make minibatch iterator for updating the actor
             # See PPO paper for details. https://arxiv.org/abs/1707.06347
             mini_batches = data.split(self.config.ppo_mini_batch_size)
+            expected_optimizer_step_count = len(mini_batches) * self.config.ppo_epochs
 
             # Track local leaf index ranges for each mini_batch (to correctly map segments to micro_batches)
             mini_batch_ranges = []
@@ -1024,7 +1090,7 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_agg_mode = self.config.loss_agg_mode
 
                         # ------------------------------
-                        # Apply token-level inverse-sharing weight (tree-rollout only).
+                        # Apply token-level inverse-sharing weight (tree process reward only).
                         # token_share_weights[t] = 1 / descendant_count(node_that_owns_token_t).
                         # Multiplying into advantages is mathematically equivalent to multiplying
                         # the final per-token pg_loss by the same weight; we do it here so we don't
@@ -1241,8 +1307,20 @@ class DataParallelPPOActor(BasePPOActor):
                         append_to_dict(metrics, micro_batch_metrics)
 
                     grad_norm = self._optimizer_step()
+                    optimizer_step_count += 1
                     mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                     append_to_dict(metrics, mini_batch_metrics)
 
+        if optimizer_step_count != expected_optimizer_step_count:
+            raise RuntimeError(
+                f"optimizer step mismatch: expected {expected_optimizer_step_count}, got {optimizer_step_count}"
+            )
+        append_to_dict(
+            metrics,
+            {
+                "actor/optimizer_steps": optimizer_step_count,
+                "actor/local_ppo_mini_batch_size": self.config.ppo_mini_batch_size,
+            },
+        )
         self.actor_optimizer.zero_grad()
         return metrics

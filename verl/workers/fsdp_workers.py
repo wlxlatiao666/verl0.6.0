@@ -85,6 +85,7 @@ from verl.utils.model import compute_position_id_with_mask, convert_weight_keys
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage, simple_timer
 from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
 from verl.utils.py_functional import convert_to_regular_types
+from verl.utils.tree_training import get_ppo_rollout_batch_multiplier
 from verl.workers.config import FSDPCriticConfig, FSDPEngineConfig, HFModelConfig, RolloutConfig
 from verl.workers.rollout import get_rollout_class
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
@@ -231,8 +232,22 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # normalize config
         if self._is_actor:
-            self.config.actor.ppo_mini_batch_size *= self.config.rollout.n
-            self.config.actor.ppo_mini_batch_size //= self.device_mesh.size() // self.ulysses_sequence_parallel_size
+            ppo_rollout_multiplier = get_ppo_rollout_batch_multiplier(self.config.rollout)
+            logger.info(
+                "Normalizing actor PPO mini-batch with response multiplier=%s "
+                "(configured rollout.n=%s)",
+                ppo_rollout_multiplier,
+                self.config.rollout.n,
+            )
+            dp_size = self.device_mesh.size() // self.ulysses_sequence_parallel_size
+            expanded_mini_batch_size = self.config.actor.ppo_mini_batch_size * ppo_rollout_multiplier
+            if expanded_mini_batch_size % dp_size != 0:
+                raise ValueError(
+                    "Expanded PPO mini-batch must be divisible by the actor data-parallel size: "
+                    f"{self.config.actor.ppo_mini_batch_size} * {ppo_rollout_multiplier} "
+                    f"is not divisible by {dp_size}"
+                )
+            self.config.actor.ppo_mini_batch_size = expanded_mini_batch_size // dp_size
             assert self.config.actor.ppo_mini_batch_size > 0, (
                 f"ppo_mini_batch_size {self.config.actor.ppo_mini_batch_size} should be larger than 0 after "
                 f"normalization"
