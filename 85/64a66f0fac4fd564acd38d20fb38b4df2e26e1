@@ -1,0 +1,35 @@
+tests/utils/test_tree_training_on_cpu.py
+  s_c6f365a0ea9470::t_cdee5028c5e580 1-134
+tree/run_qwen2.5-math7b-treepr.sh
+  s_c6f365a0ea9470::t_e204025d2898e0 92
+tree/run_qwen2.5-math7b-treerollout.sh
+  s_c6f365a0ea9470::t_914babe3c12cc8 92
+tree/run_qwen2.5-math7b-treesr.sh
+  s_c6f365a0ea9470::t_37f6d34e2ed82c 96
+verl/trainer/config/rollout/rollout.yaml
+  s_c6f365a0ea9470::t_5e56d2d395fac2 295-298
+verl/utils/tree_training.py
+  s_c6f365a0ea9470::t_d2f511dc2647be 1-95
+verl/workers/config/rollout.py
+  s_c6f365a0ea9470::t_2d4b408a01dada 104-108
+verl/workers/fsdp_workers.py
+  s_c6f365a0ea9470::t_024edd12769b78 88,235-250
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8564a66f0fac4fd564acd38d20fb38b4df2e26e1",
+  "prompts": {},
+  "sessions": {
+    "s_c6f365a0ea9470": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019feed2-40b1-7442-a127-142d7e3c9f99",
+        "model": "unknown"
+      },
+      "human_author": "weilongxuan <weilongxuan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
