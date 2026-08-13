@@ -1,0 +1,21 @@
+TREE_DECODING_VERL_VLLM_IMPLEMENTATION.md
+  s_c6f365a0ea9470::t_eb2b5a4701154d 1-755
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d68a31781482426282ea798600c9db81e1a989b8",
+  "prompts": {},
+  "sessions": {
+    "s_c6f365a0ea9470": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019feed2-40b1-7442-a127-142d7e3c9f99",
+        "model": "unknown"
+      },
+      "human_author": "weilongxuan <weilongxuan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
