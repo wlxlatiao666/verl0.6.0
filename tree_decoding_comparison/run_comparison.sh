@@ -8,7 +8,7 @@ export VLLM_USE_V1=0
 TREE_DECODING_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 USER_WORK_ROOT="${USER_WORK_ROOT:-/inspire/hdd/global_user/weilongxuan-253108120168}"
 RAY_DATA_HOME="${RAY_DATA_HOME:-${USER_WORK_ROOT}/verl0.6.0}"
-VLLM_SOURCE_PATH="${VLLM_SOURCE_PATH:-/Users/bytedance/codes/vllm}"
+VLLM_SOURCE_PATH="${VLLM_SOURCE_PATH:-/inspire/hdd/global_user/weilongxuan-253108120168/vllm}"
 export RAY_DATA_HOME VLLM_SOURCE_PATH
 
 MODEL_PATH=/inspire/hdd/global_public/public_models/Qwen/Qwen2.5-Math-7B

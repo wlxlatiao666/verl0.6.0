@@ -11,7 +11,7 @@ export NCCL_DEBUG=INFO
 HOME=/inspire/hdd/global_user/weilongxuan-253108120168
 verl_dir=/inspire/hdd/global_user/weilongxuan-253108120168/verl_data
 project_name=verl_grpo_tree_latest
-experiment_name=qwen2.5_math7b_tree_pr_waad_leaf_share_new
+experiment_name=qwen2.5_math7b_tree_pr_0811
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl0.6.0"}
 
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
