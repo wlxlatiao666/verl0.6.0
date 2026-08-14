@@ -1,0 +1,23 @@
+verl/trainer/config/actor/actor.yaml
+  s_c6f365a0ea9470::t_2f148baa8c110c 80-83
+verl/workers/config/actor.py
+  s_c6f365a0ea9470::t_9085d96dac1d07 96,154-155
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5396012ca3ad400b05cd0e9f41a7e9279a014304",
+  "prompts": {},
+  "sessions": {
+    "s_c6f365a0ea9470": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019feed2-40b1-7442-a127-142d7e3c9f99",
+        "model": "unknown"
+      },
+      "human_author": "weilongxuan <weilongxuan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
