@@ -77,6 +77,10 @@ tree_segment_batch_strategy: leaf
 # Number of segments per micro batch when using segment batching
 ppo_micro_batch_segments: null
 
+# Print one sampled tree-process PG-loss diagnostic every N actor updates.
+# Only rank 0 prints; 0 disables the diagnostic.
+tree_process_loss_log_interval: 10
+
 # Entropy regularization coefficient in PPO loss
 entropy_coeff: 0
 

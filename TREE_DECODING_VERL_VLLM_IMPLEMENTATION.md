@@ -498,6 +498,13 @@ tree/expansion_ratio
 - 将 W&B、TensorBoard、`VERL_LOGGING_LEVEL`、`VLLM_USE_V1` 等环境变量传入 Ray workers；
 - W&B adapter 支持从环境变量显式 login；
 - controller/actor/rollout 中加入了大量带时间戳和 rank 的 debug 输出；
+- `actor.tree_process_loss_log_interval` 默认是 10。仅当 actor 收到
+  `tree_process_reward=True` 对应的完整 process 数据时，rank 0 会在第一个、随后每第 N 个
+  actor update 抽样打印一行 `[TREE_PROCESS_LOSS]`。TreePR 输出 sequence 的 process PG loss、
+  inverse-sharing 后的 effective PG loss，以及按 token 位置压缩的 `advantage_runs`；TreeSR
+  输出 standalone segment PG loss、canonical sequence/offset 和 `advantage_runs`。RLE 使用
+  包含首尾的位置区间，最多展示 16 段，超出部分会折叠；单条样本值仅作 token-mean 诊断。
+  设为 0 可关闭；
 - scripts 支持 console、W&B offline 和 TensorBoard。
 
 #### Reward/eval

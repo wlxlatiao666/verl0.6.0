@@ -92,6 +92,174 @@ class DataParallelPPOActor(BasePPOActor):
         # Initialize gradient accumulation attribute for safety
         self.gradient_accumulation = 1
 
+        # Counts only actor updates that carry the tree-process data contract.
+        # This keeps the sparse diagnostic cadence independent of validation or
+        # conventional GRPO updates.
+        self._tree_process_update_count = 0
+
+    @staticmethod
+    def _sample_pg_loss(
+        policy_loss_fn,
+        old_log_prob: torch.Tensor,
+        log_prob: torch.Tensor,
+        advantages: torch.Tensor,
+        response_mask: torch.Tensor,
+        config: ActorConfig,
+        rollout_is_weights: torch.Tensor | None = None,
+    ) -> float:
+        """Return one item's token-mean PG loss without extending autograd state."""
+        rng_devices = [] if log_prob.device.index is None else [log_prob.device.index]
+        # Some optional policy losses sample internally (for example clip_cov).
+        # Isolate that RNG use so this rank-only diagnostic cannot change the
+        # subsequent distributed training trajectory.
+        with torch.no_grad(), torch.random.fork_rng(
+            devices=rng_devices, device_type=log_prob.device.type
+        ):
+            pg_loss, _, _, _ = policy_loss_fn(
+                old_log_prob=old_log_prob.detach(),
+                log_prob=log_prob.detach(),
+                advantages=advantages.detach(),
+                response_mask=response_mask.detach(),
+                loss_agg_mode="seq-mean-token-mean",
+                config=config,
+                rollout_is_weights=(
+                    rollout_is_weights.detach() if rollout_is_weights is not None else None
+                ),
+            )
+        return float(pg_loss.item())
+
+    @staticmethod
+    def _format_advantage_runs(
+        advantages: torch.Tensor,
+        response_mask: torch.Tensor,
+        max_runs: int = 16,
+    ) -> str:
+        """Format valid-token advantages as compact inclusive-position RLE."""
+        valid_positions = torch.nonzero(response_mask > 0, as_tuple=False).flatten()
+        if valid_positions.numel() == 0:
+            return "[]"
+
+        positions = valid_positions.detach().cpu().tolist()
+        values = advantages[valid_positions].detach().float().cpu().tolist()
+        runs = []
+        start = end = positions[0]
+        run_value = values[0]
+        for position, value in zip(positions[1:], values[1:]):
+            if position == end + 1 and math.isclose(value, run_value, rel_tol=1e-5, abs_tol=1e-6):
+                end = position
+                continue
+            runs.append((start, end, run_value))
+            start = end = position
+            run_value = value
+        runs.append((start, end, run_value))
+
+        def _format_run(run) -> str:
+            run_start, run_end, value = run
+            if math.isclose(value, 0.0, abs_tol=5e-7):
+                value = 0.0
+            return f"{run_start}:{run_end}={value:.6g}"
+
+        if len(runs) <= max_runs:
+            parts = [_format_run(run) for run in runs]
+        else:
+            half = max_runs // 2
+            omitted = len(runs) - 2 * half
+            parts = (
+                [_format_run(run) for run in runs[:half]]
+                + [f"...(+{omitted} runs)"]
+                + [_format_run(run) for run in runs[-half:]]
+            )
+        return "[" + ",".join(parts) + "]"
+
+    def _print_tree_process_loss_sample(
+        self,
+        *,
+        policy_loss_fn,
+        old_log_prob: torch.Tensor,
+        log_prob: torch.Tensor,
+        process_advantages: torch.Tensor,
+        effective_advantages: torch.Tensor,
+        response_mask: torch.Tensor,
+        rollout_is_weights: torch.Tensor | None,
+        update_index: int,
+        unit: str,
+        identifiers: list[str],
+        token_share_weights: torch.Tensor | None = None,
+    ) -> None:
+        """Print one informative tree-process PG-loss diagnostic on rank 0.
+
+        A sequence carrying shared-prefix weights is preferred for TreePR.  For
+        TreeSR, the segment with the largest mean absolute process advantage is
+        selected.  The printed loss is a standalone token-mean diagnostic.
+        """
+        with torch.no_grad():
+            valid = response_mask > 0
+            valid_counts = valid.sum(dim=-1)
+            eligible = valid_counts > 0
+            if not bool(eligible.any().item()):
+                print(
+                    f"[TREE_PROCESS_LOSS] update={update_index} unit={unit} "
+                    "skipped=no_valid_tokens",
+                    flush=True,
+                )
+                return
+
+            if token_share_weights is not None:
+                weights = token_share_weights.to(
+                    device=process_advantages.device,
+                    dtype=process_advantages.dtype,
+                )
+                shared = valid & (weights > 0) & (weights < 1 - 1e-6)
+                scores = shared.sum(dim=-1).to(torch.float32)
+                if not bool((scores > 0).any().item()):
+                    scores = (
+                        process_advantages.detach().abs() * valid.to(process_advantages.dtype)
+                    ).sum(dim=-1) / valid_counts.clamp_min(1)
+            else:
+                scores = (
+                    process_advantages.detach().abs() * valid.to(process_advantages.dtype)
+                ).sum(dim=-1) / valid_counts.clamp_min(1)
+
+            scores = scores.masked_fill(~eligible, float("-inf"))
+            sample_idx = int(scores.argmax().item())
+            sample_slice = slice(sample_idx, sample_idx + 1)
+            sample_is_weights = (
+                rollout_is_weights[sample_slice] if rollout_is_weights is not None else None
+            )
+            process_pg_loss = self._sample_pg_loss(
+                policy_loss_fn,
+                old_log_prob[sample_slice],
+                log_prob[sample_slice],
+                process_advantages[sample_slice],
+                response_mask[sample_slice],
+                self.config,
+                sample_is_weights,
+            )
+            effective_pg_loss = process_pg_loss
+            if token_share_weights is not None:
+                effective_pg_loss = self._sample_pg_loss(
+                    policy_loss_fn,
+                    old_log_prob[sample_slice],
+                    log_prob[sample_slice],
+                    effective_advantages[sample_slice],
+                    response_mask[sample_slice],
+                    self.config,
+                    sample_is_weights,
+                )
+
+            advantage_runs = self._format_advantage_runs(
+                process_advantages[sample_idx], response_mask[sample_idx]
+            )
+            identifier = identifiers[sample_idx] if sample_idx < len(identifiers) else f"item={sample_idx}"
+            loss_fields = f"process_pg_loss={process_pg_loss:.8f}"
+            if token_share_weights is not None:
+                loss_fields += f" effective_pg_loss={effective_pg_loss:.8f}"
+            print(
+                f"[TREE_PROCESS_LOSS] update={update_index} unit={unit} {identifier} "
+                f"{loss_fields} advantage_runs={advantage_runs}",
+                flush=True,
+            )
+
     def _forward_micro_batch(
         self, micro_batch, temperature, calculate_entropy=False
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -438,6 +606,26 @@ class DataParallelPPOActor(BasePPOActor):
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
 
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        has_tree_process_data = "token_share_weights" in data.batch.keys()
+        if has_tree_process_data:
+            self._tree_process_update_count += 1
+        tree_process_log_interval_value = self.config.get("tree_process_loss_log_interval", 10)
+        tree_process_log_interval = (
+            int(tree_process_log_interval_value) if tree_process_log_interval_value is not None else 0
+        )
+        should_log_tree_process_loss = (
+            has_tree_process_data
+            and rank == 0
+            and tree_process_log_interval > 0
+            and (
+                self._tree_process_update_count == 1
+                or self._tree_process_update_count % tree_process_log_interval == 0
+            )
+        )
+        tree_process_loss_logged = False
+
         select_keys = [
             "responses",
             "response_mask",
@@ -580,8 +768,6 @@ class DataParallelPPOActor(BasePPOActor):
         optimizer_step_count = 0
         expected_optimizer_step_count = None
 
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
         if use_segment_batching:
             # === SEGMENT-BASED BATCHING STRATEGY - LOCAL WORKER ONLY ===
             ppo_micro_batch_segments = getattr(self.config, "ppo_micro_batch_segments", None)
@@ -905,6 +1091,29 @@ class DataParallelPPOActor(BasePPOActor):
                         rollout_is_weights=seg_rollout_is_weights_local,
                     )
 
+                    if should_log_tree_process_loss and not tree_process_loss_logged:
+                        segment_identifiers = [
+                            (
+                                f"local_segment={seg_idx} "
+                                f"canonical_sequence={seg_canonical[seg_idx][0]} "
+                                f"token_offset={seg_canonical[seg_idx][1]}"
+                            )
+                            for seg_idx in seg_indices
+                        ]
+                        self._print_tree_process_loss_sample(
+                            policy_loss_fn=policy_loss_fn,
+                            old_log_prob=seg_old_log_prob_local,
+                            log_prob=seg_log_prob_local,
+                            process_advantages=seg_advantages_local,
+                            effective_advantages=seg_advantages_local,
+                            response_mask=seg_response_mask_local,
+                            rollout_is_weights=seg_rollout_is_weights_local,
+                            update_index=self._tree_process_update_count,
+                            unit="segment",
+                            identifiers=segment_identifiers,
+                        )
+                        tree_process_loss_logged = True
+
                     # Entropy loss
                     if entropy_coeff != 0:
                         response_mask = model_inputs["response_mask"]
@@ -1085,6 +1294,7 @@ class DataParallelPPOActor(BasePPOActor):
                         response_mask = model_inputs["response_mask"]
                         old_log_prob = model_inputs["old_log_probs"]
                         advantages = model_inputs["advantages"]
+                        process_advantages = advantages
 
                         entropy_coeff = self.config.entropy_coeff
                         loss_agg_mode = self.config.loss_agg_mode
@@ -1098,19 +1308,6 @@ class DataParallelPPOActor(BasePPOActor):
                         # ------------------------------
                         token_share_weights = model_inputs.get("token_share_weights", None)
                         if token_share_weights is not None:
-                            if m == 0:
-                                try:
-                                    _w = token_share_weights
-                                    print(
-                                        f"[DEBUG][token_share_weights] Worker {rank} micro-batch {m}: "
-                                        f"weights.shape={tuple(_w.shape)} "
-                                        f"nonzero_tokens={int((_w > 0).sum().item())} "
-                                        f"w_min={float(_w.min().item()):.4f} "
-                                        f"w_max={float(_w.max().item()):.4f} "
-                                        f"w_mean_valid={float(_w.sum().item() / max((_w > 0).sum().item(), 1)):.4f}"
-                                    )
-                                except Exception as _e:
-                                    print(f"[DEBUG][token_share_weights] skipped debug: {_e}")
                             advantages = advantages * token_share_weights.to(advantages.device, dtype=advantages.dtype)
 
                         if self.config.use_dynamic_bsz:
@@ -1247,6 +1444,29 @@ class DataParallelPPOActor(BasePPOActor):
                                         config=self.config,
                                         rollout_is_weights=seg_rollout_is_weights_local,
                                     )
+
+                                    if should_log_tree_process_loss and not tree_process_loss_logged:
+                                        segment_identifiers = [
+                                            (
+                                                f"local_segment={seg_idx} "
+                                                f"canonical_sequence={seg_canonical[seg_idx][0]} "
+                                                f"token_offset={seg_canonical[seg_idx][1]}"
+                                            )
+                                            for seg_idx in seg_indices
+                                        ]
+                                        self._print_tree_process_loss_sample(
+                                            policy_loss_fn=policy_loss_fn,
+                                            old_log_prob=seg_old_log_prob_local,
+                                            log_prob=seg_log_prob_local,
+                                            process_advantages=seg_advantages_local,
+                                            effective_advantages=seg_advantages_local,
+                                            response_mask=seg_response_mask_local,
+                                            rollout_is_weights=seg_rollout_is_weights_local,
+                                            update_index=self._tree_process_update_count,
+                                            unit="segment",
+                                            identifiers=segment_identifiers,
+                                        )
+                                        tree_process_loss_logged = True
                             else:
                                 # Fallback if targets not precomputed
                                 pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
@@ -1268,6 +1488,25 @@ class DataParallelPPOActor(BasePPOActor):
                                 config=self.config,
                                 rollout_is_weights=rollout_is_weights,
                             )
+
+                            if should_log_tree_process_loss and not tree_process_loss_logged:
+                                sequence_identifiers = [
+                                    f"micro_sequence={i}" for i in range(response_mask.shape[0])
+                                ]
+                                self._print_tree_process_loss_sample(
+                                    policy_loss_fn=policy_loss_fn,
+                                    old_log_prob=old_log_prob,
+                                    log_prob=log_prob,
+                                    process_advantages=process_advantages,
+                                    effective_advantages=advantages,
+                                    response_mask=response_mask,
+                                    rollout_is_weights=rollout_is_weights,
+                                    update_index=self._tree_process_update_count,
+                                    unit="sequence",
+                                    identifiers=sequence_identifiers,
+                                    token_share_weights=token_share_weights,
+                                )
+                                tree_process_loss_logged = True
 
                         if entropy_coeff != 0:
                             entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
@@ -1310,6 +1549,13 @@ class DataParallelPPOActor(BasePPOActor):
                     optimizer_step_count += 1
                     mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                     append_to_dict(metrics, mini_batch_metrics)
+
+        if should_log_tree_process_loss and not tree_process_loss_logged:
+            print(
+                f"[TREE_PROCESS_LOSS] update={self._tree_process_update_count} "
+                "skipped=no_real_process_loss_was_consumed",
+                flush=True,
+            )
 
         if optimizer_step_count != expected_optimizer_step_count:
             raise RuntimeError(

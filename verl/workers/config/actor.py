@@ -93,6 +93,7 @@ class ActorConfig(BaseConfig):
     # Tree segment loss related configurations
     tree_segment_batch_strategy: str = "leaf"  # 'leaf' (default) or 'segment'
     ppo_micro_batch_segments: Optional[int] = None
+    tree_process_loss_log_interval: int = 10
 
     strategy: str = MISSING
     ppo_mini_batch_size: int = 256
@@ -150,6 +151,8 @@ class ActorConfig(BaseConfig):
         ]
         if self.loss_agg_mode not in valid_loss_agg_modes:
             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
+        if self.tree_process_loss_log_interval < 0:
+            raise ValueError("tree_process_loss_log_interval must be >= 0")
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""
