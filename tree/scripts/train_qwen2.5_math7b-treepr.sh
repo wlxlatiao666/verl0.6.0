@@ -10,9 +10,9 @@ export RAY_DEDUP_LOGS=0
 export NCCL_SHM_DISABLE=1
 export NCCL_DEBUG=INFO
 HOME=/inspire/hdd/global_user/weilongxuan-253108120168
-verl_dir=/inspire/hdd/global_user/weilongxuan-253108120168/verl_data
+verl_dir=/inspire/qb-ilm2/project/neosmosis/weilongxuan-253108120168/verl_data
 project_name=verl_grpo_tree_0722
-experiment_name=qwen2.5_math7b_treepr
+experiment_name=qwen2.5_math7b_treepr_seg128
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl0.6.0"}
 
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
@@ -90,6 +90,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.tree_search.entropy_threshold=0.8 \
     actor_rollout_ref.rollout.tree_search.branching_factor=4 \
     actor_rollout_ref.rollout.tree_search.max_tree_depth=3 \
+    actor_rollout_ref.rollout.tree_search.topup_leaves_to_target=True \
     actor_rollout_ref.rollout.tree_search.tau_importance=0.0 \
     actor_rollout_ref.rollout.tree_search.tree_process_reward=True \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
