@@ -24,15 +24,20 @@ import random
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.tensor import DTensor
 
-import torch.distributed as dist
-
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, build_segment_tensors, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.tree_weighting import (
+    compute_segment_reach_masses,
+    normalize_tree_loss_scales,
+    select_segments_for_present_leaves,
+    tree_loss_scale_normalization_totals,
+)
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -49,6 +54,16 @@ __all__ = ["DataParallelPPOActor"]
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _loss_reduction_units(response_mask: torch.Tensor, loss_agg_mode: str) -> torch.Tensor:
+    """Return the denominator units used by a mean-style loss reducer."""
+
+    if loss_agg_mode == "token-mean":
+        return response_mask.to(torch.float32).sum()
+    if loss_agg_mode in {"seq-mean-token-sum", "seq-mean-token-mean", "seq-mean-token-sum-norm"}:
+        return (response_mask.sum(dim=-1) > 0).to(torch.float32).sum()
+    raise ValueError(f"Invalid loss_agg_mode: {loss_agg_mode}")
 
 
 class DataParallelPPOActor(BasePPOActor):
@@ -642,6 +657,14 @@ class DataParallelPPOActor(BasePPOActor):
         if "rollout_is_weights" in data.batch.keys():
             select_keys.append("rollout_is_weights")
 
+        # Conditional actor probability mass for non-iid tree leaves.  Keep it
+        # separate from rollout IS: the former corrects tree enumeration while
+        # the latter corrects rollout/training implementation mismatch.
+        if "tree_leaf_masses" in data.batch.keys():
+            select_keys.append("tree_leaf_masses")
+        if "tree_loss_scales" in data.batch.keys():
+            select_keys.append("tree_loss_scales")
+
         # Include tree-process-reward inverse-sharing weights if present.
         if "token_share_weights" in data.batch.keys():
             select_keys.append("token_share_weights")
@@ -652,6 +675,22 @@ class DataParallelPPOActor(BasePPOActor):
             non_tensor_select_keys.append("multi_modal_inputs")
 
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+        if loss_mode == "tree_segment" and self.use_ulysses_sp:
+            raise NotImplementedError(
+                "TreeSR/tree_segment currently requires ulysses_sequence_parallel_size=1. "
+                "Independent segment shuffles across sequence-parallel ranks can otherwise "
+                "feed different samples/shapes into the same collective."
+            )
+        if (
+            loss_mode == "tree_segment"
+            and self.config.loss_agg_mode == "seq-mean-token-sum-norm"
+            and world_size > 1
+        ):
+            raise NotImplementedError(
+                "Distributed TreeSR does not support seq-mean-token-sum-norm because each rank's "
+                "local max segment width would define a different reducer denominator. Use "
+                "token-mean or seq-mean-token-mean."
+            )
         if loss_mode == "tree_segment":
             if "leaf_segment_indices" in data.non_tensor_batch:
                 non_tensor_select_keys.append("leaf_segment_indices")
@@ -668,9 +707,8 @@ class DataParallelPPOActor(BasePPOActor):
         # Note: data is already sliced per-worker (each worker has its own leaves and segments)
         local_tree_seg_targets = None
         local_batch_size = len(data)
-        # We need to keep track of global seg indices for ownership check
+        # Global indices are remapped to compact worker-local indices once.
         global_to_local_seg_idx_map = None
-        local_to_global_seg_idx_map = None
         if loss_mode == "tree_segment":
             # Try to get unique_segments from non_tensor_batch first (new location),
             # then fall back to meta_info['metrics'] (old location for compatibility)
@@ -700,13 +738,9 @@ class DataParallelPPOActor(BasePPOActor):
                 used_global_seg_indices = sorted(used_global_seg_indices)
                 print(f"[DEBUG] [tree_segment] Worker {rank}: uses {len(used_global_seg_indices)} segments: {used_global_seg_indices[:10]}{'...' if len(used_global_seg_indices) > 10 else ''}")
 
-                # Build mapping from global seg idx to local seg idx (and reverse)
+                # Build mapping from global seg idx to local seg idx.
                 global_to_local_seg_idx_map = {
                     global_seg_idx: local_seg_idx
-                    for local_seg_idx, global_seg_idx in enumerate(used_global_seg_indices)
-                }
-                local_to_global_seg_idx_map = {
-                    local_seg_idx: global_seg_idx
                     for local_seg_idx, global_seg_idx in enumerate(used_global_seg_indices)
                 }
 
@@ -748,11 +782,41 @@ class DataParallelPPOActor(BasePPOActor):
                     "seg_canonical": seg_canonical,
                     "seg_lens": seg_lens,
                     "rollout_is_weights": seg_rollout_is,
-                    "local_to_global_seg_idx_map": local_to_global_seg_idx_map,
+                    "loss_weights": None,
                 }
+
+                if "tree_leaf_masses" in data_inputs:
+                    segment_reach_masses = compute_segment_reach_masses(
+                        data_inputs["tree_leaf_masses"],
+                        local_leaf_segment_indices,
+                        len(local_unique_segments),
+                    )
+                    normalization_totals = tree_loss_scale_normalization_totals(
+                        segment_reach_masses,
+                        seg_response_mask,
+                        self.config.loss_agg_mode,
+                    )
+                    global_normalization_totals = torch.stack(normalization_totals).to(get_device_id())
+                    if dist.is_initialized() and world_size > 1:
+                        dist.all_reduce(global_normalization_totals, op=dist.ReduceOp.SUM)
+                    local_tree_seg_targets["loss_weights"] = normalize_tree_loss_scales(
+                        segment_reach_masses,
+                        seg_response_mask,
+                        self.config.loss_agg_mode,
+                        normalization_totals=(
+                            float(global_normalization_totals[0].item()),
+                            float(global_normalization_totals[1].item()),
+                        ),
+                    )
 
                 print(f"[DEBUG] [tree_segment] Worker {rank}: Local segment tensors built: seg_old_log_prob.shape={seg_old_log_prob.shape}")
                 print(f"[DEBUG] [tree_segment] Worker {rank}: seg_advantages.shape={seg_advantages.shape}, seg_response_mask.shape={seg_response_mask.shape}")
+
+        if loss_mode == "tree_segment" and local_tree_seg_targets is None:
+            raise RuntimeError(
+                "tree_segment loss requires local unique_segments and leaf_segment_indices; "
+                "refusing to fall back to leaf-shaped tensors."
+            )
 
         # === New code: Check batch strategy for tree_segment loss ===
         tree_segment_batch_strategy = getattr(self.config, "tree_segment_batch_strategy", "leaf")
@@ -848,6 +912,18 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch_size=ppo_micro_batch_segments,
                 )
                 local_micro_counts = [len(group) for group in local_optimizer_micro_batches]
+                local_group_units = []
+                for optimizer_group in local_optimizer_micro_batches:
+                    optimizer_group_indices = [idx for micro in optimizer_group for idx in micro]
+                    local_group_units.append(
+                        _loss_reduction_units(
+                            local_tree_seg_targets["response_mask"][optimizer_group_indices],
+                            self.config.loss_agg_mode,
+                        )
+                    )
+                global_group_units = torch.stack(local_group_units).to(get_device_id())
+                if dist.is_initialized() and world_size > 1:
+                    dist.all_reduce(global_group_units, op=dist.ReduceOp.SUM)
                 max_micro_counts = local_micro_counts.copy()
                 if dist.is_initialized() and world_size > 1:
                     count_tensor = torch.tensor(local_micro_counts, dtype=torch.int64, device=get_device_id())
@@ -1027,7 +1103,19 @@ class DataParallelPPOActor(BasePPOActor):
                     model_inputs = {**mini_batch.batch, **mini_batch.non_tensor_batch}
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
-                    loss_scale_factor = 1 / self.gradient_accumulation
+                    if loss_agg_mode == "seq-mean-token-sum-norm":
+                        loss_scale_factor = float(world_size)
+                    else:
+                        micro_units = _loss_reduction_units(
+                            local_tree_seg_targets["response_mask"][seg_indices], loss_agg_mode
+                        ).to(get_device_id())
+                        loss_scale_factor = float(
+                            (
+                                micro_units
+                                * world_size
+                                / global_group_units[optimizer_group_idx].clamp_min(1)
+                            ).item()
+                        )
                     if m == 0:
                         print(f"[DEBUG] [tree_segment] Worker {rank}: micro-batch {m}, loss_scale_factor={loss_scale_factor:.6f} "
                               f"(gradient_accumulation={self.gradient_accumulation})")
@@ -1048,6 +1136,7 @@ class DataParallelPPOActor(BasePPOActor):
                     max_seg_len = local_tree_seg_targets["old_log_prob"].shape[1]
                     seg_lens = local_tree_seg_targets["seg_lens"]
                     log_prob_pieces = []
+                    entropy_pieces = []
                     for seg_idx in seg_indices:
                         leaf_j, tok_offset = seg_canonical[seg_idx]
                         local_leaf_j = leaf_inverse_map[leaf_j]
@@ -1057,9 +1146,17 @@ class DataParallelPPOActor(BasePPOActor):
                         if piece.shape[0] < max_seg_len:
                             piece = torch.nn.functional.pad(piece, (0, max_seg_len - piece.shape[0]))
                         log_prob_pieces.append(piece)
+                        if entropy is not None:
+                            entropy_piece = entropy[local_leaf_j, tok_offset:end_tok]
+                            if entropy_piece.shape[0] < max_seg_len:
+                                entropy_piece = torch.nn.functional.pad(
+                                    entropy_piece, (0, max_seg_len - entropy_piece.shape[0])
+                                )
+                            entropy_pieces.append(entropy_piece)
                     seg_log_prob_local = torch.stack(log_prob_pieces) if log_prob_pieces else torch.zeros(
                         len(seg_indices), max_seg_len, device=log_prob.device, dtype=log_prob.dtype
                     )
+                    seg_entropy_local = torch.stack(entropy_pieces) if entropy_pieces else None
 
                     # Get other segment tensors
                     if on_policy:
@@ -1072,6 +1169,9 @@ class DataParallelPPOActor(BasePPOActor):
                     seg_rollout_is_weights_local = local_tree_seg_targets["rollout_is_weights"]
                     if seg_rollout_is_weights_local is not None:
                         seg_rollout_is_weights_local = seg_rollout_is_weights_local[seg_indices].to(log_prob.device)
+                    seg_loss_weights_local = local_tree_seg_targets["loss_weights"]
+                    if seg_loss_weights_local is not None:
+                        seg_loss_weights_local = seg_loss_weights_local[seg_indices].to(log_prob.device)
 
                     if m == 0:
                         print(f"[DEBUG] [tree_segment] Worker {rank}: seg_advantages.shape={seg_advantages_local.shape}")
@@ -1089,6 +1189,7 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_agg_mode=loss_agg_mode,
                         config=self.config,
                         rollout_is_weights=seg_rollout_is_weights_local,
+                        loss_weights=seg_loss_weights_local,
                     )
 
                     if should_log_tree_process_loss and not tree_process_loss_logged:
@@ -1116,8 +1217,13 @@ class DataParallelPPOActor(BasePPOActor):
 
                     # Entropy loss
                     if entropy_coeff != 0:
-                        response_mask = model_inputs["response_mask"]
-                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        assert seg_entropy_local is not None
+                        entropy_loss = agg_loss(
+                            loss_mat=seg_entropy_local,
+                            loss_mask=seg_response_mask_local,
+                            loss_agg_mode=loss_agg_mode,
+                            loss_weights=seg_loss_weights_local,
+                        )
                         policy_loss = pg_loss - entropy_loss * entropy_coeff
                     else:
                         policy_loss = pg_loss
@@ -1129,7 +1235,23 @@ class DataParallelPPOActor(BasePPOActor):
                         kld = kl_penalty(
                             logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
                         )
-                        kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        kld_pieces = []
+                        for seg_idx in seg_indices:
+                            leaf_j, tok_offset = seg_canonical[seg_idx]
+                            local_leaf_j = leaf_inverse_map[leaf_j]
+                            seg_len = seg_lens[seg_idx]
+                            end_tok = min(tok_offset + seg_len, kld.shape[1])
+                            piece = kld[local_leaf_j, tok_offset:end_tok]
+                            if piece.shape[0] < max_seg_len:
+                                piece = torch.nn.functional.pad(piece, (0, max_seg_len - piece.shape[0]))
+                            kld_pieces.append(piece)
+                        seg_kld_local = torch.stack(kld_pieces)
+                        kl_loss = agg_loss(
+                            loss_mat=seg_kld_local,
+                            loss_mask=seg_response_mask_local,
+                            loss_agg_mode=loss_agg_mode,
+                            loss_weights=seg_loss_weights_local,
+                        )
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                         micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
@@ -1213,6 +1335,30 @@ class DataParallelPPOActor(BasePPOActor):
 
                     # Adjust gradient_accumulation to match actual max micro-batch count
                     self.gradient_accumulation = max_micro_batches
+
+                    # Fixed tree scales are normalized on the complete rollout
+                    # batch. Combine microbatch numerators using the reducer's
+                    # original full optimizer-group denominator. With DDP/FSDP
+                    # gradient averaging, the world-size factor recovers the
+                    # global (all-rank) denominator exactly.
+                    tree_group_global_units = None
+                    if "tree_loss_scales" in mini_batch.batch.keys():
+                        if loss_mode == "tree_segment" and local_tree_seg_targets is not None:
+                            group_present_leaves = set(range(local_leaf_start, local_leaf_end))
+                            group_segment_indices = select_segments_for_present_leaves(
+                                local_tree_seg_targets["seg_canonical"], group_present_leaves
+                            )
+                            local_group_mask = local_tree_seg_targets["response_mask"][
+                                group_segment_indices
+                            ]
+                        else:
+                            local_group_mask = mini_batch.batch["response_mask"]
+                        local_group_units = _loss_reduction_units(
+                            local_group_mask, self.config.loss_agg_mode
+                        ).to(get_device_id())
+                        tree_group_global_units = local_group_units.clone()
+                        if dist.is_initialized() and world_size > 1:
+                            dist.all_reduce(tree_group_global_units, op=dist.ReduceOp.SUM)
 
                     # Use pre-computed LOCAL segment targets, don't rebuild at mini_batch level
                     if loss_mode == "tree_segment" and local_tree_seg_targets is not None:
@@ -1299,18 +1445,42 @@ class DataParallelPPOActor(BasePPOActor):
                         entropy_coeff = self.config.entropy_coeff
                         loss_agg_mode = self.config.loss_agg_mode
 
-                        # ------------------------------
-                        # Apply token-level inverse-sharing weight (tree process reward only).
-                        # token_share_weights[t] = 1 / descendant_count(node_that_owns_token_t).
-                        # Multiplying into advantages is mathematically equivalent to multiplying
-                        # the final per-token pg_loss by the same weight; we do it here so we don't
-                        # need to touch every policy_loss_fn signature.
-                        # ------------------------------
+                        # Retained only for legacy diagnostics. Actor-occupancy
+                        # leaf weights already make a shared segment's summed
+                        # contribution equal its reach mass; multiplying by the
+                        # old inverse-descendant weight would underweight it.
                         token_share_weights = model_inputs.get("token_share_weights", None)
-                        if token_share_weights is not None:
-                            advantages = advantages * token_share_weights.to(advantages.device, dtype=advantages.dtype)
+                        loss_weights = model_inputs.get("tree_loss_scales", None)
 
-                        if self.config.use_dynamic_bsz:
+                        if tree_group_global_units is not None:
+                            if loss_agg_mode == "seq-mean-token-sum-norm":
+                                loss_scale_factor = float(world_size)
+                            else:
+                                if loss_mode == "tree_segment" and local_tree_seg_targets is not None:
+                                    if self.config.use_dynamic_bsz:
+                                        scale_present_leaves = set(batch_idx_list[m])
+                                    else:
+                                        scale_micro_start = (
+                                            local_leaf_start + m * self.config.ppo_micro_batch_size_per_gpu
+                                        )
+                                        scale_micro_end = min(
+                                            scale_micro_start + self.config.ppo_micro_batch_size_per_gpu,
+                                            local_leaf_end,
+                                        )
+                                        scale_present_leaves = set(range(scale_micro_start, scale_micro_end))
+                                    scale_segment_indices = select_segments_for_present_leaves(
+                                        local_tree_seg_targets["seg_canonical"], scale_present_leaves
+                                    )
+                                    micro_unit_mask = local_tree_seg_targets["response_mask"][
+                                        scale_segment_indices
+                                    ]
+                                else:
+                                    micro_unit_mask = response_mask
+                                micro_units = _loss_reduction_units(micro_unit_mask, loss_agg_mode)
+                                loss_scale_factor = float(
+                                    (micro_units * world_size / tree_group_global_units.clamp_min(1)).item()
+                                )
+                        elif self.config.use_dynamic_bsz:
                             loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
                         else:
                             loss_scale_factor = 1 / self.gradient_accumulation
@@ -1346,6 +1516,7 @@ class DataParallelPPOActor(BasePPOActor):
                         # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
                         # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
                         policy_loss_fn = get_policy_loss_fn(loss_mode)
+                        segment_regularizer_ctx = None
 
                         # Compute policy loss (all functions return 4 values)
                         if loss_mode == "tree_segment":
@@ -1353,42 +1524,30 @@ class DataParallelPPOActor(BasePPOActor):
                             if tree_seg_targets is not None:
                                 seg_canonical = tree_seg_targets["seg_canonical"]
                                 seg_lens = tree_seg_targets["seg_lens"]
-                                local_to_global_seg_idx_map = tree_seg_targets.get("local_to_global_seg_idx_map")
 
-                                # Fall back to original behavior if no mapping exists
-                                if local_to_global_seg_idx_map is None:
-                                    # Determine which leaves are present in this micro-batch (using LOCAL leaf indices)
-                                    if self.config.use_dynamic_bsz:
-                                        present_leaves = set(batch_idx_list[m])
-                                    else:
-                                        # For non-dynamic bsz, compute the LOCAL leaf indices in this micro_batch
-                                        local_micro_batch_start = local_leaf_start + m * self.config.ppo_micro_batch_size_per_gpu
-                                        local_micro_batch_end = min(local_micro_batch_start + self.config.ppo_micro_batch_size_per_gpu, local_leaf_end)
-                                        present_leaves = set(range(local_micro_batch_start, local_micro_batch_end))
-
-                                    # Select segments whose canonical leaf is in this micro-batch
-                                    seg_indices = [i for i, (leaf_j, _) in enumerate(seg_canonical) if leaf_j in present_leaves]
+                                # Determine which LOCAL leaves are present in
+                                # this microbatch. DataProto.chunk already gave
+                                # every rank a disjoint local segment set and
+                                # reindexed its paths, so a second
+                                # global_segment_id % world_size filter would
+                                # silently discard roughly 1 - 1/world_size of
+                                # valid segments.
+                                if self.config.use_dynamic_bsz:
+                                    present_leaves = set(batch_idx_list[m])
                                 else:
-                                    # Determine which leaves are present in this micro-batch (using LOCAL leaf indices)
-                                    if self.config.use_dynamic_bsz:
-                                        present_leaves = set(batch_idx_list[m])
-                                    else:
-                                        # For non-dynamic bsz, compute the LOCAL leaf indices in this micro_batch
-                                        local_micro_batch_start = local_leaf_start + m * self.config.ppo_micro_batch_size_per_gpu
-                                        local_micro_batch_end = min(local_micro_batch_start + self.config.ppo_micro_batch_size_per_gpu, local_leaf_end)
-                                        present_leaves = set(range(local_micro_batch_start, local_micro_batch_end))
+                                    local_micro_batch_start = (
+                                        local_leaf_start + m * self.config.ppo_micro_batch_size_per_gpu
+                                    )
+                                    local_micro_batch_end = min(
+                                        local_micro_batch_start + self.config.ppo_micro_batch_size_per_gpu,
+                                        local_leaf_end,
+                                    )
+                                    present_leaves = set(range(local_micro_batch_start, local_micro_batch_end))
 
-                                    # Select segments whose canonical leaf is in this micro-batch AND assigned to this worker
-                                    # This guarantees each segment is updated exactly once and load balanced
-                                    seg_indices = []
-                                    for i, (leaf_j, _) in enumerate(seg_canonical):
-                                        if leaf_j in present_leaves:
-                                            global_seg_idx = local_to_global_seg_idx_map[i]
-                                            if global_seg_idx % world_size == rank:
-                                                seg_indices.append(i)
+                                seg_indices = select_segments_for_present_leaves(seg_canonical, present_leaves)
 
                                 if len(seg_indices) == 0:
-                                    pg_loss = torch.tensor(0.0, device=log_prob.device)
+                                    pg_loss = log_prob.sum() * 0.0
                                     pg_clipfrac = torch.tensor(0.0, device=log_prob.device)
                                     ppo_kl = torch.tensor(0.0, device=log_prob.device)
                                     pg_clipfrac_lower = torch.tensor(0.0, device=log_prob.device)
@@ -1408,6 +1567,7 @@ class DataParallelPPOActor(BasePPOActor):
                                     # NOTE: Use torch.stack + F.pad to preserve gradient flow.
                                     max_seg_len = tree_seg_targets["old_log_prob"].shape[1]
                                     log_prob_pieces = []
+                                    entropy_pieces = []
                                     for seg_idx in seg_indices:
                                         leaf_j, tok_offset = seg_canonical[seg_idx]
                                         local_leaf_j = leaf_inverse_map[leaf_j]
@@ -1417,9 +1577,17 @@ class DataParallelPPOActor(BasePPOActor):
                                         if piece.shape[0] < max_seg_len:
                                             piece = torch.nn.functional.pad(piece, (0, max_seg_len - piece.shape[0]))
                                         log_prob_pieces.append(piece)
+                                        if entropy is not None:
+                                            entropy_piece = entropy[local_leaf_j, tok_offset:end_tok]
+                                            if entropy_piece.shape[0] < max_seg_len:
+                                                entropy_piece = torch.nn.functional.pad(
+                                                    entropy_piece, (0, max_seg_len - entropy_piece.shape[0])
+                                                )
+                                            entropy_pieces.append(entropy_piece)
                                     seg_log_prob_local = torch.stack(log_prob_pieces) if log_prob_pieces else torch.zeros(
                                         len(seg_indices), max_seg_len, device=log_prob.device, dtype=log_prob.dtype
                                     )
+                                    seg_entropy_local = torch.stack(entropy_pieces) if entropy_pieces else None
 
                                     if on_policy:
                                         seg_old_log_prob_local = seg_log_prob_local.detach()
@@ -1431,6 +1599,19 @@ class DataParallelPPOActor(BasePPOActor):
                                     seg_rollout_is_weights_local = tree_seg_targets["rollout_is_weights"]
                                     if seg_rollout_is_weights_local is not None:
                                         seg_rollout_is_weights_local = seg_rollout_is_weights_local[seg_indices].to(log_prob.device)
+                                    seg_loss_weights_local = tree_seg_targets["loss_weights"]
+                                    if seg_loss_weights_local is not None:
+                                        seg_loss_weights_local = seg_loss_weights_local[seg_indices].to(log_prob.device)
+                                    segment_regularizer_ctx = (
+                                        seg_indices,
+                                        seg_entropy_local,
+                                        seg_response_mask_local,
+                                        seg_loss_weights_local,
+                                        seg_canonical,
+                                        seg_lens,
+                                        leaf_inverse_map,
+                                        max_seg_len,
+                                    )
 
                                     if batch_idx == 0 and m == 0:  # Print once per epoch
                                         print(f"[tree_segment] Updating {len(seg_indices)} segments in this micro_batch")
@@ -1443,6 +1624,7 @@ class DataParallelPPOActor(BasePPOActor):
                                         loss_agg_mode=loss_agg_mode,
                                         config=self.config,
                                         rollout_is_weights=seg_rollout_is_weights_local,
+                                        loss_weights=seg_loss_weights_local,
                                     )
 
                                     if should_log_tree_process_loss and not tree_process_loss_logged:
@@ -1477,6 +1659,7 @@ class DataParallelPPOActor(BasePPOActor):
                                     loss_agg_mode=loss_agg_mode,
                                     config=self.config,
                                     rollout_is_weights=rollout_is_weights,
+                                    **({"loss_weights": loss_weights} if loss_weights is not None else {}),
                                 )
                         else:
                             pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
@@ -1487,6 +1670,7 @@ class DataParallelPPOActor(BasePPOActor):
                                 loss_agg_mode=loss_agg_mode,
                                 config=self.config,
                                 rollout_is_weights=rollout_is_weights,
+                                **({"loss_weights": loss_weights} if loss_weights is not None else {}),
                             )
 
                             if should_log_tree_process_loss and not tree_process_loss_logged:
@@ -1509,7 +1693,25 @@ class DataParallelPPOActor(BasePPOActor):
                                 tree_process_loss_logged = True
 
                         if entropy_coeff != 0:
-                            entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                            if loss_mode == "tree_segment" and tree_seg_targets is not None:
+                                if segment_regularizer_ctx is None:
+                                    entropy_loss = entropy.sum() * 0.0
+                                else:
+                                    _, seg_entropy_local, seg_mask, seg_scales, *_ = segment_regularizer_ctx
+                                    assert seg_entropy_local is not None
+                                    entropy_loss = agg_loss(
+                                        loss_mat=seg_entropy_local,
+                                        loss_mask=seg_mask,
+                                        loss_agg_mode=loss_agg_mode,
+                                        loss_weights=seg_scales,
+                                    )
+                            else:
+                                entropy_loss = agg_loss(
+                                    loss_mat=entropy,
+                                    loss_mask=response_mask,
+                                    loss_agg_mode=loss_agg_mode,
+                                    loss_weights=loss_weights,
+                                )
 
                             # compute policy loss
                             policy_loss = pg_loss - entropy_loss * entropy_coeff
@@ -1522,7 +1724,45 @@ class DataParallelPPOActor(BasePPOActor):
                             kld = kl_penalty(
                                 logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
                             )
-                            kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                            if loss_mode == "tree_segment" and tree_seg_targets is not None:
+                                if segment_regularizer_ctx is None:
+                                    kl_loss = kld.sum() * 0.0
+                                else:
+                                    (
+                                        reg_seg_indices,
+                                        _,
+                                        seg_mask,
+                                        seg_scales,
+                                        reg_seg_canonical,
+                                        reg_seg_lens,
+                                        reg_leaf_inverse_map,
+                                        reg_max_seg_len,
+                                    ) = segment_regularizer_ctx
+                                    kld_pieces = []
+                                    for seg_idx in reg_seg_indices:
+                                        leaf_j, tok_offset = reg_seg_canonical[seg_idx]
+                                        local_leaf_j = reg_leaf_inverse_map[leaf_j]
+                                        end_tok = min(tok_offset + reg_seg_lens[seg_idx], kld.shape[1])
+                                        piece = kld[local_leaf_j, tok_offset:end_tok]
+                                        if piece.shape[0] < reg_max_seg_len:
+                                            piece = torch.nn.functional.pad(
+                                                piece, (0, reg_max_seg_len - piece.shape[0])
+                                            )
+                                        kld_pieces.append(piece)
+                                    seg_kld_local = torch.stack(kld_pieces)
+                                    kl_loss = agg_loss(
+                                        loss_mat=seg_kld_local,
+                                        loss_mask=seg_mask,
+                                        loss_agg_mode=loss_agg_mode,
+                                        loss_weights=seg_scales,
+                                    )
+                            else:
+                                kl_loss = agg_loss(
+                                    loss_mat=kld,
+                                    loss_mask=response_mask,
+                                    loss_agg_mode=loss_agg_mode,
+                                    loss_weights=loss_weights,
+                                )
 
                             policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                             micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor

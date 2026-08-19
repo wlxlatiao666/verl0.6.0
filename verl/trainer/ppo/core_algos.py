@@ -41,8 +41,9 @@ PolicyLossFn = Callable[
         torch.Tensor,  # advantages
         torch.Tensor,  # response_mask
         str,  # loss_agg_mode
-        Optional[DictConfig | AlgoConfig],  # config
-        torch.Tensor | None,  # rollout_log_probs
+        Optional[DictConfig | AlgoConfig | ActorConfig],  # config
+        torch.Tensor | None,  # rollout_is_weights
+        torch.Tensor | None,  # loss_weights
     ],
     tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
 ]
@@ -269,6 +270,7 @@ def compute_grpo_outcome_advantage(
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
+    sample_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Compute advantage for GRPO, operating only on Outcome reward
@@ -287,6 +289,9 @@ def compute_grpo_outcome_advantage(
             whether to scale the GRPO advantage
         config: `(Optional[AlgoConfig])`
             algorithm configuration object
+        sample_weights: optional per-response actor occupancy mass. When
+            provided, GRPO reward mean and variance are computed under this
+            distribution instead of treating enumerated tree leaves as iid.
 
     Note:
         If norm_adv_by_std_in_grpo is True, the advantage is scaled by the std, as in the original GRPO.
@@ -301,21 +306,43 @@ def compute_grpo_outcome_advantage(
     scores = token_level_rewards.sum(dim=-1)
 
     id2score = defaultdict(list)
+    id2weight = defaultdict(list)
     id2mean = {}
     id2std = {}
 
     with torch.no_grad():
         bsz = scores.shape[0]
+        if sample_weights is not None:
+            if sample_weights.ndim != 1 or sample_weights.shape[0] != bsz:
+                raise ValueError(
+                    f"sample_weights must have shape ({bsz},), got {tuple(sample_weights.shape)}"
+                )
+            sample_weights = sample_weights.detach().to(device=scores.device, dtype=scores.dtype)
+            if not torch.all(torch.isfinite(sample_weights)) or torch.any(sample_weights < 0):
+                raise ValueError("sample_weights must be finite and non-negative")
         for i in range(bsz):
             id2score[index[i]].append(scores[i])
+            if sample_weights is not None:
+                id2weight[index[i]].append(sample_weights[i])
         for idx in id2score:
             if len(id2score[idx]) == 1:
-                id2mean[idx] = torch.tensor(0.0)
-                id2std[idx] = torch.tensor(1.0)
+                id2mean[idx] = scores.new_tensor(0.0)
+                id2std[idx] = scores.new_tensor(1.0)
             elif len(id2score[idx]) > 1:
                 scores_tensor = torch.stack(id2score[idx])
-                id2mean[idx] = torch.mean(scores_tensor)
-                id2std[idx] = torch.std(scores_tensor)
+                if sample_weights is None:
+                    id2mean[idx] = torch.mean(scores_tensor)
+                    id2std[idx] = torch.std(scores_tensor)
+                else:
+                    weights_tensor = torch.stack(id2weight[idx])
+                    weight_sum = weights_tensor.sum()
+                    if weight_sum <= 0:
+                        raise ValueError(f"sample_weights for prompt index {idx!r} must have positive mass")
+                    weights_tensor = weights_tensor / weight_sum
+                    id2mean[idx] = torch.sum(weights_tensor * scores_tensor)
+                    id2std[idx] = torch.sqrt(
+                        torch.sum(weights_tensor * (scores_tensor - id2mean[idx]).square()).clamp_min(0)
+                    )
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
         for i in range(bsz):
@@ -769,7 +796,12 @@ def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):
     return token_level_scores - kl * kl_ratio
 
 
-def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str):
+def agg_loss(
+    loss_mat: torch.Tensor,
+    loss_mask: torch.Tensor,
+    loss_agg_mode: str,
+    loss_weights: torch.Tensor | None = None,
+):
     """
     Aggregate the loss matrix into a scalar.
 
@@ -780,29 +812,54 @@ def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str
             shape: (bs, response_length)
         loss_agg_mode: (str) choices:
             method to aggregate the loss matrix into a scalar.
+        loss_weights: optional detached, pre-normalized multiplicative scales.
+            They must be normalized over the complete optimizer group (not an
+            individual microbatch), so their relevant unweighted mean is one.
+            A rank-1 tensor supplies one scale per sequence; a rank-2 tensor
+            supplies token scales. The ordinary reducer denominator is kept;
+            this is essential because normalizing by the local microbatch's
+            weight sum would erase relative mass when microbatch size is one.
     Returns:
         loss: `a scalar torch.Tensor`
             aggregated loss
     """
+    if loss_weights is None:
+        weights = torch.ones_like(loss_mat)
+    else:
+        weights = loss_weights.detach().to(device=loss_mat.device, dtype=loss_mat.dtype)
+        if weights.ndim == 1:
+            weights = weights.unsqueeze(-1)
+        try:
+            weights = torch.broadcast_to(weights, loss_mat.shape)
+        except RuntimeError as exc:
+            raise ValueError(
+                f"loss_weights shape {tuple(loss_weights.shape)} cannot broadcast to loss shape "
+                f"{tuple(loss_mat.shape)}"
+            ) from exc
+        if not torch.all(torch.isfinite(weights)) or torch.any(weights < 0):
+            raise ValueError("loss_weights must be finite and non-negative")
+
+    scaled_loss_mat = loss_mat * weights
+
     if loss_agg_mode == "token-mean":
-        loss = verl_F.masked_mean(loss_mat, loss_mask)
+        loss = verl_F.masked_mean(scaled_loss_mat, loss_mask)
     elif loss_agg_mode == "seq-mean-token-sum":
-        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)  # token-sum
+        seq_losses = torch.sum(scaled_loss_mat * loss_mask, dim=-1)  # token-sum
         loss = torch.mean(seq_losses)  # seq-mean
     elif loss_agg_mode == "seq-mean-token-mean":
-        token_sum = torch.sum(loss_mat * loss_mask, dim=-1)  # token-sum
+        token_sum = torch.sum(scaled_loss_mat * loss_mask, dim=-1)  # token-sum
         token_count = torch.sum(loss_mask, dim=-1)  # token count per sequence
         # Use masked mean approach with epsilon to prevent division by zero
         seq_losses = token_sum / (token_count + 1e-8)  # token-mean with protection
         # Only average over sequences that have at least one valid token
-        valid_seq_mask = (token_count > 0).float()
+        valid_seq_mask = (token_count > 0).to(loss_mat.dtype)
         if valid_seq_mask.sum() > 0:
             loss = (seq_losses * valid_seq_mask).sum() / valid_seq_mask.sum()
         else:
-            loss = torch.tensor(0.0, device=loss_mat.device)
+            loss = loss_mat.sum() * 0.0
     elif loss_agg_mode == "seq-mean-token-sum-norm":
-        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)
-        loss = torch.sum(seq_losses) / loss_mask.shape[-1]  # The divisor
+        seq_losses = torch.sum(scaled_loss_mat * loss_mask, dim=-1)
+        loss = torch.sum(seq_losses) / loss_mask.shape[-1]
         # (loss_mask.shape[-1]) should ideally be constant
         # throughout training to well-replicate the DrGRPO paper.
         # TODO: Perhaps add user-defined normalizer argument to
@@ -898,6 +955,7 @@ def compute_policy_loss_vanilla(
     loss_agg_mode: str = "token-mean",
     config: Optional[DictConfig | AlgoConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    loss_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the clipped policy objective and related metrics for PPO.
@@ -971,7 +1029,12 @@ def compute_policy_loss_vanilla(
     if rollout_is_weights is not None:
         pg_losses = pg_losses * rollout_is_weights
 
-    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    pg_loss = agg_loss(
+        loss_mat=pg_losses,
+        loss_mask=response_mask,
+        loss_agg_mode=loss_agg_mode,
+        loss_weights=loss_weights,
+    )
 
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
@@ -985,6 +1048,7 @@ def compute_policy_loss_gspo(
     loss_agg_mode: str = "seq-mean-token-mean",
     config: Optional[DictConfig | ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    loss_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the clipped policy objective and related metrics for GSPO.
@@ -1035,7 +1099,12 @@ def compute_policy_loss_gspo(
         pg_losses = pg_losses * rollout_is_weights
 
     # for GSPO, we need to aggregate the loss at the sequence level (seq-mean-token-mean)
-    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode="seq-mean-token-mean")
+    pg_loss = agg_loss(
+        loss_mat=pg_losses,
+        loss_mask=response_mask,
+        loss_agg_mode="seq-mean-token-mean",
+        loss_weights=loss_weights,
+    )
 
     # For compatibility, return zero for pg_clipfrac_lower (not used in standard GSPO)
     pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
@@ -1055,6 +1124,7 @@ def compute_policy_loss_gpg(
     loss_agg_mode: str = "token-mean",
     config: Optional[DictConfig | AlgoConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    loss_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Adapted from
     https://github.com/AMAP-ML/GPG/blob/main/VisualThinker-R1-Zero/src/open-r1-multimodal/src/open_r1/trainer/grpo_trainer.py#L495
@@ -1075,7 +1145,12 @@ def compute_policy_loss_gpg(
     if rollout_is_weights is not None:
         pg_losses = pg_losses * rollout_is_weights
 
-    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    pg_loss = agg_loss(
+        loss_mat=pg_losses,
+        loss_mask=response_mask,
+        loss_agg_mode=loss_agg_mode,
+        loss_weights=loss_weights,
+    )
     return pg_loss, torch.tensor(0.0), torch.tensor(0.0), torch.tensor(0.0)
 
 
@@ -1088,6 +1163,7 @@ def compute_policy_loss_clip_cov(
     loss_agg_mode: str = "token-mean",
     config: Optional[DictConfig | AlgoConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    loss_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the clipped policy objective and related metrics for Clip-Cov.
@@ -1174,7 +1250,12 @@ def compute_policy_loss_clip_cov(
     if rollout_is_weights is not None:
         pg_losses = pg_losses * rollout_is_weights
 
-    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    pg_loss = agg_loss(
+        loss_mat=pg_losses,
+        loss_mask=response_mask,
+        loss_agg_mode=loss_agg_mode,
+        loss_weights=loss_weights,
+    )
 
     return pg_loss, pg_clipfrac, ppo_kl, torch.tensor(0.0)
 
@@ -1188,6 +1269,7 @@ def compute_policy_loss_kl_cov(
     loss_agg_mode: str = "token-mean",
     config: Optional[DictConfig | AlgoConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    loss_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the clipped policy objective and related metrics for Clip-Cov.
@@ -1250,7 +1332,12 @@ def compute_policy_loss_kl_cov(
     if rollout_is_weights is not None:
         pg_losses = pg_losses * rollout_is_weights
 
-    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    pg_loss = agg_loss(
+        loss_mat=pg_losses,
+        loss_mask=response_mask,
+        loss_agg_mode=loss_agg_mode,
+        loss_weights=loss_weights,
+    )
 
     return pg_loss, torch.tensor(0.0), ppo_kl_abs, torch.tensor(0.0)
 
@@ -1264,6 +1351,7 @@ def compute_policy_loss_geo_mean(
     loss_agg_mode: str = "token-mean",
     config: Optional[DictConfig | AlgoConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    loss_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the clipped policy objective and related metrics for GMPO.
@@ -1327,7 +1415,20 @@ def compute_policy_loss_geo_mean(
         )
         pg_losses = pg_losses * seq_is_weights
 
-    pg_loss = torch.mean(pg_losses)
+    if loss_weights is None:
+        pg_loss = torch.mean(pg_losses)
+    else:
+        detached_weights = loss_weights.detach().to(device=pg_losses.device, dtype=pg_losses.dtype)
+        if detached_weights.ndim == 2:
+            detached_weights = (
+                detached_weights * response_mask.to(detached_weights.dtype)
+            ).sum(dim=-1) / response_mask.sum(dim=-1).clamp_min(1)
+        if detached_weights.ndim != 1 or detached_weights.shape != pg_losses.shape:
+            raise ValueError(
+                f"loss_weights must reduce to shape {tuple(pg_losses.shape)} for geo_mean, "
+                f"got {tuple(detached_weights.shape)}"
+            )
+        pg_loss = torch.mean(pg_losses * detached_weights)
 
     # higher: ratio is too large that need clamp to clip_high (when adv > 0)
     clipped = torch.ne(negative_approx_kl, negative_approx_kl_clamp)
@@ -1448,6 +1549,7 @@ def compute_policy_loss_tree_segment(
     loss_agg_mode: str = "token-mean",
     config: Optional[DictConfig | AlgoConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    loss_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """PPO policy loss on pre-built segment-level tensors.
 
@@ -1492,7 +1594,12 @@ def compute_policy_loss_tree_segment(
     if rollout_is_weights is not None:
         pg_losses = pg_losses * rollout_is_weights
 
-    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    pg_loss = agg_loss(
+        loss_mat=pg_losses,
+        loss_mask=response_mask,
+        loss_agg_mode=loss_agg_mode,
+        loss_weights=loss_weights,
+    )
 
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 

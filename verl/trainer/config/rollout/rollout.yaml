@@ -289,15 +289,12 @@ tree_search:
   # Maximum depth of the tree
   max_tree_depth: 3
 
-  # Tau for importance.
-  tau_importance: 0.0
-
   # Fill each prompt to branching_factor ** max_tree_depth responses with
   # conventional samples. This fixed target is also used for PPO batch sizing.
   topup_leaves_to_target: True
 
-  # When True, collect all tree nodes (not just leaves) and compute process reward.
-  # Non-leaf reward = mean(children rewards); advantage = node_reward - parent_reward.
+  # When True, compute process reward on all tree nodes. Internal values and
+  # sibling/global moments are weighted by conditional actor probability mass.
   tree_process_reward: False
 
   # Number of samples per prompt in the threshold stats pre-pass (collect_threshold_stats).

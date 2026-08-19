@@ -4,7 +4,7 @@
 
 ## 目录
 1. [Rollout → Tree Decoding 替换与格式对齐](#1-rollout--tree-decoding-替换与格式对齐)
-2. [Entropy Threshold 与 Tau Importance 采样逻辑](#2-entropy-threshold-与-tau-importance-采样逻辑)
+2. [Entropy-only 分叉与阈值标定](#2-entropy-only-分叉与阈值标定)
 3. [Tree Process Reward: Local Advantage 与 Global Advantage](#3-tree-process-reward-local-advantage-与-global-advantage)
 4. [Loss Mode = Tree Segment: 从 Sequence 到 Segment 的切分](#4-loss-mode--tree-segment-从-sequence-到-segment-的切分)
 5. [Tree Segment Batch Strategy = Segment: Micro Batch 更新机制](#5-tree-segment-batch-strategy--segment-micro-batch-更新机制)
@@ -59,19 +59,19 @@ else:
 
 ---
 
-## 2. Entropy Threshold 与 Tau Importance 采样逻辑
+## 2. Entropy-only 分叉与阈值标定
 
 ### 修改位置
 - 主逻辑: `verl/trainer/ppo/ray_trainer.py` (L1257-L1282)
 
 ### 修改思路
 
-为 tree decoding 动态调整搜索空间，使用 entropy threshold 控制探索深度，使用 tau importance 控制采样重要性。
+训练侧显式设置 `branch_trigger_mode="entropy"`、`tau_importance=None`，只用 entropy threshold 决定是否立即分叉。阈值预采样设置 `collect_importance_stats=False`，不会进入 attention/WAAD 计算；WAAD 仅保留给独立 comparison 显式启用。
 
-**收集阈值统计** (`ray_trainer.py` L1260-L1266):
+**收集 entropy 阈值统计** (`ray_trainer.py`):
 
 ```python
-# 在 rollout 前收集熵/重要性阈值统计
+# 在 rollout 前收集 entropy 阈值统计；训练路径不计算 WAAD
 _tree_cfg = self.config.actor_rollout_ref.rollout.get("tree_search", None)
 if _tree_cfg is not None and _tree_cfg.get("enable", False):
     _interval = int(_tree_cfg.get("threshold_stats_interval", 1))
@@ -88,21 +88,33 @@ if _tree_cfg is not None and _tree_cfg.get("enable", False):
 if isinstance(stats_output, list):
     _entropy_vals = [s.meta_info["entropy_p80"] for s in stats_output if "entropy_p80" in s.meta_info]
     _entropy_p80 = float(sum(_entropy_vals) / len(_entropy_vals)) if _entropy_vals else 1.0
-    _imp_vals = [s.meta_info["importance_p80"] for s in stats_output if s.meta_info.get("importance_p80") is not None]
-    _importance_p80 = float(sum(_imp_vals) / len(_imp_vals)) if _imp_vals else None
 else:
     _entropy_p80 = stats_output.meta_info.get("entropy_p80", 1.0)
-    _importance_p80 = stats_output.meta_info.get("importance_p80", None)
 
 # 更新 worker 的阈值
 self.actor_rollout_wg.update_entropy_threshold(_entropy_p80)
-if _importance_p80 is not None:
-    self.actor_rollout_wg.update_tau_importance(_importance_p80)
 ```
 
 **统计日志记录**:
 - `tree/entropy_threshold`: 当前使用的熵阈值
-- `tree/tau_importance`: 当前使用的重要性采样参数
+
+### Tree rollout 的 actor occupancy 权重
+
+Tree leaves 不是 iid actor samples，不能等权训练。trainer 在重算 `old_log_probs` 后，对每个实际展开的 sibling 集合计算：
+
+```math
+p(c\mid s,C)=\frac{\pi_{old}(a_c\mid s)}{\sum_{j\in C(s)}\pi_{old}(a_j\mid s)}
+```
+
+- leaf mass 是所属 root 的 leaf-slot prior，乘以 root-to-leaf 路径上的条件分叉概率；若 root 有 `d` 个 descendant leaves、prompt 共 `N` 条 emitted leaves，则 root prior 为 `d/N`；
+- unique segment 的 reach mass 是所有 descendant leaf mass 之和；
+- 若 tree 有 `m` 个叶子、另有 `k` 条普通 top-up，则展开 tree root 获得 `m/(m+k)` 总质量、每条 top-up 获得 `1/(m+k)`；因此 top-up 质量恰好等于 tree leaf 的平均质量，之后再按 prompt 归一；top-up 完整继承原 rollout 的采样参数与 LoRA；
+- advantage、policy loss、entropy 和 KL 使用同一概率质量；
+- scale 在完整 batch/所有 DP ranks 上一次性归一，micro-batch 不做局部 self-normalization。
+
+这只恢复 actor 在已展开 top-k support 上的条件分布。未展开 tail 无样本，不能声称已经恢复完整 actor iid GRPO。通用 `rollout_is` 与 tree forced-token proposal 尚无正确对齐协议，二者同时启用会显式报错。
+
+当前 actor-mass 的 micro-batch/DP 精确归约只在 FSDP actor 实现；Tree、TreePR 或 TreeSR 若使用 Megatron actor 会在切 batch 前显式报错，避免 Megatron 的 micro-batch/rank 等权平均悄悄改变概率质量。
 
 ---
 
@@ -130,26 +142,28 @@ if _importance_p80 is not None:
 leaf_scores = data.batch["token_level_rewards"].sum(-1).float()
 
 # 从叶节点分数反向传播到所有内部节点
-# 内部节点分数 = 子节点分数的平均
+# 内部节点分数 = 按 conditional actor mass 加权的子节点分数
 for i in internal_nodes_sorted:
     children = children_of[i]
     children_t = torch.tensor(children, dtype=torch.long, device=device)
     child_scores = node_scores[children_t]
-    node_scores[i] = child_scores.mean()
+    child_weights = segment_masses[children_t] / segment_masses[i]
+    node_scores[i] = (child_weights * child_scores).sum()
 ```
 
 #### Step 2: Local Advantage + Global Advantage (`ray_trainer.py` L394-L443)
 
 **Local Advantage (局部优势)**:
 - 相对于父节点和兄弟节点的优势
-- 公式: `(score(s) - score(parent(s))) / (std(siblings) + eps)`
+- 公式: `(score(s) - score(parent(s))) / (weighted_std(siblings) + eps)`
 - 根节点 local advantage = 0
 
 ```python
 for p, children in children_of.items():
     children_t = torch.tensor(children, dtype=torch.long, device=device)
     sibling_scores = node_scores[children_t]
-    sib_std = sibling_scores.std() if len(children) > 1 else torch.tensor(0.0, device=device)
+    sibling_weights = segment_masses[children_t] / segment_masses[p]
+    sib_std = weighted_std(sibling_scores, sibling_weights)
     parent_score = node_scores[p]
     seg_local_advantages[children_t] = (sibling_scores - parent_score) / (sib_std + 1e-6)
 ```
@@ -157,15 +171,16 @@ for p, children in children_of.items():
 **Global Advantage (全局优势)**:
 - 相对于同一 prompt 所有叶节点的优势
 - 按 Prompt 分组计算（类似 GRPO）
-- 公式: `(score(s) - mean(leaf_scores)) / (std(leaf_scores) + eps)`
+- 公式: `(score(s) - weighted_mean(leaf_scores)) / (weighted_std(leaf_scores) + eps)`
 
 ```python
 # 按 prompt 分组计算
 for prompt_id, prompt_leaf_segs in prompt_id_to_leaf_segs.items():
     prompt_leaf_segs_t = torch.tensor(prompt_leaf_segs, dtype=torch.long, device=device)
     prompt_leaf_node_scores = node_scores[prompt_leaf_segs_t]
-    mean_leaf_score = prompt_leaf_node_scores.mean()
-    std_leaf_score = prompt_leaf_node_scores.std() if len(prompt_leaf_node_scores) > 1 else torch.tensor(0.0, device=device)
+    prompt_weights = tree_leaf_masses[prompt_rows]
+    mean_leaf_score = weighted_mean(prompt_leaf_node_scores, prompt_weights)
+    std_leaf_score = weighted_std(prompt_leaf_node_scores, prompt_weights)
     
     # 计算该 prompt 下所有 segment 的 global advantage
     prompt_all_segs = [i for i in range(n_unique) if seg_to_prompt_id.get(i, None) == prompt_id]
@@ -327,9 +342,9 @@ def compute_policy_loss_tree_segment(
 
 #### 整体设计原则
 
-1. **Worker 数据隔离**: 每个 worker 只处理自己 rollout 产生的叶节点和 segments，无需跨 worker 通信
+1. **Worker 数据隔离**: 每个 worker 处理本地叶节点和 segments；仅用 all-reduce 汇总 weight/reducer 的两个标量统计
 2. **Micro Batch 对齐**: 通过 dummy micro-batch 确保所有 worker 的 micro batch 数量一致，避免 FSDP 死锁
-3. **Gradient Accumulation**: 正确调整 gradient accumulation 步数
+3. **Gradient Accumulation**: 用实际 reducer units 合并 micro-batch，保持与未切分 loss 严格等价
 
 #### Micro Batch 对齐机制 (`dp_actor.py` L640-L683, L367-L417)
 
@@ -357,8 +372,8 @@ for m in range(max_micro_batches):
             loss.backward()
         continue
     
-    # Real micro-batch
-    loss_scale_factor = 1 / self.gradient_accumulation
+    # Real micro-batch；mean-style reducer 使用全 DP optimizer group denominator
+    loss_scale_factor = micro_reducer_units * world_size / global_group_reducer_units
     # ... 正常更新 ...
 ```
 
@@ -386,75 +401,47 @@ if use_segment_batching:
         else:
             ppo_micro_batch_segments = max(8, num_assigned_segments // 10)
     
+    target_optimizer_steps = max(1, ceil(local_leaf_count / ppo_mini_batch_size))
     for epoch in range(self.config.ppo_epochs):
-        # 3. Shuffle segments
+        # 3. 先形成与 base GRPO 相同数量的 optimizer groups，再在组内切 micro-batch
         segment_indices = assigned_local_seg_indices.copy()
         random.shuffle(segment_indices)
-        
-        # 4. Split into micro batches
-        segment_micro_batches = [
-            segment_indices[i:i + ppo_micro_batch_segments]
-            for i in range(0, len(segment_indices), ppo_micro_batch_segments)
-        ]
-        num_micro_batches = len(segment_micro_batches)
-        
-        # 5. 重要: gradient_accumulation = micro_batch 数量
-        self.gradient_accumulation = num_micro_batches
-        
-        # 6. Micro batch 对齐（见上）
-        # ... [align + dummy logic] ...
-        
-        self.actor_optimizer.zero_grad()
-        for m in range(max_micro_batches):
-            if is_dummy:
-                # ... dummy ...
-            else:
-                seg_indices = segment_micro_batches[m]
-                
-                # 7. 收集这些 segment 涉及的叶节点
-                seg_canonical = local_tree_seg_targets["seg_canonical"]
-                required_leaves = list({seg_canonical[i][0] for i in seg_indices})
-                
-                # 8. Forward pass on required leaves
-                mini_batch = data[required_leaves]
-                model_inputs = {**mini_batch.batch, **mini_batch.non_tensor_batch}
-                entropy, log_prob = self._forward_micro_batch(...)
-                
-                # 9. 构建 segment log_prob
-                leaf_inverse_map = {global_idx: local_idx for local_idx, global_idx in enumerate(required_leaves)}
-                max_seg_len = local_tree_seg_targets["old_log_prob"].shape[1]
-                log_prob_pieces = []
-                for seg_idx in seg_indices:
-                    leaf_j, tok_offset = seg_canonical[seg_idx]
-                    local_leaf_j = leaf_inverse_map[leaf_j]
-                    seg_len = seg_lens[seg_idx]
-                    end = min(tok_offset + seg_len, log_prob.shape[1])
-                    piece = log_prob[local_leaf_j, tok_offset:end]
-                    if piece.shape[0] < max_seg_len:
-                        piece = torch.nn.functional.pad(piece, (0, max_seg_len - piece.shape[0]))
-                    log_prob_pieces.append(piece)
-                seg_log_prob_local = torch.stack(log_prob_pieces)
-                
-                # 10. 获取其他 segment tensors
-                seg_old_log_prob_local = local_tree_seg_targets["old_log_prob"][seg_indices]
-                seg_advantages_local = local_tree_seg_targets["advantages"][seg_indices]
-                seg_response_mask_local = local_tree_seg_targets["response_mask"][seg_indices]
-                
-                # 11. Compute loss & backward
-                policy_loss_fn = get_policy_loss_fn(loss_mode)
-                pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
-                    old_log_prob=seg_old_log_prob_local,
-                    log_prob=seg_log_prob_local,
-                    advantages=seg_advantages_local,
-                    response_mask=seg_response_mask_local,
-                    ...
+        optimizer_groups = build_optimizer_micro_batches(
+            segment_indices,
+            num_optimizer_steps=target_optimizer_steps,
+            micro_batch_size=ppo_micro_batch_segments,
+        )
+
+        for group in optimizer_groups:
+            # 4. 汇总该 optimizer group 在所有 DP ranks 上的 reducer units
+            global_group_reducer_units = all_reduce_sum(local_group_reducer_units)
+            aligned_group = align_with_zero_scale_dummies(group)
+
+            self.actor_optimizer.zero_grad()
+            for seg_indices in aligned_group:
+                if seg_indices is None:
+                    run_dummy_forward_backward(loss_scale_factor=0.0)
+                    continue
+
+                # 5. 只 forward canonical leaves，并提取 PG/entropy/KL 的相同 segment slice
+                required_leaves = canonical_leaves(seg_indices)
+                entropy, log_prob = self._forward_micro_batch(data[required_leaves], ...)
+                segment_tensors = gather_canonical_slices(
+                    log_prob,
+                    entropy,
+                    ref_log_prob,
+                    seg_indices,
                 )
-                loss_scale_factor = 1 / self.gradient_accumulation
-                loss = policy_loss * loss_scale_factor
-                loss.backward()
-        
-        # Optimizer step after full gradient accumulation
-        grad_norm = self._optimizer_step()
+                policy_loss = compute_weighted_segment_loss(segment_tensors)
+
+                # 6. 用固定的全组 denominator 合并 micro-batch；不在 micro 内重归一权重
+                loss_scale_factor = (
+                    micro_reducer_units * world_size / global_group_reducer_units
+                )
+                (policy_loss * loss_scale_factor).backward()
+
+            # 每个 group 恰好对应一次 base-GRPO optimizer step
+            self._optimizer_step()
 ```
 
 #### Leaf-Based Batch 兼容路径 (`dp_actor.py` L980-L1087)
@@ -467,13 +454,8 @@ if local_to_global_seg_idx_map is None:
     # 原始行为
     seg_indices = [i for i, (leaf_j, _) in enumerate(seg_canonical) if leaf_j in present_leaves]
 else:
-    # 新: 同时确保该 segment 归属于该 worker（通过 global_seg_idx % world_size == rank）
-    seg_indices = []
-    for i, (leaf_j, _) in enumerate(seg_canonical):
-        if leaf_j in present_leaves:
-            global_seg_idx = local_to_global_seg_idx_map[i]
-            if global_seg_idx % world_size == rank:
-                seg_indices.append(i)
+    # DataProto.chunk 已完成 local segment 重映射；禁止再次按 rank 取模过滤
+    seg_indices = [i for i, (leaf_j, _) in enumerate(seg_canonical) if leaf_j in present_leaves]
 ```
 
 ---

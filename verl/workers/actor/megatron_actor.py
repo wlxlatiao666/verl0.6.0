@@ -320,6 +320,12 @@ class MegatronPPOActor(BasePPOActor):
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
             select_keys.append("rollout_is_weights")
+        if "tree_loss_scales" in data.batch.keys():
+            raise NotImplementedError(
+                "Actor-occupancy-weighted tree rollout currently requires the FSDP data-parallel actor. "
+                "Megatron averages per-microbatch reducers and data-parallel ranks without the global "
+                "token/sequence-unit correction needed to preserve tree masses."
+            )
         self.has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         if self.has_multi_modal_inputs:
             data = data.select(select_keys, ["multi_modal_inputs"])

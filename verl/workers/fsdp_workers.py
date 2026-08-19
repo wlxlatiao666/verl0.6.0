@@ -962,10 +962,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.rollout.update_entropy_threshold(threshold)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def update_tau_importance(self, tau: float):
-        self.rollout.update_tau_importance(tau)
-
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def collect_threshold_stats(self, prompts: DataProto) -> DataProto:
         prompts = prompts.to(get_device_id())
         if self._is_actor:

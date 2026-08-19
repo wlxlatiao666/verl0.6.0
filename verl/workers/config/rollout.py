@@ -94,21 +94,20 @@ class ServerConfig(BaseConfig):
 
 @dataclass
 class TreeSearchConfig(BaseConfig):
-    """Configuration for vLLM tree search (tree decoding) rollout."""
+    """Configuration for entropy-triggered vLLM tree decoding."""
 
     enable: bool = False
     entropy_threshold: float = 1.0
     branching_factor: int = 3
     max_tree_depth: int = 3
-    tau_importance: float = 0.0
     # Fill a partially expanded tree with conventional samples until every
     # prompt has branching_factor ** max_tree_depth responses. Besides keeping
     # the rollout group size fixed, this also defines the effective rollout
     # multiplicity used to normalize PPO mini-batches.
     topup_leaves_to_target: bool = True
-    # When True, collect all tree nodes (not just leaves) and compute
-    # process reward: non-leaf reward = mean(children rewards),
-    # advantage = node_reward - parent_reward (root advantage = 0).
+    # When True, collect all tree nodes (not just leaves) and compute process
+    # reward. Internal values and sibling/global moments use conditional actor
+    # probability mass; the root local advantage is zero.
     tree_process_reward: bool = False
     # Number of samples per prompt used in the threshold stats pre-pass.
     threshold_stats_n: int = 1

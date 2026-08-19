@@ -105,8 +105,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.tree_search.branching_factor=${TREE_BF} \
     actor_rollout_ref.rollout.tree_search.max_tree_depth=${TREE_DEPTH} \
     actor_rollout_ref.rollout.tree_search.tree_process_reward=True \
-    +algorithm.tree_process_reward.local_adv_weight=${TREE_PR_LAMBDA} \
-    +algorithm.tree_process_reward.global_adv_weight=$(awk -v v=${TREE_PR_LAMBDA} 'BEGIN{print 1.0-v}') \
+    +algorithm.local_adv_weight=${TREE_PR_LAMBDA} \
+    +algorithm.global_adv_weight=$(awk -v v=${TREE_PR_LAMBDA} 'BEGIN{print 1.0-v}') \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     reward_model.reward_manager=dapo \
