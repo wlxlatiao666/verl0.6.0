@@ -1,0 +1,27 @@
+TREE_DECODING_VERL_VLLM_IMPLEMENTATION.md
+  s_98a88c96083a00::t_ada0ad0784e1c5 215-221,280-284
+tests/utils/test_torch_functional.py
+  s_98a88c96083a00::t_6463eb9d075f72 22-27,74-90
+verl/utils/torch_functional.py
+  s_98a88c96083a00::t_4da00428238113 249-270
+verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+  s_98a88c96083a00::t_fe4f7d2adc3cc0 70,929-946,962-966,1007-1016
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "45a3421aa5af299edff41aaf7ce640b8a82d2172",
+  "prompts": {},
+  "sessions": {
+    "s_98a88c96083a00": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a00f92-8256-7381-b72b-3375f7085fc1",
+        "model": "unknown"
+      },
+      "human_author": "weilongxuan <weilongxuan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
