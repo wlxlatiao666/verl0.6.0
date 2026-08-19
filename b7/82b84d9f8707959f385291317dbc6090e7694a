@@ -1,0 +1,35 @@
+README_tree.md
+  s_98a88c96083a00::t_07d523d94ba8ae 109,111
+TREE_DECODING_VERL_VLLM_IMPLEMENTATION.md
+  s_98a88c96083a00::t_0843d143823810 298-299,325,334-346,670,799
+tests/trainer/ppo/test_tree_weighting_on_cpu.py
+  s_98a88c96083a00::t_72422e247962e1 66,84,86-173
+verl/trainer/ppo/tree_weighting.py
+  s_6279b306d869a0::t_f8aa80ce35eedb 46-49,174-188,191-194
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b782b84d9f8707959f385291317dbc6090e7694a",
+  "prompts": {},
+  "sessions": {
+    "s_6279b306d869a0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a018f6-3948-7dc1-85f0-4c107ffbfb59",
+        "model": "unknown"
+      },
+      "human_author": "weilongxuan <weilongxuan@bytedance.com>"
+    },
+    "s_98a88c96083a00": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a00f92-8256-7381-b72b-3375f7085fc1",
+        "model": "unknown"
+      },
+      "human_author": "weilongxuan <weilongxuan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
