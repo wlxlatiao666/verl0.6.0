@@ -246,6 +246,28 @@ def get_response_mask(response_id: torch.Tensor, eos_token: int | list[int] = 2,
     return (eos_mask.cumsum(dim=1) - eos_mask).eq(0).to(dtype)
 
 
+def get_response_mask_from_lengths(
+    response_id: torch.Tensor,
+    response_lengths: torch.Tensor | list[int],
+    dtype=torch.int64,
+) -> torch.Tensor:
+    """Build a right-padded response mask from the emitted token lengths.
+
+    This avoids treating the first padding position as a generated EOS token
+    when a decoder-only tokenizer uses the same id for PAD and EOS.
+    """
+    lengths = torch.as_tensor(response_lengths, device=response_id.device)
+    if response_id.ndim != 2 or lengths.ndim != 1 or lengths.shape[0] != response_id.shape[0]:
+        raise ValueError(
+            "response_id must be rank 2 and response_lengths must contain one length per row, "
+            f"got response_id={tuple(response_id.shape)}, response_lengths={tuple(lengths.shape)}"
+        )
+    if torch.any(lengths < 0) or torch.any(lengths > response_id.shape[1]):
+        raise ValueError(f"response lengths must be within [0, {response_id.shape[1]}]")
+    positions = torch.arange(response_id.shape[1], device=response_id.device).unsqueeze(0)
+    return (positions < lengths.unsqueeze(1)).to(dtype)
+
+
 def compute_grad_norm(model: nn.Module):
     total_grad_square = 0
     for param in model.parameters():

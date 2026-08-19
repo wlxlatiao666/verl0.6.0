@@ -67,7 +67,7 @@ from verl.utils.device import is_npu_available
 from verl.utils.distributed import initialize_global_process_group_ray
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.ray_utils import ray_noset_visible_devices
-from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
+from verl.utils.torch_functional import get_response_mask, get_response_mask_from_lengths, pad_2d_list_to_length
 from verl.utils.tree_training import is_tree_process_reward_enabled
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack, is_version_ge
 from verl.workers.config import HFModelConfig, RolloutConfig
@@ -926,6 +926,24 @@ class vLLMRollout(BaseRollout):
                         "Active tree rollout emitted out-of-range segment indices for response paths "
                         f"{invalid_segment_paths[:8]}."
                     )
+                path_response_mismatches = []
+                for leaf_idx, path in enumerate(leaf_segment_indices):
+                    path_tokens = [
+                        token
+                        for segment_idx in path
+                        for token in unique_segments[int(segment_idx)]
+                    ]
+                    emitted_tokens = list(response[leaf_idx])
+                    if path_tokens != emitted_tokens:
+                        path_response_mismatches.append(
+                            (leaf_idx, len(path_tokens), len(emitted_tokens))
+                        )
+                if path_response_mismatches:
+                    raise RuntimeError(
+                        "Active tree rollout segment paths must reconstruct the unpadded responses exactly; "
+                        "mismatches are (leaf, path_tokens, response_tokens)="
+                        f"{path_response_mismatches[:8]}."
+                    )
 
             if _tree_process_reward:
                 if len(token_share_weights) != len(response):
@@ -941,6 +959,11 @@ class vLLMRollout(BaseRollout):
                         "Tree process reward token_share_weights must align with every unpadded response."
                     )
 
+            # Preserve the actual emitted lengths before padding.  In many
+            # decoder-only tokenizers PAD equals EOS; deriving a tree mask by
+            # scanning the padded ids would then count the first padding EOS
+            # as an extra generated token for a length-capped tree leaf.
+            unpadded_response_lengths = [len(tokens) for tokens in response]
             response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(
                 idx.device
             )
@@ -981,9 +1004,16 @@ class vLLMRollout(BaseRollout):
         # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
         response_position_ids = position_ids[..., -1:] + delta_position_id
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-        response_attention_mask = get_response_mask(
-            response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype
-        )
+        if _tree_search_active:
+            response_attention_mask = get_response_mask_from_lengths(
+                response_id=response,
+                response_lengths=unpadded_response_lengths,
+                dtype=attention_mask.dtype,
+            )
+        else:
+            response_attention_mask = get_response_mask(
+                response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype
+            )
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
 
         # all the tp ranks should contain the same data here. data in all ranks are valid

@@ -19,7 +19,12 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from verl.utils.torch_functional import distributed_masked_mean, distributed_mean_max_min_std, masked_mean
+from verl.utils.torch_functional import (
+    distributed_masked_mean,
+    distributed_mean_max_min_std,
+    get_response_mask_from_lengths,
+    masked_mean,
+)
 
 
 def _worker_mean(rank: int, world_size: int, rendezvous_file: str):
@@ -64,6 +69,23 @@ def test_masked_mean(value, mask, gt):
     res = masked_mean(torch.tensor(value), torch.tensor(mask))
     gt = torch.tensor(gt)
     assert torch.allclose(res, gt) or (torch.isnan(res) and torch.isnan(gt))
+
+
+def test_response_mask_from_lengths_does_not_count_padding_eos():
+    # PAD and EOS deliberately share id=2.  The first row emitted three real
+    # tokens ending in EOS; the second row was length-capped before EOS.
+    responses = torch.tensor([[10, 11, 2, 2, 2], [20, 21, 22, 2, 2]])
+    mask = get_response_mask_from_lengths(responses, [3, 3], dtype=torch.int64)
+    torch.testing.assert_close(
+        mask,
+        torch.tensor([[1, 1, 1, 0, 0], [1, 1, 1, 0, 0]]),
+    )
+
+
+@pytest.mark.parametrize("lengths", [[-1, 3], [3, 6], [3]])
+def test_response_mask_from_lengths_rejects_invalid_lengths(lengths):
+    with pytest.raises(ValueError):
+        get_response_mask_from_lengths(torch.zeros(2, 5), lengths)
 
 
 @pytest.mark.parametrize("world_size", [2, 4])

@@ -212,6 +212,13 @@ importance_list
 - deferred parent 还会去掉 probe token；
 - detokenizer 记录每个 token 实际贡献的字符数，避免按字符串长度猜测 token 边界。
 
+长度口径必须分开：forced branch token 已经位于 child prompt 中，所以 vLLM 通用
+`Sequence.get_output_len()` 只统计该 child 真正生成的 token；tree 专用的
+`get_tree_segment_len()` 才额外包含 forced token，并且只用于 `min_seg_length`
+判断。否则 forced token 会同时占用 prompt 和 output budget，每深入一层就少生成一个
+token。immediate 分支的“parent 去掉一个、child 补回一个”数量守恒；deferred 分支
+额外丢弃 probe token，因此只在 deferred child 的剩余预算中补一个 token。
+
 注意：`RequestOutput.outputs` 同时包含内部节点和叶节点；只有 `is_leaf=True` 的 root-to-leaf 拼接结果才是完整候选答案。
 
 ### 2.8 阈值统计模式
@@ -269,6 +276,11 @@ importance_list
 3. 将路径反转为 root-to-leaf；
 4. 拼接每个节点的 `tree_ids`，形成完整 response；
 5. 记录该 response 属于哪个原始 prompt。
+
+padding 前会逐叶校验 `sum(segment lengths) == len(response)`。Tree response 的
+attention mask 按 padding 前真实长度构造，不再扫描 padded token id；这避免
+Qwen 等 `pad_token_id == eos_token_id` 的模型把第一个 padding EOS 误计为一个真实
+生成 token。
 
 Tree rollout 会写入 routing metadata：
 
