@@ -1,0 +1,71 @@
+README_tree.md
+  s_98a88c96083a00::t_81a016c6b59c84 7,62,69,71,74,100-117,145,150-151,158,165-166,174,181-183,345,347,375-376,404,406,409-439,441-444,457-458
+TREE_DECODING_VERL_VLLM_IMPLEMENTATION.md
+  s_98a88c96083a00::t_747a85b8190ef8 3,19,30-36,39,41-42,78,92-94,131,151-153,219,254,257-258,296,298,305-306,308-309,311,313,315,321,324-327,329-333,335-337,357,360,375,415-422,533-534,568-572,596,614,616,624,631,657,659,661-663,667-668,672,676-677,683,685-686,690-691,694,698,719,721,729,739,757,759,764-766,786
+tests/trainer/ppo/test_tree_process_weighting_on_cpu.py
+  s_987067fa9ad8e7::t_8b5e11d0a24280 1-103
+tests/trainer/ppo/test_tree_weighting_on_cpu.py
+  s_98a88c96083a00::t_26a1c0b49caac7 1-432
+tree/run_qwen2.5-base7b-treepr.sh
+  s_98a88c96083a00::t_a3cd1c08f27eec 13
+tree/run_qwen2.5-base7b-treerollout.sh
+  s_98a88c96083a00::t_4cf82ac28c3f6e 13
+tree/scripts/run_qwen2.5-math7b-tree-segment-b3d3.sh
+  s_98a88c96083a00::t_bb8e9a098ff926 84-86
+tree/scripts/train_qwen2.5-3b_gsm8k_grpo_treepr.sh
+  s_98a88c96083a00::t_ea2949176b5a35 108-109
+tree/scripts/train_qwen2.5-3b_math_grpo_treepr.sh
+  s_98a88c96083a00::t_f3f8eb38bccb79 109-110
+tree_decoding_comparison/tree_decoding_comparison.py
+  s_7b3bce62f6a26a::t_37840a66753205 471-473
+verl/trainer/config/rollout/rollout.yaml
+  s_98a88c96083a00::t_236692848c0c81 296-297
+verl/trainer/ppo/core_algos.py
+  s_98a88c96083a00::t_199c3529b1cd34 44-46,273,292-294,309,315-322,325-326,329-330,333-345,799-804,815-821,826-843,845,847,850,855,859,861-862,958,1032-1037,1051,1102-1107,1127,1148-1153,1166,1253-1258,1272,1335-1340,1354,1418-1431,1552,1597-1602
+verl/trainer/ppo/ray_trainer.py
+  s_98a88c96083a00::t_cde6cac78323cb 55-59,160-167,254,282,316,402-406,412-417,437-444,460-478,495-500,502-514,1220-1232,1338,1546-1558,1572-1578,1602-1613,1655-1706,1708-1713,1716,1813-1817
+verl/trainer/ppo/tree_weighting.py
+  s_98a88c96083a00::t_2612ce4394dcc5 1-362
+verl/workers/actor/dp_actor.py
+  s_98a88c96083a00::t_441f8e6bd1789c 27,35-40,59-68,660-667,678-693,710,741,785,788-811,815-820,915-926,1106-1118,1139,1149-1155,1159,1172-1174,1192,1220-1226,1238-1254,1339-1362,1448-1451,1453,1455-1483,1519,1528-1536,1538-1547,1550,1570,1580-1586,1590,1602-1614,1627,1662,1673,1696-1714,1727-1765
+verl/workers/actor/megatron_actor.py
+  s_98a88c96083a00::t_2a8b1d01eff801 323-328
+verl/workers/config/rollout.py
+  s_98a88c96083a00::t_d5957dbba223aa 97,108-110
+verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+  s_98a88c96083a00::t_204836e725fd56 245-248,263,289-293,295-318,323,336,429-434,526-528,661-665,670-678,684-688,693,740-742,820,913,916,926,930-943
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5788a4ea3bbca70e9a3f8e6a65c0941952dc455c",
+  "prompts": {},
+  "sessions": {
+    "s_7b3bce62f6a26a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0182c-4260-7d62-a4ea-1adac11a5bdf",
+        "model": "unknown"
+      },
+      "human_author": "weilongxuan <weilongxuan@bytedance.com>"
+    },
+    "s_987067fa9ad8e7": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a01829-c3f2-7141-b9b5-d8eeefb539c9",
+        "model": "unknown"
+      },
+      "human_author": "weilongxuan <weilongxuan@bytedance.com>"
+    },
+    "s_98a88c96083a00": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a00f92-8256-7381-b72b-3375f7085fc1",
+        "model": "unknown"
+      },
+      "human_author": "weilongxuan <weilongxuan@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
