@@ -52,6 +52,11 @@ from verl.trainer.ppo.metric_utils import (
 )
 from verl.trainer.ppo.mismatch_helper import compute_rollout_importance_weights
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
+from verl.trainer.ppo.tree_weighting import (
+    compute_conditional_topk_tree_weights,
+    compute_segment_reach_masses,
+    normalize_tree_loss_scales,
+)
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
@@ -152,7 +157,14 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     token_level_rewards = token_level_scores - beta * kld
 
     current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence
-    current_kl = torch.mean(current_kl, dim=0).item()
+    tree_leaf_masses = data.batch.get("tree_leaf_masses")
+    if tree_leaf_masses is None:
+        current_kl = torch.mean(current_kl, dim=0).item()
+    else:
+        tree_leaf_masses = tree_leaf_masses.detach().to(current_kl)
+        current_kl = (
+            (current_kl * tree_leaf_masses).sum() / tree_leaf_masses.sum().clamp_min(1e-8)
+        ).item()
 
     # according to https://github.com/huggingface/trl/blob/951ca1841f29114b969b57b26c7d3e80a39f75a0/trl/trainer/ppo_trainer.py#L837
     kl_ctrl.update(current_kl=current_kl, n_steps=batch_size)
@@ -239,6 +251,7 @@ def compute_advantage(
             response_mask=grpo_calculation_mask,
             index=data.non_tensor_batch["uid"],
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            sample_weights=data.batch.get("tree_leaf_masses"),
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
@@ -266,7 +279,7 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
     """Compute per-segment advantages for tree process reward.
 
     Step 1 — Back-propagate leaf scores to all nodes (bottom-up):
-        non-leaf score = mean(children scores)
+        non-leaf score = actor-conditional mean(children scores)
         leaf score = sum of token_level_rewards for that leaf
 
     Step 2 — Compute advantages combining local and global signals:
@@ -300,6 +313,7 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
     if unique_segments is None:
         unique_segments = data.meta_info["metrics"]["unique_segments"]
     leaf_segment_indices = data.non_tensor_batch["leaf_segment_indices"]  # (n_leaves,) of lists
+    leaf_masses = data.batch.get("tree_leaf_masses")
     worker_segments_offsets = data.non_tensor_batch.get("worker_segments_offsets")
 
     if worker_segments_offsets is not None:
@@ -385,12 +399,22 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
     # Sort internal nodes by depth descending (compute deeper nodes first)
     internal_nodes_sorted = sorted(internal_nodes, key=lambda i: -seg_depth[i])
 
+    segment_masses = None
+    if leaf_masses is not None:
+        leaf_masses = leaf_masses.detach().to(device=device, dtype=torch.float32)
+        segment_masses = compute_segment_reach_masses(leaf_masses, leaf_segment_indices, n_unique)
+
     # Compute scores for internal nodes bottom-up
     for i in internal_nodes_sorted:
         children = children_of[i]
         children_t = torch.tensor(children, dtype=torch.long, device=device)
         child_scores = node_scores[children_t]
-        node_scores[i] = child_scores.mean()
+        if segment_masses is None:
+            node_scores[i] = child_scores.mean()
+        else:
+            child_weights = segment_masses[children_t]
+            child_weights = child_weights / child_weights.sum().clamp_min(1e-8)
+            node_scores[i] = torch.sum(child_weights * child_scores)
     print(f"[DEBUG] [compute_tree_process_advantage] node_scores range: [{node_scores.min():.4f}, {node_scores.max():.4f}]")
 
     # ── Step 2: combine local and global advantages ──────────────────────────
@@ -409,8 +433,15 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
     for p, children in children_of.items():
         children_t = torch.tensor(children, dtype=torch.long, device=device)
         sibling_scores = node_scores[children_t]
-        sib_std = sibling_scores.std() if len(children) > 1 else torch.tensor(0.0, device=device)
         parent_score = node_scores[p]
+        if segment_masses is None:
+            sib_std = sibling_scores.std() if len(children) > 1 else torch.tensor(0.0, device=device)
+        else:
+            sibling_weights = segment_masses[children_t]
+            sibling_weights = sibling_weights / sibling_weights.sum().clamp_min(1e-8)
+            sib_std = torch.sqrt(
+                torch.sum(sibling_weights * (sibling_scores - parent_score).square()).clamp_min(0)
+            )
         seg_local_advantages[children_t] = (sibling_scores - parent_score) / (sib_std + 1e-6)
 
     # Compute global advantage PER PROMPT GROUP (like GRPO)
@@ -426,8 +457,25 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
     for prompt_id, prompt_leaf_segs in prompt_id_to_leaf_segs.items():
         prompt_leaf_segs_t = torch.tensor(prompt_leaf_segs, dtype=torch.long, device=device)
         prompt_leaf_node_scores = node_scores[prompt_leaf_segs_t]
-        mean_leaf_score = prompt_leaf_node_scores.mean()
-        std_leaf_score = prompt_leaf_node_scores.std() if len(prompt_leaf_node_scores) > 1 else torch.tensor(0.0, device=device)
+        if leaf_masses is None:
+            mean_leaf_score = prompt_leaf_node_scores.mean()
+            std_leaf_score = (
+                prompt_leaf_node_scores.std()
+                if len(prompt_leaf_node_scores) > 1
+                else torch.tensor(0.0, device=device)
+            )
+        else:
+            prompt_leaf_rows = torch.tensor(
+                [leaf_seg_to_leaf_idx[seg_idx] for seg_idx in prompt_leaf_segs],
+                dtype=torch.long,
+                device=device,
+            )
+            prompt_leaf_weights = leaf_masses[prompt_leaf_rows]
+            prompt_leaf_weights = prompt_leaf_weights / prompt_leaf_weights.sum().clamp_min(1e-8)
+            mean_leaf_score = torch.sum(prompt_leaf_weights * prompt_leaf_node_scores)
+            std_leaf_score = torch.sqrt(
+                torch.sum(prompt_leaf_weights * (prompt_leaf_node_scores - mean_leaf_score).square()).clamp_min(0)
+            )
 
         # Get all segments in this prompt (not just leaf segments)
         prompt_all_segs = [i for i in range(n_unique) if seg_to_prompt_id.get(i, None) == prompt_id]
@@ -444,14 +492,26 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
     # Each leaf's response is the concatenation of its path segments in order.
     # We fill token positions with the advantage of the segment they belong to.
     # Segments shared across leaves use the same pre-computed advantage (no duplication).
-    seg_leaf_count = np.zeros(n_unique, dtype=np.int64)
-    for path in leaf_segment_indices:
+    # Compute the mean over unique valid segments, not over the physically
+    # duplicated leaf responses. Otherwise a widely shared prefix inflates the
+    # length-balancing constant by its descendant count.
+    unique_valid_seg_lens: dict[int, int] = {}
+    for leaf_idx, path in enumerate(leaf_segment_indices):
+        pos = 0
         for seg_idx in path:
-            seg_leaf_count[seg_idx] += 1
-
-    total_response_tokens = int(response_mask.sum().item())
-    mean_seg_len = total_response_tokens / max(n_unique, 1)
-    print(f"[DEBUG] [compute_tree_process_advantage] total_response_tokens={total_response_tokens}, mean_seg_len={mean_seg_len:.2f}")
+            seg_len = len(unique_segments[seg_idx])
+            end = min(pos + seg_len, resp_len)
+            if seg_idx not in unique_valid_seg_lens:
+                unique_valid_seg_lens[seg_idx] = int(response_mask[leaf_idx, pos:end].sum().item())
+            pos += seg_len
+            if pos >= resp_len:
+                break
+    valid_unique_lens = [length for length in unique_valid_seg_lens.values() if length > 0]
+    mean_seg_len = float(np.mean(valid_unique_lens)) if valid_unique_lens else 1.0
+    print(
+        "[DEBUG] [compute_tree_process_advantage] "
+        f"valid_unique_segments={len(valid_unique_lens)}, mean_seg_len={mean_seg_len:.2f}"
+    )
 
     token_advantages = torch.zeros(n_leaves, resp_len, dtype=torch.float32, device=device)
     for j, path in enumerate(leaf_segment_indices):
@@ -1157,6 +1217,19 @@ class RayPPOTrainer:
                 - updated_batch: Batch with rollout_is_weights added (if rollout_is=True)
                 - metrics: Dictionary of IS and mismatch metrics (all with mismatch/ prefix)
         """
+        if (
+            "tree_leaf_masses" in batch.batch
+            and self.config.algorithm.rollout_is_threshold is not None
+            and "rollout_log_probs" in batch.batch
+        ):
+            raise ValueError(
+                "Generic rollout importance sampling is not supported together with tree decoding. "
+                "A forced branch token belongs to the tree proposal, but the current vLLM output logprobs "
+                "only align with the generated continuation. Disable algorithm.rollout_is_threshold (and "
+                "rollout.calculate_log_probs), or implement an explicit tree-proposal logprob protocol. "
+                "Tree actor-occupancy correction is already applied through tree_leaf_masses."
+            )
+
         # Compute rollout IS weights if enabled and data is available
         # rollout_is_threshold is the main on/off switch
         if self.config.algorithm.rollout_is_threshold is not None and "rollout_log_probs" in batch.batch:
@@ -1262,9 +1335,7 @@ class RayPPOTrainer:
                 gen_batch.meta_info["global_steps"] = self.global_steps
                 gen_batch = gen_batch.repeat(self.config.actor_rollout_ref.rollout.n, interleave=True)
 
-                # Collect entropy/importance threshold stats for tree search before rollout.
-                # Runs a lightweight forward pass with collect_threshold_stats=True so that
-                # entropy_threshold and tau_importance reflect the current batch/model state.
+                # Calibrate the entropy-only tree trigger before rollout.
                 _tree_cfg = self.config.actor_rollout_ref.rollout.get("tree_search", None)
                 if _tree_cfg is not None and _tree_cfg.get("enable", False):
                     _interval = int(_tree_cfg.get("threshold_stats_interval", 1))
@@ -1276,18 +1347,11 @@ class RayPPOTrainer:
                             if isinstance(stats_output, list):
                                 _entropy_vals = [s.meta_info["entropy_p80"] for s in stats_output if "entropy_p80" in s.meta_info]
                                 _entropy_p80 = float(sum(_entropy_vals) / len(_entropy_vals)) if _entropy_vals else 1.0
-                                _imp_vals = [s.meta_info["importance_p80"] for s in stats_output if s.meta_info.get("importance_p80") is not None]
-                                _importance_p80 = float(sum(_imp_vals) / len(_imp_vals)) if _imp_vals else None
                             else:
                                 _entropy_p80 = stats_output.meta_info.get("entropy_p80", 1.0)
-                                _importance_p80 = stats_output.meta_info.get("importance_p80", None)
                         self.actor_rollout_wg.update_entropy_threshold(_entropy_p80)
                         print("entropy_threshold:", _entropy_p80)
-                        print("importance_threshold:", _importance_p80)
                         metrics["tree/entropy_threshold"] = _entropy_p80
-                        if _importance_p80 is not None:
-                            self.actor_rollout_wg.update_tau_importance(_importance_p80)
-                            metrics["tree/tau_importance"] = _importance_p80
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
@@ -1479,13 +1543,23 @@ class RayPPOTrainer:
                         "worker_segments_offsets",
                         "worker_leaves_offsets",
                     )
+                    if _tree_rollout_enabled:
+                        missing_tree_fields = [
+                            key
+                            for key in ("unique_segments", "leaf_segment_indices")
+                            if key not in gen_batch_output.non_tensor_batch
+                        ]
+                        if missing_tree_fields:
+                            raise RuntimeError(
+                                "tree_search.enable=True requires topology for actor-occupancy weighting, but "
+                                f"fields {missing_tree_fields} are missing. Regenerate the rollout instead of "
+                                "reusing an incompatible skip_rollout cache."
+                            )
+
                     if _tree_process_reward_enabled:
                         missing_process_fields = []
                         if "token_share_weights" not in gen_batch_output.batch.keys():
                             missing_process_fields.append("token_share_weights")
-                        for key in ("unique_segments", "leaf_segment_indices"):
-                            if key not in gen_batch_output.non_tensor_batch:
-                                missing_process_fields.append(key)
                         if missing_process_fields:
                             raise RuntimeError(
                                 "tree_process_reward=True requires a matching tree-process rollout, but fields "
@@ -1495,12 +1569,13 @@ class RayPPOTrainer:
                     else:
                         if "token_share_weights" in gen_batch_output.batch.keys():
                             gen_batch_output.batch.pop("token_share_weights")
-                        for key in _process_non_tensor_keys:
-                            gen_batch_output.non_tensor_batch.pop(key, None)
-                        rollout_metrics = gen_batch_output.meta_info.get("metrics", {})
-                        if isinstance(rollout_metrics, dict):
-                            for key in ("unique_segments", "leaf_segment_indices"):
-                                rollout_metrics.pop(key, None)
+                        if not _tree_rollout_enabled:
+                            for key in _process_non_tensor_keys:
+                                gen_batch_output.non_tensor_batch.pop(key, None)
+                            rollout_metrics = gen_batch_output.meta_info.get("metrics", {})
+                            if isinstance(rollout_metrics, dict):
+                                for key in ("unique_segments", "leaf_segment_indices"):
+                                    rollout_metrics.pop(key, None)
                     batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
@@ -1524,8 +1599,18 @@ class RayPPOTrainer:
                             bs = len(batch.batch)
                             remainder = bs % world_size
                             if remainder != 0:
-                                batch = batch[:bs - remainder]
-                                print(f"[DataSplitFix] Trimmed {remainder} samples to make batch size divisible by {world_size}")
+                                if _tree_rollout_enabled:
+                                    raise RuntimeError(
+                                        "Tree rollout batch cannot be made data-parallel divisible by trimming "
+                                        f"individual leaves: batch_size={bs}, world_size={world_size}, "
+                                        f"remainder={remainder}. Adjust the prompt batch/tree leaf target so "
+                                        "complete prompt groups are retained."
+                                    )
+                                batch = batch[: bs - remainder]
+                                print(
+                                    f"[DataSplitFix] Trimmed {remainder} samples to make batch size divisible "
+                                    f"by {world_size}"
+                                )
                             # Remove worker offsets if they exist (they cause unequal chunking)
                             for key in ["worker_leaves_offsets", "worker_segments_offsets"]:
                                 if key in batch.non_tensor_batch:
@@ -1567,12 +1652,68 @@ class RayPPOTrainer:
                         print(f"[DEBUG] Finished compute_log_prob at {time.time()}")
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]
+                        batch = batch.union(old_log_prob)
+
+                        if _tree_rollout_enabled:
+                            actor_loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get(
+                                "loss_mode", "vanilla"
+                            )
+                            tree_scale_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                            if (
+                                actor_loss_mode in {"gspo", "geo_mean"}
+                                and tree_scale_agg_mode != "seq-mean-token-mean"
+                            ):
+                                raise ValueError(
+                                    f"Tree weighting with {actor_loss_mode!r} requires "
+                                    "actor.loss_agg_mode=seq-mean-token-mean so PG, entropy, KL, "
+                                    "and fixed microbatch scales use the same sequence reducer; "
+                                    f"got {tree_scale_agg_mode!r}."
+                                )
+                            tree_weights = compute_conditional_topk_tree_weights(
+                                old_log_probs=batch.batch["old_log_probs"],
+                                response_mask=response_masks,
+                                unique_segments=tree_data_cache["unique_segments"],
+                                leaf_segment_indices=tree_data_cache["leaf_segment_indices"],
+                                prompt_ids=batch.non_tensor_batch["uid"],
+                            )
+                            batch.batch["tree_leaf_masses"] = tree_weights.leaf_masses
+                            batch.batch["tree_loss_scales"] = normalize_tree_loss_scales(
+                                tree_weights.leaf_masses,
+                                response_masks,
+                                tree_scale_agg_mode,
+                            )
+                            if tree_weights.branch_coverages.numel() > 0:
+                                metrics["tree/actor_topk_coverage_min"] = float(
+                                    tree_weights.branch_coverages.min().item()
+                                )
+                                metrics["tree/actor_topk_coverage_mean"] = float(
+                                    tree_weights.branch_coverages.mean().item()
+                                )
+                            prompt_ess = []
+                            prompt_ids = batch.non_tensor_batch["uid"]
+                            for prompt_id in np.unique(prompt_ids):
+                                prompt_rows = np.flatnonzero(prompt_ids == prompt_id)
+                                prompt_rows_t = torch.as_tensor(
+                                    prompt_rows,
+                                    device=tree_weights.leaf_masses.device,
+                                    dtype=torch.long,
+                                )
+                                prompt_mass = tree_weights.leaf_masses[prompt_rows_t]
+                                prompt_ess.append(float((1.0 / prompt_mass.square().sum()).item()))
+                            if prompt_ess:
+                                metrics["tree/actor_leaf_ess_mean"] = float(np.mean(prompt_ess))
+                                metrics["tree/actor_leaf_mass_max"] = float(tree_weights.leaf_masses.max().item())
+
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                        entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
+                        entropy_agg = agg_loss(
+                            loss_mat=entropys,
+                            loss_mask=response_masks,
+                            loss_agg_mode=loss_agg_mode,
+                            loss_weights=batch.batch.get("tree_loss_scales"),
+                        )
                         old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
                         metrics.update(old_log_prob_metrics)
-                        old_log_prob.batch.pop("entropys")
-                        batch = batch.union(old_log_prob)
+                        batch.batch.pop("entropys")
 
                         if "rollout_log_probs" in batch.batch.keys():
                             # TODO: we may want to add diff of probs too.
@@ -1669,6 +1810,11 @@ class RayPPOTrainer:
                                 norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                                 config=self.config.algorithm,
                             )
+                            loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
+                            if loss_mode != "tree_segment" and tree_data_cache:
+                                for key in tree_segment_large_keys:
+                                    batch.non_tensor_batch.pop(key, None)
+                                gc.collect()
 
                     # update critic
                     if self.use_critic:

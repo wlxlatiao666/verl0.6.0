@@ -468,6 +468,9 @@ def collect_threshold_stats(
             top_k=top_k,
             max_tokens=max_tokens,
             collect_threshold_stats=True,
+            # The training path is entropy-only. This comparison utility opts
+            # in explicitly because it still benchmarks the legacy WAAD mode.
+            collect_importance_stats=True,
             seed=None if seed is None else seed + prompt_idx * n,
         )
         for prompt_idx in range(len(prompts))

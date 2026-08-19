@@ -89,7 +89,6 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.tree_search.entropy_threshold=0.8 \
     actor_rollout_ref.rollout.tree_search.branching_factor=2 \
     actor_rollout_ref.rollout.tree_search.max_tree_depth=6 \
-    actor_rollout_ref.rollout.tree_search.tau_importance=0.0 \
     actor_rollout_ref.rollout.tree_search.tree_process_reward=False \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \

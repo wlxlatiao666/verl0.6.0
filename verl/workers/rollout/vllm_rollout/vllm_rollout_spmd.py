@@ -242,7 +242,10 @@ class vLLMRollout(BaseRollout):
                 entropy_threshold=float(_tree_cfg.get("entropy_threshold", 1.0)),
                 branching_factor=int(_tree_cfg.get("branching_factor", 2)),
                 max_tree_depth=int(_tree_cfg.get("max_tree_depth", 3)),
-                tau_importance=float(_tree_cfg.get("tau_importance", 0.0)),
+                # Training deliberately supports entropy-only branching.  A
+                # numeric tau would silently select vLLM's deferred WAAD path.
+                tau_importance=None,
+                branch_trigger_mode="entropy",
             )
             logger.info(f"[TreeRollout] TreeSearchParams enabled: {self.sampling_params.tree_search_params}")
 
@@ -254,21 +257,13 @@ class vLLMRollout(BaseRollout):
             self.sampling_params.tree_search_params.entropy_threshold = threshold
             logger.info(f"[TreeRollout] entropy_threshold updated to {threshold:.4f}")
 
-    def update_tau_importance(self, tau: float):
-        """Dynamically update the tau_importance for tree search."""
-        if self.sampling_params.tree_search_params is not None:
-            self.sampling_params.tree_search_params.tau_importance = tau
-            logger.info(f"[TreeRollout] tau_importance updated to {tau:.4f}")
-
     @GPUMemoryLogger(role="vllm rollout spmd collect_threshold_stats", logger=logger)
     @torch.no_grad()
     def collect_threshold_stats(self, prompts: DataProto) -> DataProto:
-        """Run a forward pass with collect_threshold_stats=True to compute
-        per-token entropy and importance lists, then return their p80 values.
+        """Run an observation-only pass and return the per-token entropy p80.
 
         Returns a DataProto with meta_info containing:
             - "entropy_p80": float
-            - "importance_p80": float or None (if importance_list is empty)
         """
         idx = prompts.batch["input_ids"]
         batch_size = idx.size(0)
@@ -291,40 +286,57 @@ class vLLMRollout(BaseRollout):
         stats_n = int(_tree_cfg.get("threshold_stats_n", 1))
         _stats_max_tokens = int(_tree_cfg.get("threshold_stats_max_tokens", 0))
         _max_tokens = _stats_max_tokens if _stats_max_tokens > 0 else int(self.sampling_params.max_tokens)
+        if stats_n < 1 or _max_tokens < 1:
+            raise ValueError(
+                "Tree entropy calibration requires threshold_stats_n>=1 and max_tokens>=1, "
+                f"got n={stats_n}, max_tokens={_max_tokens}."
+            )
 
-        stats_params = SamplingParams(
-            n=stats_n,
-            temperature=float(self.sampling_params.temperature),
-            max_tokens=_max_tokens,
-            collect_threshold_stats=True,
-        )
+        # Observe the same sampling distribution as the real rollout. Clone
+        # all stop/EOS, filtering, penalty, seed and logits-processor settings;
+        # only branching and output multiplicity differ in this pre-pass.
+        stats_params = self.sampling_params.clone()
+        stats_params.n = stats_n
+        stats_params.best_of = None
+        stats_params._real_n = None
+        stats_params.max_tokens = _max_tokens
+        stats_params.tree_search_params = None
+        stats_params.collect_threshold_stats = True
+        stats_params.collect_importance_stats = False
+
+        stats_lora_requests = None
+        if self.lora_kwargs:
+            lora_int_ids = list(self.inference_engine.llm_engine.list_loras())
+            if len(lora_int_ids) > 0:
+                lora_int_id = lora_int_ids[0]
+                stats_lora_requests = [
+                    LoRARequest(
+                        lora_name=f"{lora_int_id}",
+                        lora_int_id=lora_int_id,
+                        lora_path="/simon-stub-path",
+                    )
+                ] * batch_size
 
         outputs = self.inference_engine.generate(
             prompts=vllm_inputs,
             sampling_params=stats_params,
+            lora_request=stats_lora_requests,
             use_tqdm=False,
         )
 
         all_entropy: list[float] = []
-        all_importance: list[float] = []
         for output in outputs:
             for completion in output.outputs:
                 # Filter out nan values that can arise from numerical instability
                 # (e.g. 0.0 * (-inf) in entropy computation) before computing percentile.
                 all_entropy.extend(v for v in completion.entropy_list if not math.isnan(v))
-                all_importance.extend(v for v in completion.importance_list if v is not None)
 
         entropy_p80: float = float(np.percentile(all_entropy, 80)) if all_entropy else 1.0
-        importance_p80: float | None = float(np.percentile(all_importance, 80)) if all_importance else None
 
-        logger.info(
-            f"[TreeRollout] collect_threshold_stats: entropy_p80={entropy_p80:.4f}, "
-            f"importance_p80={importance_p80}"
-        )
+        logger.info(f"[TreeRollout] collect_threshold_stats: entropy_p80={entropy_p80:.4f}")
 
         result = DataProto.from_single_dict({})
         result.meta_info["entropy_p80"] = entropy_p80
-        result.meta_info["importance_p80"] = importance_p80
         return result
 
     @contextmanager
@@ -414,6 +426,12 @@ class vLLMRollout(BaseRollout):
             and do_sample
             and not is_validate
         )
+        if _tree_search_active and self.config.calculate_log_probs:
+            raise ValueError(
+                "Tree rollout does not currently expose an aligned behavior logprob for the forced "
+                "branch token. Set rollout.calculate_log_probs=False; actor occupancy is corrected "
+                "from recomputed old_log_probs via the saved tree topology."
+            )
         _tree_process_reward = is_tree_process_reward_enabled(
             _tree_cfg,
             is_validate=is_validate,
@@ -505,7 +523,9 @@ class vLLMRollout(BaseRollout):
                             response_ids = sum([seg for _, seg in path_nodes], [])
 
                             # Register each node in unique_segments (dedup by seq_id)
-                            if _tree_process_reward:
+                            # Topology is required for actor-occupancy weighting
+                            # in both plain tree rollout and process-reward modes.
+                            if _tree_search_active:
                                 path_indices: list[int] = []
                                 for seq_id, seg in path_nodes:
                                     if seq_id not in seq_id_to_segment_idx:
@@ -638,37 +658,39 @@ class vLLMRollout(BaseRollout):
                             _tu_n.append(deficit)
                             _tu_map.append(_p_out)
                     if _tu_inputs:
-                        # Clone sampling params (no tree branching) + set n=need
+                        # Clone the complete rollout distribution, then disable
+                        # tree branching and change only the requested sample
+                        # count/logprob payload. Reconstructing SamplingParams
+                        # field-by-field silently drops stop/EOS constraints,
+                        # logits processors, min_tokens, bad words, and seeds.
                         _base = self.sampling_params
                         _lp_req = 1 if self.config.calculate_log_probs else 0
                         _tu_sp_list = []
                         for _def in _tu_n:
-                            _tu_sp_list.append(
-                                SamplingParams(
-                                    n=_def,
-                                    temperature=float(_base.temperature),
-                                    top_p=float(_base.top_p),
-                                    top_k=int(_base.top_k),
-                                    min_p=(float(_base.min_p)
-                                           if _base.min_p is not None else 0.0),
-                                    repetition_penalty=float(_base.repetition_penalty),
-                                    presence_penalty=float(_base.presence_penalty),
-                                    frequency_penalty=float(_base.frequency_penalty),
-                                    max_tokens=int(_base.max_tokens),
-                                    logprobs=_lp_req,
-                                    tree_search_params=None,
-                                )
-                            )
+                            _topup_params = _base.clone()
+                            _topup_params.n = _def
+                            _topup_params.best_of = None
+                            _topup_params._real_n = None
+                            _topup_params.logprobs = _lp_req
+                            _topup_params.tree_search_params = None
+                            _topup_params.collect_threshold_stats = False
+                            _topup_params.collect_importance_stats = False
+                            _tu_sp_list.append(_topup_params)
                         logger.info(
                             f"[TreeRollout][TopUp] bf={_bf}, depth={_md}, target={_tgt}/prompt. "
                             f"Top-up needed for {len(_tu_inputs)}/{len(outputs)} prompts: "
                             f"total {sum(_tu_n)} conventional samples."
                         )
+                        _tu_lora_requests = (
+                            [lora_requests[prompt_idx] for prompt_idx in _tu_map]
+                            if lora_requests is not None
+                            else None
+                        )
                         with torch.no_grad():
                             _tu_outputs = self.inference_engine.generate(
                                 prompts=_tu_inputs,
                                 sampling_params=_tu_sp_list,
-                                lora_request=None,
+                                lora_request=_tu_lora_requests,
                                 use_tqdm=False,
                             )
 
@@ -715,8 +737,9 @@ class vLLMRollout(BaseRollout):
                                 if _tree_process_reward:
                                     token_share_weights.append([1.0] * len(resp_ids))
 
-                                # 4) tree_process_reward single synthetic segment
-                                if _tree_process_reward:
+                                # 4) A top-up is a one-node synthetic root in
+                                # the rollout forest used by actor weighting.
+                                if _tree_search_active:
                                     seg_idx = len(unique_segments)
                                     unique_segments.append(list(resp_ids))
                                     leaf_segment_indices.append([seg_idx])
@@ -794,7 +817,7 @@ class vLLMRollout(BaseRollout):
             # unique_segments: token list per unique tree node (deduped by seq_id), shape (n_unique_nodes,)
             # leaf_segment_indices: for each leaf, ordered indices into unique_segments for its root→leaf path
             #                       shape (n_leaves,) of variable-len index arrays
-            if _tree_process_reward:
+            if _tree_search_active:
                 # Always write these keys (even if empty) so all workers have the same keys
                 # NOTE: unique_segments is stored in non_tensor_batch
                 # rather than meta_info['metrics'] so they are properly partitioned per-worker
@@ -887,23 +910,11 @@ class vLLMRollout(BaseRollout):
                 "tree/expansion_ratio": round(avg_leaves, 2),
             })
 
-            if _tree_process_reward:
-                if len(token_share_weights) != len(response):
-                    raise RuntimeError(
-                        "Tree process reward must emit exactly one token_share_weights row "
-                        f"per response, got weights={len(token_share_weights)} responses={len(response)}."
-                    )
+            if _tree_search_active:
                 if len(leaf_segment_indices) != len(response):
                     raise RuntimeError(
-                        "Tree process reward must emit exactly one segment path per response, "
+                        "Active tree rollout must emit exactly one segment path per response, "
                         f"got paths={len(leaf_segment_indices)} responses={len(response)}."
-                    )
-                if not all(
-                    len(weights) == len(tokens)
-                    for weights, tokens in zip(token_share_weights, response)
-                ):
-                    raise RuntimeError(
-                        "Tree process reward token_share_weights must align with every unpadded response."
                     )
                 invalid_segment_paths = [
                     path_idx
@@ -912,8 +923,22 @@ class vLLMRollout(BaseRollout):
                 ]
                 if invalid_segment_paths:
                     raise RuntimeError(
-                        "Tree process reward emitted out-of-range segment indices for response paths "
+                        "Active tree rollout emitted out-of-range segment indices for response paths "
                         f"{invalid_segment_paths[:8]}."
+                    )
+
+            if _tree_process_reward:
+                if len(token_share_weights) != len(response):
+                    raise RuntimeError(
+                        "Tree process reward must emit exactly one token_share_weights row "
+                        f"per response, got weights={len(token_share_weights)} responses={len(response)}."
+                    )
+                if not all(
+                    len(weights) == len(tokens)
+                    for weights, tokens in zip(token_share_weights, response)
+                ):
+                    raise RuntimeError(
+                        "Tree process reward token_share_weights must align with every unpadded response."
                     )
 
             response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(
