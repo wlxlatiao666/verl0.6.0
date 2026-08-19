@@ -106,9 +106,9 @@ Tree leaves 不是 iid actor samples，不能等权训练。trainer 在重算 `o
 p(c\mid s,C)=\frac{\pi_{old}(a_c\mid s)}{\sum_{j\in C(s)}\pi_{old}(a_j\mid s)}
 ```
 
-- leaf mass 是 root-to-leaf 路径上分叉概率的乘积；
+- leaf mass 是所属 root 的 leaf-slot prior，乘以 root-to-leaf 路径上的条件分叉概率；若 root 有 `d` 个 descendant leaves、prompt 共 `N` 条 emitted leaves，则 root prior 为 `d/N`；
 - unique segment 的 reach mass 是所有 descendant leaf mass 之和；
-- 一个展开 tree root 和每个普通 top-up root 作为等权 strata，top-up 完整继承原 rollout 的采样参数与 LoRA；
+- 若 tree 有 `m` 个叶子、另有 `k` 条普通 top-up，则展开 tree root 获得 `m/(m+k)` 总质量、每条 top-up 获得 `1/(m+k)`；因此 top-up 质量恰好等于 tree leaf 的平均质量，之后再按 prompt 归一；top-up 完整继承原 rollout 的采样参数与 LoRA；
 - advantage、policy loss、entropy 和 KL 使用同一概率质量；
 - scale 在完整 batch/所有 DP ranks 上一次性归一，micro-batch 不做局部 self-normalization。
 

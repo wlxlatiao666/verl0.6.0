@@ -295,7 +295,8 @@ K=B^D
 - tree leaves 与 fillers 使用同一个 prompt uid，仍属于同一 GRPO group；
 - filler 被表示为一个独立 synthetic root segment；
 - filler 的 `token_share_weights=1`；
-- 一个展开 tree root 与每个普通 top-up root 被视为等权 estimator strata；展开 tree 内部再按 actor 条件概率分配质量；
+- 若展开 tree 有 `m` 个 descendant leaves，另有 `k` 个普通 top-up，则 root mass 按 descendant leaf 数分配：展开 tree root 为 `m/(m+k)`，每个单叶 top-up root 为 `1/(m+k)`；
+- 展开 tree 内部再按 actor 条件概率 `p_i` 分配，所以 tree leaf 为 `m p_i/(m+k)`；所有 tree leaves 的算术平均质量恰好也是 `1/(m+k)`，与每条 top-up 相等；最后按 prompt 再归一以消除浮点误差；
 - top-up 后严格检查每个 prompt 恰有 K 个 response，否则报错，不静默 trim/复制。
 
 ### 3.4 阈值动态标定
@@ -321,7 +322,7 @@ trainer 在配置的 interval 上先执行短 rollout：
 | `token_share_weights` | tensor、每 token | legacy `1 / descendant_count`，仅 process 数据携带，不再参与 loss |
 | `worker_segments_offsets` | non-tensor metadata | concat 前各 worker segment 边界 |
 | `worker_leaves_offsets` | non-tensor metadata | concat 前各 worker leaf 边界 |
-| `tree_leaf_masses` | tensor、每 leaf | prompt 内归一的 conditional top-k actor path mass |
+| `tree_leaf_masses` | tensor、每 leaf | prompt 内归一的 root leaf-slot prior × conditional top-k actor path mass |
 | `tree_loss_scales` | tensor、每 leaf | 针对实际 `loss_agg_mode` 一次性全局归一后的固定 loss scale |
 
 设 parent `s` 实际展开的 children 集合为 `C(s)`。训练用重算后的旧 actor log-prob 计算：
@@ -330,7 +331,19 @@ trainer 在配置的 interval 上先执行短 rollout：
 p(c\mid s,C)=\frac{\pi_{old}(a_c\mid s)}{\sum_{j\in C(s)}\pi_{old}(a_j\mid s)}
 ```
 
-leaf mass 是路径上这些条件概率的乘积；segment reach mass 是其所有 descendant leaf mass 之和。于是共享 prefix 即使在多个 leaf response 中物理重复，其总贡献也恰好等于 actor 到达该 segment 的概率质量，而不是 descendant 数。普通 treerollout、TreePR 和 TreeSR 都使用该权重。
+设 prompt 的 root 集合为 `R`，root `r` 有 `d_r` 个 descendant leaves，且 `N=Σ_r d_r`。先分配 root leaf-slot prior：
+
+```math
+M(r)=\frac{d_r}{N}
+```
+
+再对属于该 root 的 leaf `y` 沿路径拆分：
+
+```math
+M(y)=M(r)\prod_{(s\to c)\in path(y)}p(c\mid s,C)
+```
+
+单叶 synthetic top-up 的 `d_r=1`、路径没有 tree 分叉，所以 `M(topup)=1/N`；而任一 expanded root 下所有 tree leaves 的算术平均同样为 `1/N`。segment reach mass 是其所有 descendant leaf mass 之和。于是共享 prefix 即使在多个 leaf response 中物理重复，其总贡献也恰好等于 actor 到达该 segment 的概率质量，而不是 descendant 数。普通 treerollout、TreePR 和 TreeSR 都使用该权重。
 
 这些概率只在**已展开的 top-k support 内条件化**。代码同时记录每个 branch 的 `sum(exp(old_logprob_child))` 作为 coverage；未展开的 tail 没有样本，不能由有限权重恢复。因此这是 conditional top-k actor objective，不是完整 actor iid objective。
 
@@ -654,7 +667,7 @@ cd /Users/bytedance/codes/verl0.6.0/tree_decoding_comparison
 
 ### 5.1 Tree rollout 不是 actor policy 的 iid rollout
 
-分叉 token 是 deterministic top-k，不能把 emitted leaves 等权当作 actor iid 样本。当前实现不再这样做：它用重算后的 `old_log_probs` 在每组实际展开的 siblings 内恢复 actor 条件概率，并将路径 mass 用于 leaf，将 descendant mass 之和用于 shared segment。
+分叉 token 是 deterministic top-k，不能把 emitted leaves 等权当作 actor iid 样本。当前实现不再这样做：它先按每个 root 的 descendant leaf 数设置 leaf-slot prior，再用重算后的 `old_log_probs` 在每组实际展开的 siblings 内恢复 actor 条件概率；两者乘积用于 leaf，descendant leaf mass 之和用于 shared segment。
 
 一个 branch ratio 虽然只来自分叉 token，却缩放该分支的整条后续路径；它不是只缩放该 token。当前 reducer 正是按这条语义传播概率质量。
 
@@ -783,7 +796,7 @@ chunked_prefill / TP size
 | 数据构造 | `tree/scripts/generate_math_datasets.py`、`data/` 下的数学数据与说明 | 将 GSM8K/MATH 等数据整理成 verl 可读取的数据文件，并保存少量示例/评测数据 |
 | 数值诊断 | `debug_std.py`、`debug_std2.py`、`test_fix.py` | 检查 tree process reward 的 sibling/global 标准化、零方差和 bottom-up 聚合行为 |
 | verl CPU 测试 | `tests/utils/test_tree_training_on_cpu.py` | 在不启动完整分布式训练的情况下检查 tree multiplier、feature gate 和 segment 调度 helper |
-| actor-mass CPU 测试 | `tests/trainer/ppo/test_tree_weighting_on_cpu.py` | 检查 branch 概率递归、top-up strata、segment reach、加权 advantage 以及 micro-batch/rank normalization |
+| actor-mass CPU 测试 | `tests/trainer/ppo/test_tree_weighting_on_cpu.py` | 检查 branch 概率递归、top-up 等于 tree-leaf 平均质量、segment reach、加权 advantage 以及 micro-batch/rank normalization |
 | comparison 测试 | `tree_decoding_comparison/tests/` | 检查 exact-N candidate budget、组合式 pass@k、结果 schema、tree path 重建与参数校验 |
 | vLLM benchmark/test | `/Users/bytedance/codes/vllm/benchmarks/` 和 `/Users/bytedance/codes/vllm/tests/` 中的 tree 相关文件 | 测试分叉、输出重建、WAAD/entropy 统计、随机 trigger、leaf cap 和延迟；部分早期脚本仅用于调试，不代表严格 equal-budget benchmark |
 | 实验产物 | `tree/` 下的 TensorBoard event、日志和结果文件 | 历史运行记录；不参与代码执行，比较实验时应以对应脚本和有效 Hydra 配置为准 |

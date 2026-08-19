@@ -63,7 +63,7 @@ def test_conditional_topk_weights_follow_actor_probability_and_reach_mass():
     torch.testing.assert_close(result.branch_coverages, torch.tensor([0.5, 0.4]))
 
 
-def test_tree_root_and_iid_topup_roots_are_equal_strata():
+def test_topup_mass_equals_mean_expanded_tree_leaf_mass():
     # Expanded root 0 has children 1/2.  Segments 3 and 4 are conventional
     # top-ups represented as synthetic one-node roots.
     unique_segments = [[10], [20], [30], [40], [50]]
@@ -81,9 +81,96 @@ def test_tree_root_and_iid_topup_roots_are_equal_strata():
         prompt_ids=[0, 0, 0, 0],
     )
 
-    expected_leaf = torch.tensor([0.3, 1.0 / 30.0, 1.0 / 3.0, 1.0 / 3.0])
+    expected_leaf = torch.tensor([0.45, 0.05, 0.25, 0.25])
     torch.testing.assert_close(result.leaf_masses, expected_leaf)
-    torch.testing.assert_close(result.segment_masses, torch.tensor([1 / 3, 0.3, 1 / 30, 1 / 3, 1 / 3]))
+    torch.testing.assert_close(result.segment_masses, torch.tensor([0.5, 0.45, 0.05, 0.25, 0.25]))
+    tree_leaf_mean = result.leaf_masses[:2].mean()
+    torch.testing.assert_close(result.leaf_masses[2:], tree_leaf_mean.expand(2))
+    torch.testing.assert_close(result.leaf_masses.sum(), torch.tensor(1.0))
+
+
+def test_multilevel_tree_and_topups_use_equal_mean_leaf_slots():
+    # Expanded tree 0 -> {1 -> {3,4}, 2} has conditional leaf mass
+    # [.6, .2, .2]. Three one-node top-ups make six emitted leaf slots.
+    unique_segments = [[token] for token in range(8)]
+    paths = [[0, 1, 3], [0, 1, 4], [0, 2], [5], [6], [7]]
+    old_log_probs = torch.zeros(6, 3)
+    response_mask = torch.tensor(
+        [
+            [1, 1, 1],
+            [1, 1, 1],
+            [1, 1, 0],
+            [1, 0, 0],
+            [1, 0, 0],
+            [1, 0, 0],
+        ],
+        dtype=torch.float32,
+    )
+    old_log_probs[0, 1] = torch.log(torch.tensor(0.4))
+    old_log_probs[1, 1] = torch.log(torch.tensor(0.4))
+    old_log_probs[2, 1] = torch.log(torch.tensor(0.1))
+    old_log_probs[0, 2] = torch.log(torch.tensor(0.3))
+    old_log_probs[1, 2] = torch.log(torch.tensor(0.1))
+
+    result = compute_conditional_topk_tree_weights(
+        old_log_probs=old_log_probs,
+        response_mask=response_mask,
+        unique_segments=unique_segments,
+        leaf_segment_indices=paths,
+        prompt_ids=["p"] * 6,
+    )
+
+    expected_leaf = torch.tensor([0.3, 0.1, 0.1, 1 / 6, 1 / 6, 1 / 6])
+    expected_reach = torch.tensor([0.5, 0.4, 0.1, 0.3, 0.1, 1 / 6, 1 / 6, 1 / 6])
+    torch.testing.assert_close(result.leaf_masses, expected_leaf)
+    torch.testing.assert_close(result.segment_masses, expected_reach)
+    torch.testing.assert_close(result.leaf_masses[3:], result.leaf_masses[:3].mean().expand(3))
+
+    scales = normalize_tree_loss_scales(result.leaf_masses, response_mask, "token-mean")
+    torch.testing.assert_close(scales[3:], scales[:3].mean().expand(3))
+
+
+def test_topup_equal_mean_normalization_is_independent_for_interleaved_prompts():
+    # Prompt A has two tree leaves plus one top-up. Prompt B has three tree
+    # leaves plus one top-up. Rows are deliberately interleaved.
+    unique_segments = [[token] for token in range(9)]
+    paths = [[0, 1], [4, 5], [3], [4, 6], [0, 2], [8], [4, 7]]
+    prompt_ids = np.array(["a", "b", "a", "b", "a", "b", "b"], dtype=object)
+    old_log_probs = torch.zeros(7, 2)
+    response_mask = torch.tensor(
+        [
+            [1, 1],
+            [1, 1],
+            [1, 0],
+            [1, 1],
+            [1, 1],
+            [1, 0],
+            [1, 1],
+        ],
+        dtype=torch.float32,
+    )
+    old_log_probs[0, 1] = torch.log(torch.tensor(0.75))
+    old_log_probs[4, 1] = torch.log(torch.tensor(0.25))
+    old_log_probs[1, 1] = torch.log(torch.tensor(0.5))
+    old_log_probs[3, 1] = torch.log(torch.tensor(0.3))
+    old_log_probs[6, 1] = torch.log(torch.tensor(0.2))
+
+    result = compute_conditional_topk_tree_weights(
+        old_log_probs=old_log_probs,
+        response_mask=response_mask,
+        unique_segments=unique_segments,
+        leaf_segment_indices=paths,
+        prompt_ids=prompt_ids,
+    )
+
+    a_rows = torch.tensor([0, 2, 4])
+    a_tree_rows = torch.tensor([0, 4])
+    b_rows = torch.tensor([1, 3, 5, 6])
+    b_tree_rows = torch.tensor([1, 3, 6])
+    torch.testing.assert_close(result.leaf_masses[a_rows].sum(), torch.tensor(1.0))
+    torch.testing.assert_close(result.leaf_masses[b_rows].sum(), torch.tensor(1.0))
+    torch.testing.assert_close(result.leaf_masses[2], result.leaf_masses[a_tree_rows].mean())
+    torch.testing.assert_close(result.leaf_masses[5], result.leaf_masses[b_tree_rows].mean())
 
 
 def test_weights_normalize_each_prompt_independently():

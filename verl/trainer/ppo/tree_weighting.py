@@ -43,8 +43,10 @@ class TreeActorWeights:
 
     ``leaf_masses`` sums to one independently for every prompt.  A prompt may
     contain one expanded tree root and conventional top-up samples represented
-    as one-node synthetic roots.  Those roots are treated as equal estimator
-    strata; mass within an expanded root is distributed by actor probabilities.
+    as one-node synthetic roots.  A root receives mass proportional to its
+    descendant leaf count.  Consequently, every top-up has exactly the mean
+    mass of the expanded tree's leaves after prompt-level normalization; mass
+    within an expanded root is distributed by actor probabilities.
 
     ``segment_masses[s]`` is the probability of reaching unique segment ``s``
     and equals the sum of masses of its descendant leaves.
@@ -169,13 +171,27 @@ def compute_conditional_topk_tree_weights(
             if not roots:
                 raise ValueError(f"prompt {prompt_id!r} has no tree root")
 
-            # The expanded tree and every conventional top-up sequence are
-            # separate Monte-Carlo strata.  Equal root mass prevents the many
-            # leaves of an expanded stratum from overwhelming iid top-ups.
-            root_mass = 1.0 / len(roots)
+            # Allocate one probability slot per emitted leaf.  An expanded
+            # root with d descendants gets d slots, while every conventional
+            # top-up is a one-leaf synthetic root and gets one slot.  The
+            # expanded root's total mass is then distributed by conditional
+            # actor probabilities, so a top-up's mass equals the arithmetic
+            # mean mass of that root's d tree leaves.
+            root_leaf_counts: dict[int, int] = defaultdict(int)
+            for leaf_idx in leaf_indices:
+                root_leaf_counts[paths[leaf_idx][0]] += 1
+            total_leaf_slots = sum(root_leaf_counts.values())
+            if total_leaf_slots != len(leaf_indices):
+                raise RuntimeError(
+                    f"prompt {prompt_id!r} has inconsistent root/leaf accounting: "
+                    f"slots={total_leaf_slots}, leaves={len(leaf_indices)}"
+                )
             pending = list(roots)
             for root in roots:
-                segment_masses[root] = root_mass
+                descendant_leaf_count = root_leaf_counts.get(root, 0)
+                if descendant_leaf_count <= 0:
+                    raise ValueError(f"prompt {prompt_id!r} root {root} has no descendant leaves")
+                segment_masses[root] = descendant_leaf_count / total_leaf_slots
 
             while pending:
                 parent_idx = pending.pop()
