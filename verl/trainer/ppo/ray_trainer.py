@@ -440,6 +440,76 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
     seg_advantages = local_adv_weight * seg_local_advantages + global_adv_weight * seg_global_advantages
     print(f"[DEBUG] [compute_tree_process_advantage] seg_advantages range: [{seg_advantages.min():.4f}, {seg_advantages.max():.4f}], mean={seg_advantages.mean():.4f}")
 
+    # ── Diagnostics: does the tree add signal beyond GRPO? ────────────────────
+    # The central question behind "tree never beats GRPO": does the LOCAL
+    # (sibling-contrast) term actually contribute, or does seg_adv collapse to
+    # the GLOBAL (== GRPO) term because deterministic top-k made siblings
+    # near-identical? These metrics measure exactly that. They are logged to
+    # wandb via meta_info["tree_adv_metrics"] and must never break training.
+    try:
+        eps = 1e-8
+        wl, wg = float(local_adv_weight), float(global_adv_weight)
+        nonroot_idx = np.where(parent_of >= 0)[0]
+        nonroot_t = torch.as_tensor(nonroot_idx, dtype=torch.long, device=device)
+
+        def _m(t):
+            return float(t.mean().item()) if t.numel() > 0 else 0.0
+
+        local_abs = seg_local_advantages[nonroot_t].abs()
+        global_abs = seg_global_advantages[nonroot_t].abs()
+        wlocal_abs = (wl * seg_local_advantages[nonroot_t]).abs()
+        wglobal_abs = (wg * seg_global_advantages[nonroot_t]).abs()
+        combined_abs = seg_advantages[nonroot_t].abs()
+
+        # Correlation between local and global adv over non-root segments.
+        corr = 0.0
+        if nonroot_t.numel() > 1:
+            la = seg_local_advantages[nonroot_t]
+            ga = seg_global_advantages[nonroot_t]
+            la_c, ga_c = la - la.mean(), ga - ga.mean()
+            denom = (la_c.norm() * ga_c.norm()).item()
+            if denom > eps:
+                corr = float((la_c * ga_c).sum().item() / denom)
+
+        # Sibling-score std distribution: the collapse detector. sib_std ~ 0
+        # means siblings are (near) duplicates -> local term is ~0.
+        sib_stds, n_children = [], []
+        for _p, _children in children_of.items():
+            n_children.append(len(_children))
+            if len(_children) > 1:
+                cs = node_scores[torch.tensor(_children, dtype=torch.long, device=device)]
+                sib_stds.append(float(cs.std().item()))
+        sib_std_mean = float(np.mean(sib_stds)) if sib_stds else 0.0
+        sib_std_collapsed_frac = float(np.mean([s < 1e-4 for s in sib_stds])) if sib_stds else 1.0
+
+        # Fraction of leaves that actually went through >=1 real branch. Low ->
+        # most of the batch is topup (single-segment) leaves == plain GRPO.
+        pls = np.array([len(p) for p in leaf_segment_indices], dtype=np.float64)
+        frac_branch_leaves = float((pls > 1).mean()) if pls.size else 0.0
+
+        wl_share = _m(wlocal_abs) / (_m(wlocal_abs) + _m(wglobal_abs) + eps)
+
+        tree_adv_metrics = {
+            "tree_adv/local_abs_mean": _m(local_abs),
+            "tree_adv/global_abs_mean": _m(global_abs),
+            "tree_adv/local_over_global": _m(local_abs) / (_m(global_abs) + eps),
+            "tree_adv/local_share_of_combined": wl_share,
+            "tree_adv/combined_abs_mean": _m(combined_abs),
+            "tree_adv/corr_local_global": corr,
+            "tree_adv/sib_std_mean": sib_std_mean,
+            "tree_adv/sib_std_collapsed_frac": sib_std_collapsed_frac,
+            "tree_adv/frac_branch_leaves": frac_branch_leaves,
+            "tree_adv/mean_children": float(np.mean(n_children)) if n_children else 0.0,
+            "tree_adv/mean_path_len": float(pls.mean()) if pls.size else 0.0,
+            "tree_adv/n_unique_segments": float(n_unique),
+            "tree_adv/n_internal_nodes": float(len(internal_nodes)),
+            "tree_adv/n_leaves": float(n_leaves),
+        }
+        data.meta_info["tree_adv_metrics"] = tree_adv_metrics
+        print(f"[DEBUG] [compute_tree_process_advantage] tree_adv_metrics={tree_adv_metrics}")
+    except Exception as e:  # diagnostics must never break training
+        print(f"[WARN] [compute_tree_process_advantage] diagnostics failed: {e}")
+
     # ── Step 3: assemble token-level advantages per leaf ─────────────────────
     # Each leaf's response is the concatenation of its path segments in order.
     # We fill token positions with the advantage of the segment they belong to.
@@ -1642,6 +1712,9 @@ class RayPPOTrainer:
                                 local_adv_weight=local_adv_weight,
                                 global_adv_weight=global_adv_weight
                             )
+                            # Surface tree-advantage diagnostics to wandb.
+                            if "tree_adv_metrics" in batch.meta_info:
+                                metrics.update(batch.meta_info.pop("tree_adv_metrics"))
 
                             loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
                             if loss_mode != "tree_segment":

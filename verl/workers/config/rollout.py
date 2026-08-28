@@ -116,6 +116,15 @@ class TreeSearchConfig(BaseConfig):
     threshold_stats_interval: int = 10
     # Max tokens to generate during threshold stats collection (0 = use rollout max_tokens).
     threshold_stats_max_tokens: int = 64
+    # How branch-continuation tokens are chosen at a branch point (B2):
+    #   "sample" — sample branching_factor DISTINCT tokens without replacement
+    #              from softmax(logprobs / branch_temperature). Diverse,
+    #              on-policy siblings (recommended: sibling contrast is what the
+    #              segment-level advantage feeds on).
+    #   "topk"   — legacy deterministic top-k (near-duplicate siblings).
+    branch_sampling: str = "sample"
+    # Temperature applied to the branch-point distribution before sampling.
+    branch_temperature: float = 1.0
 
 
 @dataclass
