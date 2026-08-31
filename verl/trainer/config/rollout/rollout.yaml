@@ -304,6 +304,22 @@ tree_search:
   # Higher values give more stable p80 estimates at the cost of extra compute.
   threshold_stats_n: 1
 
+  # Minimum number of tokens a segment must have before it may branch.
+  min_seg_length: 10
+
+  # Branch trigger mode: null auto-resolves ("entropy_waad" when tau_importance is
+  # set, else "entropy"). Set to "entropy" to branch purely on entropy (no WAAD
+  # compute, no deferred branching), "entropy_waad", or "random".
+  branch_trigger_mode: null
+
+  # How branch-continuation tokens are chosen: "sample" (without-replacement
+  # sampling from softmax(logprobs / branch_temperature); diverse on-policy
+  # siblings) or "topk" (legacy deterministic top-k).
+  branch_sampling: sample
+
+  # Temperature applied to the branch-point distribution before sampling.
+  branch_temperature: 1.0
+
 # profile the rollout model in `generate_sequence` 
 profiler:
 
