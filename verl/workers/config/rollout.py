@@ -125,6 +125,13 @@ class TreeSearchConfig(BaseConfig):
     branch_sampling: str = "sample"
     # Temperature applied to the branch-point distribution before sampling.
     branch_temperature: float = 1.0
+    # Minimum number of tokens a segment must have before it may branch.
+    min_seg_length: int = 10
+    # Branch trigger mode: None auto-resolves ("entropy_waad" when tau_importance
+    # is set, else "entropy"). Set explicitly to "entropy" to branch purely on
+    # entropy (no WAAD compute, no deferred branching), "entropy_waad", or
+    # "random".
+    branch_trigger_mode: Optional[str] = None
 
 
 @dataclass

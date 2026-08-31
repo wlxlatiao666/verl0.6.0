@@ -243,6 +243,8 @@ class vLLMRollout(BaseRollout):
                 branching_factor=int(_tree_cfg.get("branching_factor", 2)),
                 max_tree_depth=int(_tree_cfg.get("max_tree_depth", 3)),
                 tau_importance=float(_tree_cfg.get("tau_importance", 0.0)),
+                min_seg_length=int(_tree_cfg.get("min_seg_length", 10)),
+                branch_trigger_mode=_tree_cfg.get("branch_trigger_mode", None),
                 branch_sampling=str(_tree_cfg.get("branch_sampling", "sample")),
                 branch_temperature=float(_tree_cfg.get("branch_temperature", 1.0)),
             )

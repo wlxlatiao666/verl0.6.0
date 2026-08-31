@@ -106,3 +106,7 @@ class AlgoConfig(BaseConfig):
     rollout_is: bool = False
     # Aggregation mode for tree process reward back-propagation
     proc_agg_mode: str = "raw"
+    # Weight on the local (sibling-contrast) term of the tree segment advantage.
+    local_adv_weight: float = 0.5
+    # Weight on the global (GRPO-style, per-prompt) term of the tree segment advantage.
+    global_adv_weight: float = 0.5

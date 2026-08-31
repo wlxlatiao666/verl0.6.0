@@ -12,7 +12,7 @@ export NCCL_DEBUG=INFO
 HOME=/inspire/hdd/global_user/weilongxuan-253108120168
 verl_dir=/inspire/qb-ilm2/project/neosmosis/weilongxuan-253108120168/verl_data
 project_name=verl_grpo_tree_0722
-experiment_name=qwen2.5_math7b_treepr_0820
+experiment_name=qwen2.5_math7b_treepr_seg64_ent_t13_l07
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl0.6.0"}
 
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
@@ -59,6 +59,8 @@ mkdir -p "${WANDB_DIR}"
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
+    algorithm.local_adv_weight=0.7 \
+    algorithm.global_adv_weight=0.3 \
     data.train_files="$TRAIN_FILE" \
     data.val_files="$TEST_FILE" \
     data.train_batch_size=96 \
@@ -90,6 +92,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.tree_search.entropy_threshold=0.8 \
     actor_rollout_ref.rollout.tree_search.branching_factor=4 \
     actor_rollout_ref.rollout.tree_search.max_tree_depth=3 \
+    actor_rollout_ref.rollout.tree_search.min_seg_length=64 \
+    actor_rollout_ref.rollout.tree_search.branch_trigger_mode=entropy \
+    actor_rollout_ref.rollout.tree_search.branch_temperature=1.3 \
     actor_rollout_ref.rollout.tree_search.topup_leaves_to_target=True \
     actor_rollout_ref.rollout.tree_search.tau_importance=0.0 \
     actor_rollout_ref.rollout.tree_search.tree_process_reward=True \

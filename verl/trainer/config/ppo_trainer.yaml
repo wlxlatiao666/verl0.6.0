@@ -80,6 +80,12 @@ algorithm:
   # Aggregation mode for tree process reward back-propagation: "mean", "min", or "max"
   proc_agg_mode: raw
 
+  # Weight on the local (sibling-contrast) term of the tree segment advantage
+  local_adv_weight: 0.5
+
+  # Weight on the global (GRPO-style, per-prompt) term of the tree segment advantage
+  global_adv_weight: 0.5
+
   # Whether to enable in-reward KL penalty
   use_kl_in_reward: False
 
