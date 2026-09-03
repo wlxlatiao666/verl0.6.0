@@ -110,3 +110,12 @@ class AlgoConfig(BaseConfig):
     local_adv_weight: float = 0.5
     # Weight on the global (GRPO-style, per-prompt) term of the tree segment advantage.
     global_adv_weight: float = 0.5
+    # Tree segment advantage mode: "telescope" (GRPO-conserving telescoping
+    # decomposition: root gets the GRPO advantage of its subtree value,
+    # non-root gets the group-sigma-normalized marginal value change; path sums
+    # equal the leaf's GRPO advantage) or "local_global" (legacy weighted mix).
+    tree_adv_mode: str = "local_global"
+    # Sibling dedup: 4-gram Jaccard threshold above which sibling segments are
+    # treated as duplicates and merged (counted once) in the parent's value.
+    # 0 disables.
+    sibling_dedup_threshold: float = 0.0

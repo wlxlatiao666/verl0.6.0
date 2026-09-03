@@ -262,7 +262,7 @@ def compute_advantage(
     return data
 
 
-def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", local_adv_weight: float = 0.5, global_adv_weight: float = 0.5) -> DataProto:
+def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", local_adv_weight: float = 0.5, global_adv_weight: float = 0.5, tree_adv_mode: str = "local_global", sibling_dedup_threshold: float = 0.0) -> DataProto:
     """Compute per-segment advantages for tree process reward.
 
     Step 1 — Back-propagate leaf scores to all nodes (bottom-up):
@@ -378,6 +378,42 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
         if p >= 0:
             children_of[p].append(i)
 
+    # ── Optional sibling dedup (statistical merge) ───────────────────────────
+    # Siblings whose segments are near-duplicates (the branch produced a
+    # rewording, not a semantically different continuation) are clustered so
+    # each distinct continuation counts ONCE toward the parent's value.
+    # Without this, k duplicate siblings weight the same continuation k times
+    # in V(parent). The merge only affects statistics; every node still gets
+    # its own advantage and its own training row.
+    dedup_clusters: dict[int, list[list[int]]] = {}
+    _dedup_n_children = 0
+    _dedup_n_clusters = 0
+    if sibling_dedup_threshold and sibling_dedup_threshold > 0:
+        def _seg_ngrams(seg_idx: int, n: int = 4, limit: int = 48):
+            toks = list(unique_segments[seg_idx][:limit])
+            return {tuple(toks[k:k + n]) for k in range(len(toks) - n + 1)}
+
+        for p, children in children_of.items():
+            ngram_sets = {c: _seg_ngrams(c) for c in children}
+            clusters: list[list[int]] = []
+            for c in children:
+                placed = False
+                for cl in clusters:
+                    a, b = ngram_sets[c], ngram_sets[cl[0]]
+                    union = len(a | b)
+                    if union > 0 and len(a & b) / union >= sibling_dedup_threshold:
+                        cl.append(c)
+                        placed = True
+                        break
+                if not placed:
+                    clusters.append([c])
+            dedup_clusters[p] = clusters
+            _dedup_n_children += len(children)
+            _dedup_n_clusters += len(clusters)
+        print(f"[DEBUG] [compute_tree_process_advantage] sibling dedup: "
+              f"{_dedup_n_children} children -> {_dedup_n_clusters} clusters "
+              f"(threshold={sibling_dedup_threshold})")
+
     # Get list of internal nodes (non-leaf nodes)
     internal_nodes = [i for i in range(n_unique) if i in children_of]
     print(f"[DEBUG] [compute_tree_process_advantage] internal_nodes={len(internal_nodes)}, leaf_nodes={len(leaf_seg_to_leaf_idx)}")
@@ -385,44 +421,47 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
     # Sort internal nodes by depth descending (compute deeper nodes first)
     internal_nodes_sorted = sorted(internal_nodes, key=lambda i: -seg_depth[i])
 
-    # Compute scores for internal nodes bottom-up
+    # Compute scores for internal nodes bottom-up. With dedup, each duplicate
+    # cluster contributes one (averaged) vote to the parent's value.
     for i in internal_nodes_sorted:
         children = children_of[i]
-        children_t = torch.tensor(children, dtype=torch.long, device=device)
-        child_scores = node_scores[children_t]
-        node_scores[i] = child_scores.mean()
+        clusters = dedup_clusters.get(i)
+        if clusters and len(clusters) < len(children):
+            cluster_means = [
+                node_scores[torch.tensor(cl, dtype=torch.long, device=device)].mean()
+                for cl in clusters
+            ]
+            node_scores[i] = torch.stack(cluster_means).mean()
+        else:
+            children_t = torch.tensor(children, dtype=torch.long, device=device)
+            child_scores = node_scores[children_t]
+            node_scores[i] = child_scores.mean()
     print(f"[DEBUG] [compute_tree_process_advantage] node_scores range: [{node_scores.min():.4f}, {node_scores.max():.4f}]")
 
-    # ── Step 2: combine local and global advantages ──────────────────────────
-    # Local advantage: adv_local(s) = (score(s) - score(parent(s))) / (std(siblings) + eps)
-    # Global advantage: adv_global(s) = (score(s) - mean_leaf_score) / (std_leaf_scores + eps)
-    # Combined: adv(s) = local_adv_weight * adv_local(s) + global_adv_weight * adv_global(s)
+    # ── Step 2: per-segment advantages ───────────────────────────────────────
+    # Two modes:
+    #   "telescope" (recommended): GRPO-conserving telescoping decomposition.
+    #     Root segments:     A = (V(root) − μ) / σ      (GRPO-style vs group)
+    #     Non-root segments: A = (V(s) − V(parent)) / σ (marginal value change)
+    #     where μ/σ are the prompt group's leaf-score mean/std (the same
+    #     statistics GRPO uses). Along any root→leaf path the terms telescope:
+    #     ΣA = (V(leaf) − μ)/σ ≡ that leaf's GRPO advantage. Total credit per
+    #     trajectory is identical to GRPO; the tree only redistributes it onto
+    #     the segments that actually changed the expected outcome. Top-up
+    #     (single-segment) samples reduce exactly to GRPO.
+    #   "local_global" (legacy): weighted mix of sibling-z-scored local
+    #     advantage and GRPO-style global advantage.
     seg_local_advantages = torch.zeros(n_unique, dtype=torch.float32, device=device)
-
-    # group children by parent to compute sibling std for local advantage
-    children_of: dict[int, list[int]] = defaultdict(list)
-    for i in range(n_unique):
-        p = int(parent_of[i])
-        if p >= 0:
-            children_of[p].append(i)
-
-    for p, children in children_of.items():
-        children_t = torch.tensor(children, dtype=torch.long, device=device)
-        sibling_scores = node_scores[children_t]
-        sib_std = sibling_scores.std() if len(children) > 1 else torch.tensor(0.0, device=device)
-        parent_score = node_scores[p]
-        seg_local_advantages[children_t] = (sibling_scores - parent_score) / (sib_std + 1e-6)
-
-    # Compute global advantage PER PROMPT GROUP (like GRPO)
     seg_global_advantages = torch.zeros(n_unique, dtype=torch.float32, device=device)
+    seg_sigma = torch.zeros(n_unique, dtype=torch.float32, device=device)
 
-    # First, build a map from prompt id to list of leaf segment ids in this prompt
+    # Global advantage PER PROMPT GROUP (like GRPO); also record each
+    # segment's prompt-group sigma for the telescope normalization.
     prompt_id_to_leaf_segs: dict[int, list[int]] = defaultdict(list)
     for seg_idx in leaf_seg_to_leaf_idx.keys():
         prompt_id = seg_to_prompt_id[seg_idx]
         prompt_id_to_leaf_segs[prompt_id].append(seg_idx)
 
-    # Compute mean/std and global advantage per prompt
     for prompt_id, prompt_leaf_segs in prompt_id_to_leaf_segs.items():
         prompt_leaf_segs_t = torch.tensor(prompt_leaf_segs, dtype=torch.long, device=device)
         prompt_leaf_node_scores = node_scores[prompt_leaf_segs_t]
@@ -433,12 +472,34 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
         prompt_all_segs = [i for i in range(n_unique) if seg_to_prompt_id.get(i, None) == prompt_id]
         prompt_all_segs_t = torch.tensor(prompt_all_segs, dtype=torch.long, device=device)
 
-        # Compute global advantage for all segments in this prompt
         seg_global_advantages[prompt_all_segs_t] = (node_scores[prompt_all_segs_t] - mean_leaf_score) / (std_leaf_score + 1e-6)
+        seg_sigma[prompt_all_segs_t] = std_leaf_score
 
-    # Combine local and global advantages
-    seg_advantages = local_adv_weight * seg_local_advantages + global_adv_weight * seg_global_advantages
-    print(f"[DEBUG] [compute_tree_process_advantage] seg_advantages range: [{seg_advantages.min():.4f}, {seg_advantages.max():.4f}], mean={seg_advantages.mean():.4f}")
+    if tree_adv_mode == "telescope":
+        # Non-root: telescoped marginal increment, group-σ normalized (no
+        # 3-sample sib_std noise). Root: its global advantage — so path sums
+        # telescope exactly to the leaf's GRPO advantage.
+        for p, children in children_of.items():
+            children_t = torch.tensor(children, dtype=torch.long, device=device)
+            seg_local_advantages[children_t] = (
+                node_scores[children_t] - node_scores[p]
+            ) / (seg_sigma[children_t] + 1e-6)
+        nonroot_mask = torch.zeros(n_unique, dtype=torch.bool, device=device)
+        nonroot_idx = [i for i in range(n_unique) if parent_of[i] >= 0]
+        if nonroot_idx:
+            nonroot_mask[torch.tensor(nonroot_idx, dtype=torch.long, device=device)] = True
+        seg_advantages = torch.where(nonroot_mask, seg_local_advantages, seg_global_advantages)
+    else:
+        # Legacy: local advantage z-scored within the sibling set.
+        for p, children in children_of.items():
+            children_t = torch.tensor(children, dtype=torch.long, device=device)
+            sibling_scores = node_scores[children_t]
+            sib_std = sibling_scores.std() if len(children) > 1 else torch.tensor(0.0, device=device)
+            parent_score = node_scores[p]
+            seg_local_advantages[children_t] = (sibling_scores - parent_score) / (sib_std + 1e-6)
+        seg_advantages = local_adv_weight * seg_local_advantages + global_adv_weight * seg_global_advantages
+
+    print(f"[DEBUG] [compute_tree_process_advantage] mode={tree_adv_mode}, seg_advantages range: [{seg_advantages.min():.4f}, {seg_advantages.max():.4f}], mean={seg_advantages.mean():.4f}")
 
     # ── Diagnostics: does the tree add signal beyond GRPO? ────────────────────
     # The central question behind "tree never beats GRPO": does the LOCAL
@@ -489,6 +550,21 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
 
         wl_share = _m(wlocal_abs) / (_m(wlocal_abs) + _m(wglobal_abs) + eps)
 
+        # Within-trajectory credit dispersion: std of segment advantages along
+        # each multi-segment path. This measures whether the tree actually
+        # differentiates credit INSIDE a trajectory (the thing GRPO cannot
+        # do); it replaces corr(local, global) as the primary health signal
+        # under the telescope mode.
+        _path_stds = []
+        for _path in leaf_segment_indices:
+            if len(_path) > 1:
+                _pv = seg_advantages[torch.tensor(_path, dtype=torch.long, device=device)]
+                _path_stds.append(float(_pv.std().item()))
+        within_traj_adv_std = float(np.mean(_path_stds)) if _path_stds else 0.0
+        sibling_dup_rate = (
+            1.0 - _dedup_n_clusters / _dedup_n_children
+        ) if _dedup_n_children else 0.0
+
         tree_adv_metrics = {
             "tree_adv/local_abs_mean": _m(local_abs),
             "tree_adv/global_abs_mean": _m(global_abs),
@@ -499,6 +575,8 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
             "tree_adv/sib_std_mean": sib_std_mean,
             "tree_adv/sib_std_collapsed_frac": sib_std_collapsed_frac,
             "tree_adv/frac_branch_leaves": frac_branch_leaves,
+            "tree_adv/within_traj_adv_std": within_traj_adv_std,
+            "tree_adv/sibling_dup_rate": sibling_dup_rate,
             "tree_adv/mean_children": float(np.mean(n_children)) if n_children else 0.0,
             "tree_adv/mean_path_len": float(pls.mean()) if pls.size else 0.0,
             "tree_adv/n_unique_segments": float(n_unique),
@@ -544,7 +622,7 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
     # ── Memory cleanup: free large tree data after token_advantages is assembled ──
     # unique_segments and leaf_segment_indices are no longer needed once token_advantages is built
     del unique_segments, leaf_segment_indices
-    del node_scores, seg_local_advantages, seg_global_advantages, seg_advantages
+    del node_scores, seg_local_advantages, seg_global_advantages, seg_advantages, seg_sigma
     gc.collect()
 
     data.batch["advantages"] = token_advantages
@@ -1706,11 +1784,15 @@ class RayPPOTrainer:
                             proc_agg_mode = self.config.algorithm.get("proc_agg_mode", "raw")
                             local_adv_weight = self.config.algorithm.get("local_adv_weight", 0.5)
                             global_adv_weight = self.config.algorithm.get("global_adv_weight", 0.5)
+                            tree_adv_mode = self.config.algorithm.get("tree_adv_mode", "local_global")
+                            sibling_dedup_threshold = self.config.algorithm.get("sibling_dedup_threshold", 0.0)
                             batch = compute_tree_process_advantage(
                                 batch,
                                 proc_agg_mode=proc_agg_mode,
                                 local_adv_weight=local_adv_weight,
-                                global_adv_weight=global_adv_weight
+                                global_adv_weight=global_adv_weight,
+                                tree_adv_mode=tree_adv_mode,
+                                sibling_dedup_threshold=sibling_dedup_threshold,
                             )
                             # Surface tree-advantage diagnostics to wandb.
                             if "tree_adv_metrics" in batch.meta_info:

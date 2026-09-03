@@ -320,6 +320,15 @@ tree_search:
   # Temperature applied to the branch-point distribution before sampling.
   branch_temperature: 1.0
 
+  # Only branch at reasoning-step starts (previous token is a newline or
+  # sentence-final punctuation). Threshold calibration then also collects
+  # entropy only at step-start positions.
+  branch_at_step_start: False
+
+  # Total-leaf budget per prompt (binding size control; top-up and batch
+  # sizing target this value). null keeps legacy branching_factor**max_tree_depth.
+  max_num_leaves: null
+
 # profile the rollout model in `generate_sequence` 
 profiler:
 

@@ -247,6 +247,9 @@ class vLLMRollout(BaseRollout):
                 branch_trigger_mode=_tree_cfg.get("branch_trigger_mode", None),
                 branch_sampling=str(_tree_cfg.get("branch_sampling", "sample")),
                 branch_temperature=float(_tree_cfg.get("branch_temperature", 1.0)),
+                branch_at_step_start=bool(_tree_cfg.get("branch_at_step_start", False)),
+                max_num_leaves=(int(_tree_cfg["max_num_leaves"])
+                                if _tree_cfg.get("max_num_leaves") else None),
             )
             logger.info(f"[TreeRollout] TreeSearchParams enabled: {self.sampling_params.tree_search_params}")
 
@@ -301,6 +304,8 @@ class vLLMRollout(BaseRollout):
             temperature=float(self.sampling_params.temperature),
             max_tokens=_max_tokens,
             collect_threshold_stats=True,
+            threshold_stats_step_start_only=bool(
+                _tree_cfg.get("branch_at_step_start", False)),
         )
 
         outputs = self.inference_engine.generate(
@@ -628,7 +633,8 @@ class vLLMRollout(BaseRollout):
             if _tree_search_active and _tree_cfg is not None and _leaves_per_prompt:
                 _bf    = int(_tree_cfg.get("branching_factor", 2))
                 _md    = int(_tree_cfg.get("max_tree_depth",   3))
-                _tgt   = _bf ** _md
+                _tgt   = (int(_tree_cfg["max_num_leaves"])
+                          if _tree_cfg.get("max_num_leaves") else _bf ** _md)
                 _topup_enable = bool(_tree_cfg.get("topup_leaves_to_target", True))
                 if _topup_enable and min(_leaves_per_prompt) < _tgt:
                     # Build per-prompt deficit
@@ -740,7 +746,8 @@ class vLLMRollout(BaseRollout):
             if _tree_search_active and _tree_cfg is not None:
                 _bf = int(_tree_cfg.get("branching_factor", 2))
                 _md = int(_tree_cfg.get("max_tree_depth",   3))
-                _tgt = _bf ** _md
+                _tgt = (int(_tree_cfg["max_num_leaves"])
+                        if _tree_cfg.get("max_num_leaves") else _bf ** _md)
                 _topup_enable = bool(_tree_cfg.get("topup_leaves_to_target", True))
                 _hits = sum(1 for n in _leaves_per_prompt if n >= _tgt) if _leaves_per_prompt else 0
                 print(

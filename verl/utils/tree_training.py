@@ -46,6 +46,15 @@ def get_ppo_rollout_batch_multiplier(rollout_config) -> int:
         raise ValueError(f"tree_search.branching_factor must be positive, got {branching_factor}")
     if max_tree_depth < 0:
         raise ValueError(f"tree_search.max_tree_depth must be non-negative, got {max_tree_depth}")
+    # Leaf-budget control: when max_num_leaves is set it is the binding size
+    # target (top-up fills to it and vLLM caps splits at it), so the response
+    # multiplicity is exactly that budget.
+    max_num_leaves = _config_get(tree_config, "max_num_leaves", None)
+    if max_num_leaves:
+        max_num_leaves = int(max_num_leaves)
+        if max_num_leaves < 1:
+            raise ValueError(f"tree_search.max_num_leaves must be positive, got {max_num_leaves}")
+        return max_num_leaves
     return branching_factor**max_tree_depth
 
 

@@ -132,6 +132,16 @@ class TreeSearchConfig(BaseConfig):
     # entropy (no WAAD compute, no deferred branching), "entropy_waad", or
     # "random".
     branch_trigger_mode: Optional[str] = None
+    # Only branch at reasoning-step starts (previous token is a newline or
+    # sentence-final punctuation). Threshold calibration then also collects
+    # entropy only at step-start positions.
+    branch_at_step_start: bool = False
+    # Total-leaf budget per prompt. When set, this is the binding size control:
+    # the tree stops splitting once it would exceed this many complete leaves,
+    # and top-up / batch sizing target this value instead of
+    # branching_factor ** max_tree_depth (which then acts only as a loose
+    # shape limit). None keeps the legacy bf**depth behaviour.
+    max_num_leaves: Optional[int] = None
 
 
 @dataclass
