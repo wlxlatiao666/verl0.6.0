@@ -503,7 +503,6 @@ class vLLMRollout(BaseRollout):
                             path_nodes: list[tuple[int, list[int]]] = []
                             current = sample
                             while current is not None:
-                                print(f"segment length: {len(current.tree_ids)}, segment depth: {current.tree_depth}")
                                 path_nodes.append((current.seq_id, current.tree_ids))
                                 if current.parent_seq_id is not None and current.parent_seq_id in seq_map:
                                     current = seq_map[current.parent_seq_id]
@@ -512,6 +511,16 @@ class vLLMRollout(BaseRollout):
                             # Reverse to get root→leaf order
                             path_nodes.reverse()
                             response_ids = sum([seg for _, seg in path_nodes], [])
+
+                            # Tree reconstruction concatenates segments and each
+                            # branch child prepends a divergence token that is not
+                            # counted against the per-child max_tokens budget, so a
+                            # deep path can exceed response_length. Conventional
+                            # responses are capped by max_tokens; clamp tree
+                            # responses the same way, otherwise workers pad to
+                            # different widths and DataProto.concat fails.
+                            if len(response_ids) > self.config.response_length:
+                                response_ids = response_ids[: self.config.response_length]
 
                             # Register each node in unique_segments (dedup by seq_id)
                             if _tree_process_reward:
@@ -591,7 +600,8 @@ class vLLMRollout(BaseRollout):
                                         curr_log_prob.append(0.0)
                             else:
                                 curr_log_prob.extend([0.0] * len(seg_tokens))
-                        rollout_log_probs.append(curr_log_prob)
+                        # Keep aligned with the (possibly clamped) response_ids.
+                        rollout_log_probs.append(curr_log_prob[: len(response_ids)])
 
                     if _tree_process_reward:
                         # Token-level inverse-sharing weight:
@@ -600,6 +610,8 @@ class vLLMRollout(BaseRollout):
                         for seg_id, seg_tokens in path_nodes:
                             cnt = float(_node_descendant_count.get(seg_id, 1))
                             leaf_weights.extend([1.0 / cnt] * len(seg_tokens))
+                        # Clamp to the (possibly truncated) response length.
+                        leaf_weights = leaf_weights[: len(response_ids)]
                         if len(leaf_weights) != len(response_ids):
                             raise RuntimeError(
                                 "[token_share_weights] length mismatch: "
