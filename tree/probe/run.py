@@ -87,7 +87,7 @@ def prepare(args):
     tokenizer = tokenizer_for(args.model)
     table = pq.read_table(args.data)
     rows = table.to_pylist()
-    unique, row_ids = {}, []
+    unique, row_ids, group_rows, conflicts = {}, [], {}, set()
     for index, row in enumerate(rows):
         messages = row[args.prompt_key]
         if (
@@ -98,9 +98,13 @@ def prepare(args):
             raise ValueError(f"Row {index}: expected text-only chat messages in {args.prompt_key!r}")
         qid = question_id(messages)
         row_ids.append(qid)
+        group_rows.setdefault(qid, []).append(index)
+        gt = row["reward_model"]["ground_truth"]
+        if not isinstance(gt, str):
+            raise ValueError(f"Row {index}: math_dapo ground_truth must be a string")
         if qid in unique:
-            if unique[qid]["ground_truth"] != row["reward_model"]["ground_truth"]:
-                raise ValueError(f"Conflicting ground truth for duplicate question {qid}")
+            if unique[qid]["ground_truth"] != gt:
+                conflicts.add(qid)
             continue
         raw = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         prompt_ids = tokenizer(raw, add_special_tokens=False)["input_ids"]
@@ -115,28 +119,54 @@ def prepare(args):
             or source.startswith(("aime", "math_dapo_"))
         ):
             raise ValueError(f"This pipeline uses the local math_dapo verifier; unsupported source {source!r}")
-        gt = row["reward_model"]["ground_truth"]
-        if not isinstance(gt, str):
-            raise ValueError(f"Row {index}: math_dapo ground_truth must be a string")
         unique[qid] = dict(id=qid, row_index=index, prompt_ids=prompt_ids, ground_truth=gt, data_source=source)
+    # Quarantine the WHOLE group: choosing the first/majority answer would silently
+    # change supervision. Keep original rows for inspection, even if answers might
+    # turn out to be equivalent spellings. Do not modify the source parquet.
+    conflict_groups = [
+        dict(
+            id=qid,
+            rows=[
+                dict(row_index=i, prompt=rows[i][args.prompt_key],
+                     ground_truth=rows[i]["reward_model"]["ground_truth"],
+                     data_source=rows[i]["data_source"])
+                for i in group_rows[qid]
+            ],
+        )
+        for qid in sorted(conflicts)
+    ]
+    conflict_row_count = sum(len(group_rows[qid]) for qid in conflicts)
+    atomic_json(root / "conflicting_ground_truth.json", dict(
+        policy="exclude_entire_question_group",
+        group_count=len(conflicts), row_count=conflict_row_count, groups=conflict_groups,
+    ))
+    for qid in conflicts:
+        del unique[qid]
+    if conflicts:
+        print(f"Excluded {len(conflicts)} conflicting question groups ({conflict_row_count} rows); "
+              f"see {root / 'conflicting_ground_truth.json'}", flush=True)
     selected = sorted(unique)
     random.Random(args.seed).shuffle(selected)
     selected = selected[: args.num_questions]
     split = split_questions(selected, args.seed, args.val_fraction, args.test_fraction)
     questions = [dict(unique[qid], split=split[qid]) for qid in sorted(selected)]
-    atomic_json(root / "questions.json", questions)
+    # A failed old prepare left only config.json and can resume. Never overwrite
+    # a different completed split that may already have downstream artifacts.
+    ensure_manifest(root / "questions.json", questions)
     held_out = {q["id"] for q in questions if q["split"] != "train"}
     for name in ("train", "val", "test"):
         ids = [q["row_index"] for q in questions if q["split"] == name]
         pq.write_table(table.take(ids), root / f"probe_{name}.parquet")
-    # Exclude ALL duplicates of held-out questions, including rows not sampled for annotation.
+    # Exclude ALL held-out duplicates and conflicting groups from the GRPO export.
     pq.write_table(
-        table.take([i for i, qid in enumerate(row_ids) if qid not in held_out]),
+        table.take([i for i, qid in enumerate(row_ids) if qid not in held_out and qid not in conflicts]),
         root / "grpo_train_without_probe_holdout.parquet",
     )
     summary = dict(
         source_rows=len(rows),
         unique_questions=len(unique),
+        conflicting_question_groups=len(conflicts),
+        conflicting_rows=conflict_row_count,
         selected=len(questions),
         splits=dict(Counter(q["split"] for q in questions)),
         max_annotation_rollouts=sum(

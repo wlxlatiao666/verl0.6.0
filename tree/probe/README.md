@@ -92,6 +92,10 @@ bash tree/scripts/train_qwen2.5_math7b-probe.sh evaluate
   prompt 是别的列名时，prepare 使用 `--prompt-key`。错误格式直接报错。
 - 按规范化 prompt（保留大小写，只合并空白）做精确去重后划分题目。不是语义近重复去重；
   需要人工或上游工具排除同模板改数字等近重复。验证/测试题不接触 AIME。
+- 同一规范化 prompt 的 ground truth 字符串不一致时，隔离整组题目，继续处理其他题目。
+  `conflicting_ground_truth.json` 保存所有冲突组的原始 prompt、答案和行号，供人工判断是
+  答案表示差异还是真正的标注冲突；不自动选第一个答案或投票，也不修改源 parquet。
+  冲突组同时从 probe 数据和导出的 GRPO 数据中排除。
 - 导出 `probe_{train,val,test}.parquet`，并从完整原始题库排除所有留出题目的精确重复，
   生成 `grpo_train_without_probe_holdout.parquet`。后续 GRPO 若要保留此验证隔离，可将 TRAIN_FILE 指向它。
 - 生成轨迹不使用树搜索。按 response 长度分层均匀选位置，不以 entropy/WAAD/最终正确性筛位置。
