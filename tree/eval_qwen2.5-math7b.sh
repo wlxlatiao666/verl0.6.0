@@ -63,7 +63,7 @@ VAL_FILES="['${MATH500_FILE}','${AMC_FILE}','${OLYMPIAD_FILE}']"
 # Default checkpoint root matches verl's default:
 #   checkpoints/<project_name>/<experiment_name>/global_step_N/actor/...
 PROJECT_NAME=${PROJECT_NAME:-"verl_grpo_tree_0722"}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-"qwen2.5_math7b_treepr_0828"}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-"qwen2.5_math7b_grpo_new"}
 CHECKPOINT_DIR=${CHECKPOINT_DIR:-"/inspire/qb-ilm2/project/neosmosis/weilongxuan-253108120168/verl_data/checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}"}
 
 # Build the list of global_step_* directories to evaluate.

@@ -19,9 +19,9 @@ export NCCL_SHM_DISABLE=1
 export NCCL_DEBUG=INFO
 
 HOME=/inspire/hdd/global_user/weilongxuan-253108120168
-verl_dir=/inspire/hdd/global_user/weilongxuan-253108120168/verl_data
+verl_dir=/inspire/qb-ilm2/project/neosmosis/weilongxuan-253108120168/verl_data
 project_name="verl_ablation_qwen25_7b"
-experiment_name="math_grpo_treepr"
+experiment_name="math_grpo_treepr_new"
 
 RAY_DATA_HOME="${RAY_DATA_HOME:-${HOME}/verl0.6.0}"
 DATA_DIR="${DATA_DIR:-${RAY_DATA_HOME}/data}"
