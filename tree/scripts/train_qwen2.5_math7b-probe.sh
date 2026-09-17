@@ -39,7 +39,7 @@ gpu_stage() {
 case "$STAGE" in
     prepare) prepare "$@" ;;
     rollout|features|label) gpu_stage "$STAGE" "$@" ;;
-    train|evaluate) "$PYTHON_BIN" tree/probe/run.py "$STAGE" --work-dir "$WORK_DIR" "$@" ;;
+    train|evaluate|summarize) "$PYTHON_BIN" tree/probe/run.py "$STAGE" --work-dir "$WORK_DIR" "$@" ;;
     all)
         if [[ "$NUM_SHARDS" != 1 ]]; then
             echo "For multiple shards run prepare once, GPU stages with a barrier, then train/evaluate once." >&2
@@ -52,5 +52,5 @@ case "$STAGE" in
         "$PYTHON_BIN" tree/probe/run.py train --work-dir "$WORK_DIR"
         "$PYTHON_BIN" tree/probe/run.py evaluate --work-dir "$WORK_DIR"
         ;;
-    *) echo "Usage: bash $0 {all|prepare|rollout|features|label|train|evaluate} [stage arguments]" >&2; exit 2 ;;
+    *) echo "Usage: bash $0 {all|prepare|rollout|features|label|train|evaluate|summarize} [stage arguments]" >&2; exit 2 ;;
 esac

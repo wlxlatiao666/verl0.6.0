@@ -166,6 +166,30 @@ matched-budget 是每题离线选相同比例位置的回顾性指标，不能�
 
 ## 独立重复标注审计
 
+### 零标签分类统计
+
+label 完成后（包括全部命中缓存时）自动输出 overall/train/val/test 分类数量与占比，
+保存 `label_summary_main_all.json`。分片运行时文件名增加 shard 后缀，只统计该分片；
+所有分片完成后用下面的 summarize 命令汇总全量结果。
+
+- `zero_all_wrong`：该位置所有候选、所有续写均错误。
+- `zero_all_correct`：所有续写均正确。
+- `zero_mixed_cancellation`：存在正确和错误结果，但候选间方差与噪声修正恰好抵消。
+- `positive` / `negative`：修正后的估计严格为正/负。
+
+分类用二元 outcomes 的有理数计算确定精确零，不改训练标签。额外报告非零却因五位小数
+显示为零的位置数，以及精确零产生浮点残差的位置数。每类同时给出占全部位置的比例、
+零类别占所有零位置的比例、该类续写的截断比例。截断比例以续写次数为分母，不能当作错误率。
+缺失的题目列在 JSON 中，`complete=false` 表示当前汇总不完整。
+
+已有实验无需重新生成或训练，就能从原始标签得到统计（仅需标准 Python，不加载模型）：
+
+```bash
+bash tree/scripts/train_qwen2.5_math7b-probe.sh summarize
+# 审计标签或只看验证集：
+bash tree/scripts/train_qwen2.5_math7b-probe.sh summarize --replica audit --split test
+```
+
 在相同测试前缀、相同候选上换 seed 重新标注，避免只在一次 noisy label 上比较。
 不会重新训练或重新校准阈值：
 

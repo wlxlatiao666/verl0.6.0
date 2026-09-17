@@ -22,6 +22,7 @@ from common import (
     split_questions,
     utility_label,
 )
+from diagnostics import label_category, summarize
 
 REPO = Path(__file__).resolve().parents[2]
 DEFAULT_MODEL = "/inspire/hdd/global_public/public_models/Qwen/Qwen2.5-Math-7B"
@@ -372,6 +373,7 @@ def label(args):
             todo.append((q, source, repeats, provenance, path))
     if not todo:
         print("All assigned labels already complete")
+        summarize(args)
         return
     llm = engine(cfg, args)
     tokenizer = tokenizer_for(cfg["model"])
@@ -427,7 +429,8 @@ def label(args):
                 outcomes.append(candidate_outcomes)
                 details.append(candidate_details)
             labeled.append(dict(id=record["id"], outcomes=outcomes, details=details, **utility_label(outcomes)))
-            print(f"label {record['id'][-18:]} U={labeled[-1]['utility_raw']:.5f}", flush=True)
+            print(f"label {record['id'][-18:]} U={labeled[-1]['utility_raw']:.5f} "
+                  f"category={label_category(labeled[-1])}", flush=True)
         atomic_json(
             path,
             dict(
@@ -438,6 +441,7 @@ def label(args):
                 records=labeled,
             ),
         )
+    summarize(args)
 
 
 def parser():
@@ -464,16 +468,17 @@ def parser():
     prep.add_argument("--repeats", type=int, default=4)
     prep.add_argument("--eval-repeats", type=int, default=8)
     parsers = [prep]
-    for command in ("rollout", "features", "label"):
+    for command in ("rollout", "features", "label", "summarize"):
         s = sub.add_parser(command)
         s.add_argument("--num-shards", type=int, default=1)
         s.add_argument("--shard-index", type=int, default=0)
-        if command != "features":
+        if command in ("rollout", "label"):
             s.add_argument("--tensor-parallel-size", type=int, default=1)
             s.add_argument("--gpu-memory-utilization", type=float, default=0.7)
-        if command == "label":
+        if command in ("label", "summarize"):
             s.add_argument("--replica", default="main")
             s.add_argument("--split", choices=["all", "train", "val", "test"], default="all")
+        if command == "label":
             s.add_argument("--repeats-override", type=int)
             s.add_argument("--save-text", action="store_true")
         parsers.append(s)
