@@ -27,7 +27,7 @@ def get_ppo_rollout_batch_multiplier(rollout_config) -> int:
 
     Conventional rollout expands by ``rollout.n``. Tree rollout starts with
     ``n=1`` and expands inside vLLM, so a fixed-size, topped-up tree instead
-    uses ``branching_factor ** max_tree_depth``.
+    uses ``num_roots * branching_factor ** max_tree_depth``.
     """
     rollout_n = int(_config_get(rollout_config, "n", 1))
     tree_config = _config_get(rollout_config, "tree_search", None)
@@ -46,7 +46,10 @@ def get_ppo_rollout_batch_multiplier(rollout_config) -> int:
         raise ValueError(f"tree_search.branching_factor must be positive, got {branching_factor}")
     if max_tree_depth < 0:
         raise ValueError(f"tree_search.max_tree_depth must be non-negative, got {max_tree_depth}")
-    return branching_factor**max_tree_depth
+    num_roots = int(_config_get(tree_config, "num_roots", 1))
+    if num_roots < 1:
+        raise ValueError("tree_search.num_roots must be positive")
+    return num_roots * branching_factor**max_tree_depth
 
 
 def is_tree_process_reward_enabled(

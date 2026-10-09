@@ -97,10 +97,17 @@ class TreeSearchConfig(BaseConfig):
     """Configuration for vLLM tree search (tree decoding) rollout."""
 
     enable: bool = False
+    # Independent shallow trees per original question. rollout.n stays 1.
+    num_roots: int = 1
+    threshold_stats_quantile: float = 0.8
     entropy_threshold: float = 1.0
     branching_factor: int = 3
     max_tree_depth: int = 3
-    tau_importance: float = 0.0
+    tau_importance: Optional[float] = 0.0
+    branch_trigger_mode: Optional[str] = None
+    branch_probe_path: Optional[str] = None
+    branch_probe_threshold: Optional[float] = None
+    min_seg_length: int = 10
     # Fill a partially expanded tree with conventional samples until every
     # prompt has branching_factor ** max_tree_depth responses. Besides keeping
     # the rollout group size fixed, this also defines the effective rollout

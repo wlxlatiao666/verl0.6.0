@@ -292,6 +292,17 @@ tree_search:
   # Tau for importance.
   tau_importance: 0.0
 
+  # null preserves the legacy entropy/WAAD trigger selection.
+  branch_trigger_mode: null
+  branch_probe_path: null
+  # Raw classification logit, not a probability or utility estimate.
+  branch_probe_threshold: null
+  min_seg_length: 10
+  num_roots: 1
+  threshold_stats_quantile: 0.8
+  branch_sampling: sample
+  branch_temperature: 1.0
+
   # Fill each prompt to branching_factor ** max_tree_depth responses with
   # conventional samples. This fixed target is also used for PPO batch sizing.
   topup_leaves_to_target: True

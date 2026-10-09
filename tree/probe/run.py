@@ -257,6 +257,27 @@ def prefix_features(model, ids, prompt_length, positions, vocab_size):
     return h, logp, entropy
 
 
+def sample_branch_candidates(row_logprobs, k, temperature, generator):
+    """Match local vLLM LLMEngine._select_tree_branch_token_ids(sample).
+
+    Same finite mask, temperature, uniform clamp and Gumbel-top-k; use an
+    explicit per-position RNG for reproducible offline annotation.
+    """
+    import torch
+
+    logits = row_logprobs.float()
+    finite = torch.isfinite(logits)
+    k = min(int(k), logits.shape[-1], int(finite.sum().item()))
+    if k <= 0:
+        return torch.empty(0, dtype=torch.long, device=logits.device)
+    logits = logits / float(temperature or 1.0)
+    u = torch.rand(logits.shape, dtype=logits.dtype, device=logits.device,
+                   generator=generator).clamp_(1e-20, 1.0)
+    gumbel = -torch.log(-torch.log(u))
+    perturbed = torch.where(finite, logits + gumbel, torch.full_like(logits, float("-inf")))
+    return torch.topk(perturbed, k, dim=-1).indices
+
+
 def features(args):
     import torch
     from transformers import AutoModelForCausalLM
@@ -267,7 +288,10 @@ def features(args):
         source = root / "trajectories" / f"{q['id']}.json"
         if not source.exists():
             raise ValueError(f"Missing trajectories: {source}. Finish rollout first.")
-        provenance = digest([cfg, q, file_digest(source), "features"])
+        provenance_parts = [cfg, q, file_digest(source), "features"]
+        if cfg["branch_sampling"] == "sample":
+            provenance_parts.append("vllm_gumbel_topk_v1")
+        provenance = digest(provenance_parts)
         path = root / "features" / f"{q['id']}.json"
         tensor_path = path.with_suffix(".pt")
         if check_artifact(path, provenance):
@@ -313,12 +337,11 @@ def features(args):
                         generator = torch.Generator(device="cuda").manual_seed(
                             seed_for(cfg["seed"], q["id"], j, t, "candidates")
                         )
-                        u = torch.rand(logp.shape[-1], generator=generator, device="cuda").clamp_(1e-7, 1 - 1e-7)
-                        candidates = (
-                            (logp[row] / cfg["branch_temperature"] - (-u.log()).log())
-                            .topk(cfg["branching_factor"])
-                            .indices
+                        candidates = sample_branch_candidates(
+                            logp[row], cfg["branching_factor"], cfg["branch_temperature"], generator
                         )
+                    if len(candidates) < 2:
+                        raise ValueError("Fewer than two finite branch candidates; cannot estimate branch contrast")
                     records.append(
                         dict(
                             id=f"{q['id']}:{j}:{t}",
@@ -461,7 +484,7 @@ def parser():
     prep.add_argument("--max-prompt", type=int, default=2048)
     prep.add_argument("--max-response", type=int, default=2048)
     prep.add_argument("--branching-factor", type=int, default=4)
-    prep.add_argument("--branch-sampling", choices=["topk", "sample"], default="topk")
+    prep.add_argument("--branch-sampling", choices=["topk", "sample"], default="sample")
     prep.add_argument("--branch-temperature", type=float, default=1.0)
     prep.add_argument("--temperature", type=float, default=1.0)
     prep.add_argument("--top-p", type=float, default=1.0)

@@ -242,7 +242,14 @@ class vLLMRollout(BaseRollout):
                 entropy_threshold=float(_tree_cfg.get("entropy_threshold", 1.0)),
                 branching_factor=int(_tree_cfg.get("branching_factor", 2)),
                 max_tree_depth=int(_tree_cfg.get("max_tree_depth", 3)),
-                tau_importance=float(_tree_cfg.get("tau_importance", 0.0)),
+                tau_importance=(None if _tree_cfg.get("tau_importance", 0.0) is None
+                                else float(_tree_cfg.get("tau_importance", 0.0))),
+                branch_trigger_mode=_tree_cfg.get("branch_trigger_mode", None),
+                branch_probe_path=_tree_cfg.get("branch_probe_path", None),
+                branch_probe_threshold=_tree_cfg.get("branch_probe_threshold", None),
+                max_num_leaves=(int(_tree_cfg.get("branching_factor", 2)) **
+                                int(_tree_cfg.get("max_tree_depth", 3))),
+                min_seg_length=int(_tree_cfg.get("min_seg_length", 10)),
                 branch_sampling=str(_tree_cfg.get("branch_sampling", "sample")),
                 branch_temperature=float(_tree_cfg.get("branch_temperature", 1.0)),
             )
@@ -325,6 +332,13 @@ class vLLMRollout(BaseRollout):
         )
 
         result = DataProto.from_single_dict({})
+        quantile = float(_tree_cfg.get("threshold_stats_quantile", 0.8))
+        if not 0 < quantile < 1:
+            raise ValueError("threshold_stats_quantile must be between 0 and 1")
+        finite_entropy = [v for v in all_entropy if math.isfinite(v)]
+        result.meta_info["entropy_threshold_stat"] = (
+            float(np.quantile(finite_entropy, quantile)) if finite_entropy else entropy_p80
+        )
         result.meta_info["entropy_p80"] = entropy_p80
         result.meta_info["importance_p80"] = importance_p80
         return result
@@ -440,6 +454,16 @@ class vLLMRollout(BaseRollout):
                 "tree_search_params": None,
             }
 
+        # Expand roots internally; external n and question UIDs remain unchanged.
+        _original_batch_size = batch_size
+        _num_roots = int(_tree_cfg.get("num_roots", 1)) if _tree_search_active else 1
+        if _num_roots < 1:
+            raise ValueError("tree_search.num_roots must be positive")
+        if _tree_search_active and int(self.config.n) != 1:
+            raise ValueError("tree rollout requires rollout.n=1; use tree_search.num_roots")
+        if _num_roots > 1:
+            vllm_inputs = [dict(inp) for inp in vllm_inputs for _ in range(_num_roots)]
+
         lora_requests = None
         if self.lora_kwargs:
             lora_int_ids = list(self.inference_engine.llm_engine.list_loras())
@@ -447,14 +471,17 @@ class vLLMRollout(BaseRollout):
                 lora_int_id = lora_int_ids[0]
                 lora_requests = [
                     LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="/simon-stub-path")
-                ] * batch_size
+                ] * len(vllm_inputs)
 
         # users can customize different sampling_params at different run
         _tree_metrics: dict = {}
         with self.update_sampling_params(**kwargs):
             outputs = self.inference_engine.generate(
                 prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
+                sampling_params=(
+                    [self.sampling_params.clone_for_tree_root(i) for i in range(len(vllm_inputs))]
+                    if _num_roots > 1 else self.sampling_params
+                ),
                 lora_request=lora_requests,
                 use_tqdm=False,
             )
@@ -768,6 +795,11 @@ class vLLMRollout(BaseRollout):
                     f"got prompt_indices={len(prompt_indices)} responses={len(response)}."
                 )
 
+            # Map roots back to original questions before indexing prompt tensors
+            # and emitting worker routing metadata. Segment IDs stay tree-local.
+            if _tree_search_active:
+                prompt_indices = [i // _num_roots for i in prompt_indices]
+
             # When tree search produces more responses than prompts,
             # expand prompt tensors and non_tensor_batch to match
             if len(response) != batch_size:
@@ -790,7 +822,7 @@ class vLLMRollout(BaseRollout):
                 print("prompt_indices True")
                 non_tensor_batch["tree_prompt_indices"] = np.array(prompt_indices)
                 non_tensor_batch["tree_num_leaves"] = np.array([len(response)] * len(response))
-                non_tensor_batch["tree_num_prompts"] = np.array([len(outputs)] * len(response))
+                non_tensor_batch["tree_num_prompts"] = np.array([_original_batch_size] * len(response))
 
             # Store segment-level data for tree responses.
             # unique_segments: token list per unique tree node (deduped by seq_id), shape (n_unique_nodes,)
@@ -855,17 +887,21 @@ class vLLMRollout(BaseRollout):
 
             n_prompts = max(len(outputs), 1)
             _tree_branch_pts = _tree_total - _tree_leaves
-            _all_n_leaves = _leaves_per_prompt if _leaves_per_prompt else [0]
+            _tree_metrics["tree/num_roots_per_prompt"] = _num_roots
+            _tree_metrics["tree/avg_leaves_per_root"] = (
+                sum(_leaves_per_prompt) / max(len(_leaves_per_prompt), 1))
+            # Report question-level counts, comparable to the single-root baseline.
+            _all_n_leaves = [sum(_leaves_per_prompt[i:i + _num_roots])
+                             for i in range(0, len(_leaves_per_prompt), _num_roots)] or [0]
             avg_leaves = sum(_all_n_leaves) / len(_all_n_leaves)
             _min_l  = min(_all_n_leaves) if _all_n_leaves else 0
             _max_l  = max(_all_n_leaves) if _all_n_leaves else 0
-            _avg_tree = (sum(_tree_only_leaves) / len(_tree_only_leaves)) if _tree_only_leaves else 0
+            _avg_tree = sum(_tree_only_leaves) / max(_original_batch_size, 1)
 
             # Metrics: merge top-up info (produced earlier if any, defaults 0)
             _tree_metrics["tree/topup_samples"] = _topup_total if '_topup_total' in locals() else 0
             _tree_metrics["tree/prompts_need_topup"] = (
-                sum(1 for _p in range(len(outputs))
-                    if (_topup_per_prompt.get(_p, 0) if '_topup_per_prompt' in locals() else 0) > 0)
+                len({p // _num_roots for p, count in _topup_per_prompt.items() if count > 0})
             )
 
             _tree_metrics.update({

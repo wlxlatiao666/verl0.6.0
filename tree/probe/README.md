@@ -5,10 +5,13 @@
 以 `tree/scripts/train_qwen2.5_math7b-treepr.sh` 及其默认配置为基准。
 不修改原有 GRPO/tree decoding，不运行 WAAD；当前产物还没有接入在线分叉。
 
-默认候选策略显式选择 **topk**，对应本次讨论的 deterministic-k。
-注意：当前原训练代码的 `branch_sampling` 默认是 **sample**。
-若要对齐该默认行为，准备数据时设置 `BRANCH_SAMPLING=sample`，并使用新的 WORK_DIR。
-sample 使用 Gumbel top-k 不放回抽样，不能视为 k 个独立的原策略样本。
+默认候选策略为 **sample**，与本地 vLLM 的 `branch_sampling=sample` 一致：从
+`softmax(logprobs / branch_temperature)` 使用 Gumbel-top-k 不放回抽取 k 个不同 token，
+默认 `BRANCH_TEMPERATURE=1.0`，包括相同的有限值过滤及 uniform clamp。
+离线标注使用每个位置独立的固定随机种子；采样策略一致不代表与在线运行得到逐 token 相同的候选。
+不能把这 k 个候选视为有放回的独立样本。
+此前 topk 实验保留为对照；切换策略必须使用新的 WORK_DIR 和新候选的续写标签，
+不能将旧标签直接改名复用。复现旧实验时显式设置 `BRANCH_SAMPLING=topk`。
 
 ## 环境与先决条件
 
@@ -21,7 +24,7 @@ cd /实际路径/verl0.6.0
 python3 -c 'import torch, transformers, pyarrow, numpy, vllm; print(torch.__version__, vllm.__file__); assert torch.cuda.is_available()'
 export MODEL_PATH=/inspire/hdd/global_public/public_models/Qwen/Qwen2.5-Math-7B
 export TRAIN_FILE=/inspire/hdd/global_user/weilongxuan-253108120168/verl0.6.0/data/dapo-math-17k.parquet
-export WORK_DIR=/inspire/hdd/global_user/weilongxuan-253108120168/probe_runs/qwen2.5-math7b-topk-pilot
+export WORK_DIR=/inspire/hdd/global_user/weilongxuan-253108120168/probe_runs/qwen2.5-math7b-sample-pilot
 ```
 
 默认 feature extraction 在一个 GPU 上加载 BF16 7B 模型，需容纳模型和最长 4096 token 的激活，
@@ -53,7 +56,7 @@ CUDA_VISIBLE_DEVICES=0 NUM_QUESTIONS=100 \
 每个 GPU 阶段结束并检查所有退出码，再进入下一阶段。
 
 ```bash
-export WORK_DIR=/inspire/hdd/global_user/weilongxuan-253108120168/probe_runs/qwen2.5-math7b-topk-1000
+export WORK_DIR=/inspire/hdd/global_user/weilongxuan-253108120168/probe_runs/qwen2.5-math7b-sample-1000
 NUM_QUESTIONS=1000 bash tree/scripts/train_qwen2.5_math7b-probe.sh prepare
 
 # 在 bash 中执行以下循环。请按实际可用 GPU 数修改。

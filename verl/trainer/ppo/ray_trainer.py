@@ -1336,26 +1336,29 @@ class RayPPOTrainer:
                 # Runs a lightweight forward pass with collect_threshold_stats=True so that
                 # entropy_threshold and tau_importance reflect the current batch/model state.
                 _tree_cfg = self.config.actor_rollout_ref.rollout.get("tree_search", None)
-                if _tree_cfg is not None and _tree_cfg.get("enable", False):
+                if (_tree_cfg is not None and _tree_cfg.get("enable", False)
+                        and _tree_cfg.get("branch_trigger_mode", None) not in {"probe", "probe_entropy", "random"}):
                     _interval = int(_tree_cfg.get("threshold_stats_interval", 1))
-                    _should_collect = (_interval <= 1) or (self.global_steps % _interval == 0)
+                    _should_collect = (not getattr(self, "_tree_threshold_initialized", False)
+                                       or (_interval <= 1) or (self.global_steps % _interval == 0))
                     if _should_collect:
                         with marked_timer("tree_threshold_stats", timing_raw, color="yellow"):
                             stats_output = self.actor_rollout_wg.collect_threshold_stats(gen_batch)
                             # ONE_TO_ALL returns a list (one DataProto per worker); average across workers
                             if isinstance(stats_output, list):
-                                _entropy_vals = [s.meta_info["entropy_p80"] for s in stats_output if "entropy_p80" in s.meta_info]
+                                _entropy_vals = [s.meta_info.get("entropy_threshold_stat", s.meta_info["entropy_p80"]) for s in stats_output if "entropy_p80" in s.meta_info]
                                 _entropy_p80 = float(sum(_entropy_vals) / len(_entropy_vals)) if _entropy_vals else 1.0
                                 _imp_vals = [s.meta_info["importance_p80"] for s in stats_output if s.meta_info.get("importance_p80") is not None]
                                 _importance_p80 = float(sum(_imp_vals) / len(_imp_vals)) if _imp_vals else None
                             else:
-                                _entropy_p80 = stats_output.meta_info.get("entropy_p80", 1.0)
+                                _entropy_p80 = stats_output.meta_info.get("entropy_threshold_stat", stats_output.meta_info.get("entropy_p80", 1.0))
                                 _importance_p80 = stats_output.meta_info.get("importance_p80", None)
+                        self._tree_threshold_initialized = True
                         self.actor_rollout_wg.update_entropy_threshold(_entropy_p80)
                         print("entropy_threshold:", _entropy_p80)
                         print("importance_threshold:", _importance_p80)
                         metrics["tree/entropy_threshold"] = _entropy_p80
-                        if _importance_p80 is not None:
+                        if _importance_p80 is not None and _tree_cfg.get("branch_trigger_mode") != "entropy":
                             self.actor_rollout_wg.update_tau_importance(_importance_p80)
                             metrics["tree/tau_importance"] = _importance_p80
 

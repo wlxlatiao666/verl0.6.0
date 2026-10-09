@@ -11,7 +11,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 MODEL_PATH="${MODEL_PATH:-/inspire/hdd/global_public/public_models/Qwen/Qwen2.5-Math-7B}"
 RAY_DATA_HOME="${RAY_DATA_HOME:-/inspire/hdd/global_user/weilongxuan-253108120168/verl0.6.0}"
 TRAIN_FILE="${TRAIN_FILE:-${RAY_DATA_HOME}/data/dapo-math-17k.parquet}"
-WORK_DIR="${WORK_DIR:-${RAY_DATA_HOME}/probe_runs/qwen2.5-math7b-topk-pilot}"
+WORK_DIR="${WORK_DIR:-${RAY_DATA_HOME}/probe_runs/qwen2.5-math7b-sample-pilot}"
 NUM_SHARDS="${NUM_SHARDS:-1}"
 SHARD_INDEX="${SHARD_INDEX:-0}"
 TP_SIZE="${TP_SIZE:-1}"
@@ -22,7 +22,8 @@ prepare() {
     "$PYTHON_BIN" tree/probe/run.py prepare --work-dir "$WORK_DIR" \
         --model "$MODEL_PATH" --data "$TRAIN_FILE" \
         --num-questions "${NUM_QUESTIONS:-100}" \
-        --branch-sampling "${BRANCH_SAMPLING:-topk}" \
+        --branch-sampling "${BRANCH_SAMPLING:-sample}" \
+        --branch-temperature "${BRANCH_TEMPERATURE:-1.0}" \
         --trajectories "${TRAJECTORIES:-2}" --positions "${POSITIONS:-6}" \
         --repeats "${REPEATS:-4}" --eval-repeats "${EVAL_REPEATS:-8}" "$@"
 }

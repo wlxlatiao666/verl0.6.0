@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+set -euo pipefail
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$REPO_DIR"
+TASK_ROOT="${TASK_ROOT:-/inspire/hdd/global_user/weilongxuan-253108120168}"
+export PYTHONUNBUFFERED=1 VLLM_USE_V1=0 RAY_DEDUP_LOGS=0 NCCL_SHM_DISABLE=1 NCCL_DEBUG=INFO
+export VERL_LOGGING_LEVEL="${VERL_LOGGING_LEVEL:-INFO}"
+export VERL_DEBUG_LOG_PATH="$TASK_ROOT"
+export WANDB_MODE="${WANDB_MODE:-offline}"
+export WANDB_DIR="${WANDB_DIR:-$TASK_ROOT/wandb_offline}"
+verl_dir="${OUTPUT_ROOT:-/inspire/qb-ilm2/project/neosmosis/weilongxuan-253108120168/verl_data}"
+project_name=verl_grpo_tree_0722
+TREE_PROCESS_REWARD="${TREE_PROCESS_REWARD:-True}"
+case "$TREE_PROCESS_REWARD" in
+  True) default_experiment=qwen2.5_math7b_multiroot_entropy_treepr ;;
+  False) default_experiment=qwen2.5_math7b_multiroot_entropy_grpo ;;
+  *) echo 'TREE_PROCESS_REWARD must be True or False' >&2; exit 2 ;;
+esac
+experiment_name="${EXPERIMENT_NAME:-$default_experiment}"
+RAY_DATA_HOME="${RAY_DATA_HOME:-$TASK_ROOT/verl0.6.0}"
+TRAIN_FILE="${TRAIN_FILE:-$RAY_DATA_HOME/data/dapo-math-17k.parquet}"
+TEST_FILE="${TEST_FILE:-$RAY_DATA_HOME/data/aime-2024.parquet}"
+LOG_DIR="${LOG_DIR:-$TASK_ROOT/verl_logs}"
+mkdir -p "$LOG_DIR" "$WANDB_DIR"
+LOG_FILE="$LOG_DIR/${experiment_name}_$(date +%Y%m%d_%H%M%S).log"
+dry_args=()
+if [[ "${DRY_RUN:-0}" == 1 ]]; then dry_args=(--cfg job --resolve); fi
+# Authentication comes from the environment or wandb login; no embedded key.
+python3 -m verl.trainer.main_ppo "${dry_args[@]}" \
+    algorithm.adv_estimator=grpo \
+    data.train_files="$TRAIN_FILE" \
+    data.val_files="$TEST_FILE" \
+    data.train_batch_size=96 \
+    data.max_prompt_length=2048 \
+    data.max_response_length=2048 \
+    data.filter_overlong_prompts=False \
+    data.truncation='error' \
+    actor_rollout_ref.actor.clip_ratio_low=0.2 \
+    actor_rollout_ref.actor.clip_ratio_high=0.28 \
+    actor_rollout_ref.model.path=/inspire/hdd/global_public/public_models/Qwen/Qwen2.5-Math-7B \
+    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.model.use_remove_padding=True \
+    actor_rollout_ref.actor.ppo_mini_batch_size=16 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
+    actor_rollout_ref.actor.use_kl_loss=False \
+    actor_rollout_ref.actor.kl_loss_coef=0 \
+    actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    actor_rollout_ref.actor.entropy_coeff=0 \
+    actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    actor_rollout_ref.actor.fsdp_config.param_offload=False \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+    actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
+    actor_rollout_ref.rollout.n=1 \
+    actor_rollout_ref.rollout.enforce_eager=True \
+    actor_rollout_ref.rollout.tree_search.enable=True \
+    actor_rollout_ref.rollout.tree_search.num_roots=8 \
+    actor_rollout_ref.rollout.tree_search.branch_trigger_mode=entropy \
+    actor_rollout_ref.rollout.tree_search.branch_sampling=sample_with_replacement \
+    actor_rollout_ref.rollout.tree_search.min_seg_length=64 \
+    actor_rollout_ref.rollout.tree_search.threshold_stats_quantile=0.8 \
+    ++actor_rollout_ref.rollout.tree_search.threshold_stats_interval=10 \
+    actor_rollout_ref.rollout.tree_search.entropy_threshold=0.8 \
+    actor_rollout_ref.rollout.tree_search.branching_factor=2 \
+    actor_rollout_ref.rollout.tree_search.max_tree_depth=3 \
+    actor_rollout_ref.rollout.tree_search.topup_leaves_to_target=True \
+    actor_rollout_ref.rollout.tree_search.tau_importance=null \
+    actor_rollout_ref.rollout.tree_search.tree_process_reward=${TREE_PROCESS_REWARD} \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    reward_model.reward_manager=dapo \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.enable=False \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.len=512 \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=1.0 \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
+    +reward_model.reward_kwargs.max_resp_len=4096 \
+    algorithm.use_kl_in_reward=False \
+    trainer.critic_warmup=0 \
+    trainer.logger='["console","wandb","tensorboard"]' \
+    trainer.project_name=${project_name} \
+    trainer.experiment_name=${experiment_name} \
+    trainer.n_gpus_per_node=8 \
+    trainer.nnodes=1 \
+    +ray_kwargs.ray_init.log_to_driver=True \
+    trainer.save_freq=20 \
+    trainer.test_freq=2 \
+    trainer.total_epochs=1 \
+    trainer.default_local_dir="${verl_dir}/checkpoints/${project_name}/${experiment_name}" \
+    trainer.rollout_data_dir="${verl_dir}/rollout_data/${project_name}/${experiment_name}" \
+    trainer.validation_data_dir="${verl_dir}/validation_data/${project_name}/${experiment_name}" \
+    actor_rollout_ref.rollout.val_kwargs.n=1 \
+    actor_rollout_ref.rollout.val_kwargs.do_sample=False\
+    "$@" 2>&1 | tee -a "${LOG_FILE}"
