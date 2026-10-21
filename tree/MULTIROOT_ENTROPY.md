@@ -1,5 +1,10 @@
 # Multi-root shallow entropy rollout
 
+Current training entry points: `tree/scripts/math_grpo/`. The launch commands
+below are historical; their scripts are archived and disabled under
+`tree/scripts/legacy/`. See `tree/scripts/math_grpo/README.md` for pure GRPO
+experiments on MATH.
+
 Implementation: 2026-10-09.
 
 Each original question starts 8 independent vLLM requests, each with at most
