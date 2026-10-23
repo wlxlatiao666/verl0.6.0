@@ -14,11 +14,11 @@ case "$MODE" in
 esac
 
 TASK_ROOT="${TASK_ROOT:-/inspire/hdd/global_user/weilongxuan-253108120168}"
-DATA_DIR="${DATA_DIR:-$TASK_ROOT/verl0.6.0/data/math}"
-MODEL_PATH="${MODEL_PATH:-/inspire/hdd/global_public/public_models/Qwen/Qwen2.5-Math-7B}"
+DATA_DIR="${DATA_DIR:-$TASK_ROOT/verl0.6.0/data/gsm8k}"
+MODEL_PATH="${MODEL_PATH:-/inspire/hdd/global_public/public_models/Qwen/Qwen2.5-0.5B-Instruct}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-$TASK_ROOT/verl_data}"
-PROJECT_NAME="${PROJECT_NAME:-math_pure_grpo}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen2.5_math7b_${MODE}}"
+PROJECT_NAME="${PROJECT_NAME:-verl_multiroot_qwen0.5b_instruct}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-gsm8k_${MODE}}"
 RUN_DIR="$OUTPUT_ROOT/$PROJECT_NAME/$EXPERIMENT_NAME"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
@@ -68,16 +68,16 @@ command=(
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2
     actor_rollout_ref.rollout.enforce_eager=True
-    actor_rollout_ref.rollout.temperature=1.0
-    actor_rollout_ref.rollout.top_p=1.0
-    actor_rollout_ref.rollout.top_k=-1
+    actor_rollout_ref.rollout.temperature=0.7
+    actor_rollout_ref.rollout.top_p=0.8
+    actor_rollout_ref.rollout.top_k=20
     actor_rollout_ref.rollout.do_sample=True
     "actor_rollout_ref.rollout.n=$ROLLOUT_N"
     "actor_rollout_ref.rollout.tree_search.enable=$TREE_ENABLED"
     "actor_rollout_ref.rollout.tree_search.tree_process_reward=$TREE_PROCESS_REWARD"
-    actor_rollout_ref.rollout.tree_search.num_roots=8
+    actor_rollout_ref.rollout.tree_search.num_roots=4
     actor_rollout_ref.rollout.tree_search.branching_factor=2
-    actor_rollout_ref.rollout.tree_search.max_tree_depth=3
+    actor_rollout_ref.rollout.tree_search.max_tree_depth=4
     actor_rollout_ref.rollout.tree_search.branch_trigger_mode=entropy
     actor_rollout_ref.rollout.tree_search.branch_sampling=sample_with_replacement
     actor_rollout_ref.rollout.tree_search.branch_temperature=1.0
@@ -94,11 +94,11 @@ command=(
     'trainer.logger=["console","wandb","tensorboard"]'
     "trainer.project_name=$PROJECT_NAME"
     "trainer.experiment_name=$EXPERIMENT_NAME"
-    trainer.n_gpus_per_node=8
+    trainer.n_gpus_per_node=4
     trainer.nnodes=1
     trainer.save_freq=20
     trainer.test_freq=2
-    trainer.total_epochs=1
+    trainer.total_epochs=10
     "trainer.default_local_dir=$RUN_DIR/checkpoints"
     "trainer.rollout_data_dir=$RUN_DIR/rollouts"
     "trainer.validation_data_dir=$RUN_DIR/validation"
@@ -110,7 +110,7 @@ fi
 
 for data_file in "$DATA_DIR/train.parquet" "$DATA_DIR/test.parquet"; do
     if [[ ! -f "$data_file" ]]; then
-        echo "Missing MATH dataset: $data_file" >&2
+        echo "Missing GSM8K dataset: $data_file" >&2
         exit 2
     fi
 done
