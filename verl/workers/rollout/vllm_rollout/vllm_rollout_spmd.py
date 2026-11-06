@@ -35,6 +35,7 @@ import os
 import pickle
 import socket
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import asdict
 from types import MethodType
@@ -231,7 +232,8 @@ class vLLMRollout(BaseRollout):
             if hasattr(SamplingParams(), str(k)) and k != "seed":
                 kwargs[k] = config.get(k)
         kwargs["n"] = 1  # already repeat in ray_trainer
-        print(f"kwargs: {kwargs}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"kwargs: {kwargs}")
         self.sampling_params = SamplingParams(**kwargs)
 
         # Tree search params — read from rollout config's tree_search sub-config
@@ -507,6 +509,9 @@ class vLLMRollout(BaseRollout):
             _global_seq_map: dict[int, object] = {}
             token_share_weights: list[list[float]] = []
             _has_tree_by_prompt: list[bool] = []
+            tree_leaf_logprobs: list[float] = []
+            tree_root_ids: list[str] = []
+            tree_batch_id = uuid.uuid4().hex
 
             for out_idx, output in enumerate(outputs):
                 seq_map = {out.seq_id: out for out in output.outputs}
@@ -523,7 +528,8 @@ class vLLMRollout(BaseRollout):
                             path_nodes: list[tuple[int, list[int]]] = []
                             current = sample
                             while current is not None:
-                                print(f"segment length: {len(current.tree_ids)}, segment depth: {current.tree_depth}")
+                                if logger.isEnabledFor(logging.DEBUG):
+                                    logger.debug(f"segment length: {len(current.tree_ids)}, segment depth: {current.tree_depth}")
                                 path_nodes.append((current.seq_id, current.tree_ids))
                                 if current.parent_seq_id is not None and current.parent_seq_id in seq_map:
                                     current = seq_map[current.parent_seq_id]
@@ -590,6 +596,10 @@ class vLLMRollout(BaseRollout):
                 for path_nodes, response_ids, out_idx in _leaf_records:
                     response.append(response_ids)
                     prompt_indices.append(out_idx)
+                    if _tree_process_reward:
+                        leaf_sample = _global_seq_map[path_nodes[-1][0]]
+                        tree_leaf_logprobs.append(float(leaf_sample.branch_path_logprob))
+                        tree_root_ids.append(f"{tree_batch_id}:{out_idx}:{path_nodes[0][0]}")
                     _leaves_per_prompt[out_idx] += 1
 
                     if self.config.calculate_log_probs:
@@ -633,12 +643,11 @@ class vLLMRollout(BaseRollout):
                         w = token_share_weights[_i]
                         counts = [_node_descendant_count.get(s, 0) for s, _ in _p]
                         segs = [(s, len(t), c) for (s, t), c in zip(_p, counts)]
-                        print(
-                            f"[DEBUG][token_share_weights] leaf {_i}: "
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"[DEBUG][token_share_weights] leaf {_i}: "
                             f"resp_len={len(r)} n_segments={len(_p)} "
                             f"segments(seg_id, seg_len, desc_count)={segs} "
-                            f"w_min={min(w):.4f} w_max={max(w):.4f} w_sum={sum(w):.4f}"
-                        )
+                            f"w_min={min(w):.4f} w_max={max(w):.4f} w_sum={sum(w):.4f}")
 
             # ── Step 2 (NEW): TOP-UP leaves with conventional sampling ──────
             # Target = bf ** max_depth. For every prompt whose tree produced
@@ -743,6 +752,9 @@ class vLLMRollout(BaseRollout):
                                 # ancestors, so its process-reward weight is 1.
                                 if _tree_process_reward:
                                     token_share_weights.append([1.0] * len(resp_ids))
+                                    # Each conventional top-up is a separate single-leaf tree.
+                                    tree_leaf_logprobs.append(0.0)
+                                    tree_root_ids.append(f"{tree_batch_id}:topup:{len(response)}")
 
                                 # 4) tree_process_reward single synthetic segment
                                 if _tree_process_reward:
@@ -768,14 +780,13 @@ class vLLMRollout(BaseRollout):
                 _tgt = _bf ** _md
                 _topup_enable = bool(_tree_cfg.get("topup_leaves_to_target", True))
                 _hits = sum(1 for n in _leaves_per_prompt if n >= _tgt) if _leaves_per_prompt else 0
-                print(
-                    f"[TreeRollout][TopUp-Summary] target_leaves/prompt={_tgt} (bf={_bf}, depth={_md}). "
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[TreeRollout][TopUp-Summary] target_leaves/prompt={_tgt} (bf={_bf}, depth={_md}). "
                     f"Prompts at target: {_hits}/{len(_leaves_per_prompt) if _leaves_per_prompt else 0}. "
                     f"Top-up samples total: {_topup_total}. "
                     f"Per-prompt leaves: min={min(_leaves_per_prompt) if _leaves_per_prompt else 0}, "
                     f"max={max(_leaves_per_prompt) if _leaves_per_prompt else 0}, "
-                    f"mean={(sum(_leaves_per_prompt)/len(_leaves_per_prompt)) if _leaves_per_prompt else 0:.2f}."
-                )
+                    f"mean={(sum(_leaves_per_prompt)/len(_leaves_per_prompt)) if _leaves_per_prompt else 0:.2f}.")
                 if _topup_enable:
                     incomplete_prompts = [
                         prompt_idx
@@ -817,9 +828,11 @@ class vLLMRollout(BaseRollout):
 
             # Always write tree routing metadata when tree search is active so that
             # DataProto.concat across workers sees consistent keys and lengths.
-            print("prompt_indices:", prompt_indices)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug('%s %s', "prompt_indices:", prompt_indices)
             if prompt_indices:
-                print("prompt_indices True")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug("prompt_indices True")
                 non_tensor_batch["tree_prompt_indices"] = np.array(prompt_indices)
                 non_tensor_batch["tree_num_leaves"] = np.array([len(response)] * len(response))
                 non_tensor_batch["tree_num_prompts"] = np.array([_original_batch_size] * len(response))
@@ -829,6 +842,10 @@ class vLLMRollout(BaseRollout):
             # leaf_segment_indices: for each leaf, ordered indices into unique_segments for its root→leaf path
             #                       shape (n_leaves,) of variable-len index arrays
             if _tree_process_reward:
+                if len(tree_leaf_logprobs) != len(response):
+                    raise RuntimeError("Tree branch probabilities must align with leaf responses")
+                non_tensor_batch["tree_leaf_logprobs"] = np.asarray(tree_leaf_logprobs, dtype=np.float64)
+                non_tensor_batch["tree_root_ids"] = np.asarray(tree_root_ids, dtype=object)
                 # Always write these keys (even if empty) so all workers have the same keys
                 # NOTE: unique_segments is stored in non_tensor_batch
                 # rather than meta_info['metrics'] so they are properly partitioned per-worker
@@ -853,9 +870,12 @@ class vLLMRollout(BaseRollout):
             _leaf_resp_lens = []
 
             # Debug: Print per-prompt tree statistics
-            print(f"[TreeRollout] Number of prompts (outputs): {len(outputs)}")
-            print(f"[TreeRollout] Total unique_segments collected so far: {len(unique_segments)}")
-            print(f"[TreeRollout] Total leaf_segment_indices collected so far: {len(leaf_segment_indices)}")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[TreeRollout] Number of prompts (outputs): {len(outputs)}")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[TreeRollout] Total unique_segments collected so far: {len(unique_segments)}")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[TreeRollout] Total leaf_segment_indices collected so far: {len(leaf_segment_indices)}")
 
             for _out_idx, _out in enumerate(outputs):
                 _seqs = _out.outputs
@@ -880,7 +900,8 @@ class vLLMRollout(BaseRollout):
                 # Debug per-prompt tree info
                 prompt_new_segments = len(unique_segments) - prompt_segments_before
                 _tu = _topup_per_prompt.get(_out_idx, 0) if '_topup_per_prompt' in locals() else 0
-                print(f"[TreeRollout] Prompt {_out_idx}: {prompt_total_nodes} total nodes, "
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[TreeRollout] Prompt {_out_idx}: {prompt_total_nodes} total nodes, "
                       f"{prompt_leaf_count} tree-leaves + {_tu} topup = {prompt_leaf_count+_tu} total, "
                       f"max_depth={prompt_max_depth}, "
                       f"{prompt_new_segments} new segments (segments/leaf ratio: {prompt_total_nodes / max(prompt_leaf_count, 1):.2f})")
@@ -969,14 +990,13 @@ class vLLMRollout(BaseRollout):
                     token_share_weights, 0.0, max_length=self.config.response_length
                 ).to(idx.device)
                 token_share_weights_t = token_share_weights_t.to(torch.float32)
-                print(
-                    f"[DEBUG][token_share_weights] Emitted tensor: "
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[DEBUG][token_share_weights] Emitted tensor: "
                     f"shape={tuple(token_share_weights_t.shape)} "
                     f"nonzero_rows={int((token_share_weights_t.sum(dim=-1) > 0).sum().item())} "
                     f"w_sum_total={float(token_share_weights_t.sum().item()):.2f} "
                     f"w_min={float(token_share_weights_t.min().item()):.4f} "
-                    f"w_max={float(token_share_weights_t.max().item()):.4f}"
-                )
+                    f"w_max={float(token_share_weights_t.max().item()):.4f}")
             else:
                 token_share_weights_t = None
 

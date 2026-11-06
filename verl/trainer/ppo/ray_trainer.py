@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import logging
 import gc
 import os
 import uuid
@@ -62,6 +63,10 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.utils.tree_training import get_ppo_rollout_batch_multiplier, is_tree_process_reward_enabled
+
+
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 @dataclass
@@ -278,9 +283,12 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
     Step 3 — Assemble token-level advantages per leaf sequence:
         Each leaf's response tokens are filled with the advantage of the segment
         they belong to, then multiplied by response_mask to zero out padding.
-        Segments shared across multiple leaves use the same pre-computed advantage.
+        Segments shared across multiple leaves start with the same advantage.
+        Finally each leaf is weighted by its normalized product of branch-token
+        sampling probabilities within its actual tree (not its prompt group).
     """
-    print(f"[DEBUG] [compute_tree_process_advantage] Start")
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"[DEBUG] [compute_tree_process_advantage] Start")
 
     if "response_mask" not in data.batch.keys():
         data.batch["response_mask"] = compute_response_mask(data)
@@ -288,11 +296,13 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
     response_mask = data.batch["response_mask"]          # (n_leaves, resp_len)
     n_leaves, resp_len = response_mask.shape
     device = response_mask.device
-    print(f"[DEBUG] [compute_tree_process_advantage] n_leaves={n_leaves}, resp_len={resp_len}")
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"[DEBUG] [compute_tree_process_advantage] n_leaves={n_leaves}, resp_len={resp_len}")
 
     # ── Step 1: back-propagate leaf scores to all nodes ──────────────────────
     leaf_scores = data.batch["token_level_rewards"].sum(dim=-1).float()  # (n_leaves,)
-    print(f"[DEBUG] [compute_tree_process_advantage] leaf_scores range: [{leaf_scores.min():.4f}, {leaf_scores.max():.4f}], mean={leaf_scores.mean():.4f}")
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"[DEBUG] [compute_tree_process_advantage] leaf_scores range: [{leaf_scores.min():.4f}, {leaf_scores.max():.4f}], mean={leaf_scores.mean():.4f}")
 
     # Try to get unique_segments from non_tensor_batch first (new location),
     # then fall back to meta_info['metrics'] (old location for compatibility)
@@ -303,11 +313,13 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
     worker_segments_offsets = data.non_tensor_batch.get("worker_segments_offsets")
 
     if worker_segments_offsets is not None:
-        print(f"[DEBUG] [compute_tree_process_advantage] worker_segments_offsets={worker_segments_offsets}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"[DEBUG] [compute_tree_process_advantage] worker_segments_offsets={worker_segments_offsets}")
 
     n_unique = len(unique_segments)
     n_leaves = len(leaf_segment_indices)
-    print(f"[DEBUG] [compute_tree_process_advantage] n_unique segments: {n_unique}, n_leaves: {n_leaves}")
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"[DEBUG] [compute_tree_process_advantage] n_unique segments: {n_unique}, n_leaves: {n_leaves}")
 
     # Get prompt indices for grouping (like GRPO)
     index = data.non_tensor_batch.get("uid")  # Use uid to group by prompt
@@ -322,11 +334,13 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
 
     # Debug: Show grouping info
     unique_prompt_ids = np.unique(index)
-    print(f"[DEBUG] [compute_tree_process_advantage] unique_prompt_ids={len(unique_prompt_ids)}, index_range=[{index.min()}, {index.max()}]")
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"[DEBUG] [compute_tree_process_advantage] unique_prompt_ids={len(unique_prompt_ids)}, index_range=[{index.min()}, {index.max()}]")
 
     # Debug: Print tree structure stats
     path_lengths = [len(path) for path in leaf_segment_indices]
-    print(f"[DEBUG] [compute_tree_process_advantage] Path length stats: min={min(path_lengths)}, max={max(path_lengths)}, "
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"[DEBUG] [compute_tree_process_advantage] Path length stats: min={min(path_lengths)}, max={max(path_lengths)}, "
           f"mean={np.mean(path_lengths):.2f}, median={np.median(path_lengths):.2f}")
 
     # Count segments at each depth
@@ -335,7 +349,8 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
     for path in leaf_segment_indices:
         for depth, _ in enumerate(path):
             depth_counts[depth] += 1
-    print(f"[DEBUG] [compute_tree_process_advantage] Segment depth counts: {dict(depth_counts)}")
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"[DEBUG] [compute_tree_process_advantage] Segment depth counts: {dict(depth_counts)}")
 
     # Check for root nodes (segments with no parent)
     all_segments = set()
@@ -346,8 +361,10 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
             if i > 0:
                 child_segments.add(seg_idx)
     root_segments = all_segments - child_segments
-    print(f"[DEBUG] [compute_tree_process_advantage] Number of root segments: {len(root_segments)}")
-    print(f"[DEBUG] [compute_tree_process_advantage] n_unique={n_unique}, all_segments={len(all_segments)}")
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"[DEBUG] [compute_tree_process_advantage] Number of root segments: {len(root_segments)}")
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"[DEBUG] [compute_tree_process_advantage] n_unique={n_unique}, all_segments={len(all_segments)}")
 
     # Map leaf segment -> leaf row index; build parent map in one pass
     leaf_seg_to_leaf_idx: dict[int, int] = {}
@@ -363,7 +380,8 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
             seg_to_prompt_id[seg_idx] = prompt_id  # Track which prompt this segment belongs to
             if depth > 0:
                 parent_of[seg_idx] = path[depth - 1]
-    print(f"[DEBUG] [compute_tree_process_advantage] leaf_seg_to_leaf_idx has {len(leaf_seg_to_leaf_idx)} entries, seg_to_prompt_id has {len(seg_to_prompt_id)} entries")
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"[DEBUG] [compute_tree_process_advantage] leaf_seg_to_leaf_idx has {len(leaf_seg_to_leaf_idx)} entries, seg_to_prompt_id has {len(seg_to_prompt_id)} entries")
 
     # Assign leaf scores first
     node_scores = torch.zeros(n_unique, dtype=torch.float32, device=device)
@@ -380,7 +398,8 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
 
     # Get list of internal nodes (non-leaf nodes)
     internal_nodes = [i for i in range(n_unique) if i in children_of]
-    print(f"[DEBUG] [compute_tree_process_advantage] internal_nodes={len(internal_nodes)}, leaf_nodes={len(leaf_seg_to_leaf_idx)}")
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"[DEBUG] [compute_tree_process_advantage] internal_nodes={len(internal_nodes)}, leaf_nodes={len(leaf_seg_to_leaf_idx)}")
 
     # Sort internal nodes by depth descending (compute deeper nodes first)
     internal_nodes_sorted = sorted(internal_nodes, key=lambda i: -seg_depth[i])
@@ -391,7 +410,8 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
         children_t = torch.tensor(children, dtype=torch.long, device=device)
         child_scores = node_scores[children_t]
         node_scores[i] = child_scores.mean()
-    print(f"[DEBUG] [compute_tree_process_advantage] node_scores range: [{node_scores.min():.4f}, {node_scores.max():.4f}]")
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"[DEBUG] [compute_tree_process_advantage] node_scores range: [{node_scores.min():.4f}, {node_scores.max():.4f}]")
 
     # ── Step 2: combine local and global advantages ──────────────────────────
     # Local advantage: adv_local(s) = (score(s) - score(parent(s))) / (std(siblings) + eps)
@@ -438,7 +458,8 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
 
     # Combine local and global advantages
     seg_advantages = local_adv_weight * seg_local_advantages + global_adv_weight * seg_global_advantages
-    print(f"[DEBUG] [compute_tree_process_advantage] seg_advantages range: [{seg_advantages.min():.4f}, {seg_advantages.max():.4f}], mean={seg_advantages.mean():.4f}")
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"[DEBUG] [compute_tree_process_advantage] seg_advantages range: [{seg_advantages.min():.4f}, {seg_advantages.max():.4f}], mean={seg_advantages.mean():.4f}")
 
     # ── Diagnostics: does the tree add signal beyond GRPO? ────────────────────
     # The central question behind "tree never beats GRPO": does the LOCAL
@@ -506,7 +527,8 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
             "tree_adv/n_leaves": float(n_leaves),
         }
         data.meta_info["tree_adv_metrics"] = tree_adv_metrics
-        print(f"[DEBUG] [compute_tree_process_advantage] tree_adv_metrics={tree_adv_metrics}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"[DEBUG] [compute_tree_process_advantage] tree_adv_metrics={tree_adv_metrics}")
     except Exception as e:  # diagnostics must never break training
         print(f"[WARN] [compute_tree_process_advantage] diagnostics failed: {e}")
 
@@ -521,7 +543,8 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
 
     total_response_tokens = int(response_mask.sum().item())
     mean_seg_len = total_response_tokens / max(n_unique, 1)
-    print(f"[DEBUG] [compute_tree_process_advantage] total_response_tokens={total_response_tokens}, mean_seg_len={mean_seg_len:.2f}")
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"[DEBUG] [compute_tree_process_advantage] total_response_tokens={total_response_tokens}, mean_seg_len={mean_seg_len:.2f}")
 
     token_advantages = torch.zeros(n_leaves, resp_len, dtype=torch.float32, device=device)
     for j, path in enumerate(leaf_segment_indices):
@@ -538,8 +561,27 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
             if pos >= resp_len:
                 break
 
+    # Weight the existing advantages only; reward propagation and local/global
+    # baselines remain unchanged. Root IDs distinguish trees sharing a prompt.
+    leaf_logprobs = torch.as_tensor(
+        data.non_tensor_batch["tree_leaf_logprobs"], dtype=torch.float64, device=device)
+    root_ids = data.non_tensor_batch["tree_root_ids"]
+    if leaf_logprobs.shape != (n_leaves,) or len(root_ids) != n_leaves:
+        raise ValueError("Tree probability metadata must contain one entry per leaf")
+    if not torch.isfinite(leaf_logprobs).all():
+        raise ValueError("Tree path log probabilities must be finite")
+    leaf_weights = torch.zeros(n_leaves, dtype=torch.float32, device=device)
+    root_to_rows = defaultdict(list)
+    for row, root_id in enumerate(root_ids):
+        root_to_rows[root_id].append(row)
+    for rows in root_to_rows.values():
+        rows_t = torch.tensor(rows, dtype=torch.long, device=device)
+        leaf_weights[rows_t] = torch.softmax(leaf_logprobs[rows_t], dim=0).float()
+    data.batch["tree_leaf_weights"] = leaf_weights
+    token_advantages = token_advantages * leaf_weights.unsqueeze(-1)
     token_advantages = token_advantages * response_mask
-    print(f"[DEBUG] [compute_tree_process_advantage] token_advantages range: [{token_advantages.min():.4f}, {token_advantages.max():.4f}]")
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"[DEBUG] [compute_tree_process_advantage] token_advantages range: [{token_advantages.min():.4f}, {token_advantages.max():.4f}]")
 
     # ── Memory cleanup: free large tree data after token_advantages is assembled ──
     # unique_segments and leaf_segment_indices are no longer needed once token_advantages is built
@@ -549,7 +591,8 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
 
     data.batch["advantages"] = token_advantages
     data.batch["returns"] = token_advantages  # returns not used downstream in this path
-    print(f"[DEBUG] [compute_tree_process_advantage] Done")
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"[DEBUG] [compute_tree_process_advantage] Done")
     return data
 
 
@@ -1266,7 +1309,7 @@ class RayPPOTrainer:
 
         from verl.utils.tracking import Tracking
 
-        logger = Tracking(
+        metrics_logger = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
             default_backend=self.config.trainer.logger,
@@ -1284,7 +1327,7 @@ class RayPPOTrainer:
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
-            logger.log(data=val_metrics, step=self.global_steps)
+            metrics_logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
                 return
 
@@ -1616,7 +1659,8 @@ class RayPPOTrainer:
                     tree_segment_large_keys = ["unique_segments", "leaf_segment_indices"]
                     has_tree_data = any(key in batch.non_tensor_batch for key in tree_segment_large_keys)
                     if has_tree_data:
-                        print(f"[MemoryOpt] Temporarily removing large tree data from batch for compute_log_prob/ref/values")
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"[MemoryOpt] Temporarily removing large tree data from batch for compute_log_prob/ref/values")
                         for key in tree_segment_large_keys:
                             if key in batch.non_tensor_batch:
                                 tree_data_cache[key] = batch.non_tensor_batch.pop(key)
@@ -1634,10 +1678,12 @@ class RayPPOTrainer:
 
                     # recompute old_log_probs
                     import time
-                    print(f"[DEBUG] Starting compute_log_prob at {time.time()}")
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"[DEBUG] Starting compute_log_prob at {time.time()}")
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        print(f"[DEBUG] Finished compute_log_prob at {time.time()}")
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"[DEBUG] Finished compute_log_prob at {time.time()}")
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
@@ -1699,7 +1745,8 @@ class RayPPOTrainer:
                         # This bypasses the normal advantage estimator for tree nodes.
                         # Restore tree data if we have it cached
                         if tree_data_cache:
-                            print(f"[MemoryOpt] Restoring tree data to batch for compute_tree_process_advantage")
+                            if logger.isEnabledFor(logging.DEBUG):
+                                logger.debug(f"[MemoryOpt] Restoring tree data to batch for compute_tree_process_advantage")
                             for key, value in tree_data_cache.items():
                                 batch.non_tensor_batch[key] = value
 
@@ -1721,7 +1768,8 @@ class RayPPOTrainer:
 
                             loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
                             if loss_mode != "tree_segment":
-                                print(f"[MemoryOpt] Removing tree data after compute_tree_process_advantage (loss_mode={loss_mode})")
+                                if logger.isEnabledFor(logging.DEBUG):
+                                    logger.debug(f"[MemoryOpt] Removing tree data after compute_tree_process_advantage (loss_mode={loss_mode})")
                                 for key in tree_segment_large_keys:
                                     if key in batch.non_tensor_batch:
                                         batch.non_tensor_batch.pop(key)
@@ -1836,7 +1884,7 @@ class RayPPOTrainer:
                     self.train_dataloader.sampler.update(batch=batch)
 
                 # TODO: make a canonical logger that supports various backend
-                logger.log(data=metrics, step=self.global_steps)
+                metrics_logger.log(data=metrics, step=self.global_steps)
 
                 progress_bar.update(1)
                 self.global_steps += 1

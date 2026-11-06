@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-echo "Deprecated script. Use tree/scripts/math_grpo/{grpo,treerollout,treepr}.sh; see its README." >&2
-exit 2
+# echo "Deprecated script. Use tree/scripts/math_grpo/{grpo,treerollout,treepr}.sh; see its README." >&2
+# exit 2
 set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_DIR"
@@ -14,7 +14,7 @@ verl_dir="${OUTPUT_ROOT:-/inspire/hdd/global_user/weilongxuan-253108120168/verl_
 project_name=verl_grpo_tree_0722
 TREE_PROCESS_REWARD="${TREE_PROCESS_REWARD:-True}"
 case "$TREE_PROCESS_REWARD" in
-  True) default_experiment=qwen2.5_math7b_multiroot_entropy_treepr ;;
+  True) default_experiment=qwen2.5_math7b_multiroot_entropy_treepr_1102 ;;
   False) default_experiment=qwen2.5_math7b_multiroot_entropy_grpo ;;
   *) echo 'TREE_PROCESS_REWARD must be True or False' >&2; exit 2 ;;
 esac

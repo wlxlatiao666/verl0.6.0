@@ -279,14 +279,16 @@ class DataParallelPPOActor(BasePPOActor):
 
             multi_modal_inputs = extract_multi_modal_inputs(micro_batch["multi_modal_inputs"])
 
-        print(f"[DEBUG] Rank {rank}: _forward_micro_batch starting at {time.time()}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"[DEBUG] Rank {rank}: _forward_micro_batch starting at {time.time()}")
 
         with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
             input_ids = micro_batch["input_ids"]
             batch_size, seqlen = input_ids.shape
             attention_mask = micro_batch["attention_mask"]
             position_ids = micro_batch["position_ids"]
-            print(f"[DEBUG] Rank {rank}: batch_size={batch_size}, seqlen={seqlen}")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[DEBUG] Rank {rank}: batch_size={batch_size}, seqlen={seqlen}")
             entropy = None
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
@@ -351,7 +353,8 @@ class DataParallelPPOActor(BasePPOActor):
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
 
-                print(f"[DEBUG] Rank {rank}: starting actor_module forward pass at {time.time()}")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[DEBUG] Rank {rank}: starting actor_module forward pass at {time.time()}")
                 output = self.actor_module(
                     input_ids=input_ids_rmpad,
                     attention_mask=None,
@@ -360,7 +363,8 @@ class DataParallelPPOActor(BasePPOActor):
                     use_cache=False,
                     **extra_args,
                 )  # prevent model thinks we are generating
-                print(f"[DEBUG] Rank {rank}: finished actor_module forward pass at {time.time()}")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[DEBUG] Rank {rank}: finished actor_module forward pass at {time.time()}")
 
                 if self.use_fused_kernels:
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
@@ -426,7 +430,8 @@ class DataParallelPPOActor(BasePPOActor):
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
 
             else:  # not using rmpad and no ulysses sp
-                print(f"[DEBUG] Rank {rank}: use_remove_padding=False, starting forward pass at {time.time()}")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[DEBUG] Rank {rank}: use_remove_padding=False, starting forward pass at {time.time()}")
                 extra_args = {}
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
@@ -440,7 +445,8 @@ class DataParallelPPOActor(BasePPOActor):
                     use_cache=False,
                     **extra_args,
                 )  # prevent model thinks we are generating
-                print(f"[DEBUG] Rank {rank}: use_remove_padding=False, forward pass done at {time.time()}")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[DEBUG] Rank {rank}: use_remove_padding=False, forward pass done at {time.time()}")
 
                 if self.use_fused_kernels:
                     log_probs = output.log_probs[:, -response_length - 1 : -1]
@@ -458,7 +464,8 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
 
-            print(f"[DEBUG] Rank {rank}: _forward_micro_batch returning at {time.time()}")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[DEBUG] Rank {rank}: _forward_micro_batch returning at {time.time()}")
             return entropy, log_probs
 
     def _optimizer_step(self):
@@ -506,7 +513,8 @@ class DataParallelPPOActor(BasePPOActor):
         rank = dist.get_rank() if dist.is_initialized() else 0
         world_size = dist.get_world_size() if dist.is_initialized() else 1
 
-        print(f"[DEBUG] Rank {rank}/{world_size}: compute_log_prob started at {time.time()}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"[DEBUG] Rank {rank}/{world_size}: compute_log_prob started at {time.time()}")
 
         # set to eval
         self.actor_module.eval()
@@ -518,20 +526,25 @@ class DataParallelPPOActor(BasePPOActor):
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
-        print(f"[DEBUG] Rank {rank}: before data.select(), len(data)={len(data)}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"[DEBUG] Rank {rank}: before data.select(), len(data)={len(data)}")
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
-        print(f"[DEBUG] Rank {rank}: after data.select()")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"[DEBUG] Rank {rank}: after data.select()")
 
         if use_dynamic_bsz:
             max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
-            print(f"[DEBUG] Rank {rank}: use_dynamic_bsz=True, max_token_len={max_token_len}")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[DEBUG] Rank {rank}: use_dynamic_bsz=True, max_token_len={max_token_len}")
             micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
         else:
-            print(f"[DEBUG] Rank {rank}: use_dynamic_bsz=False, micro_batch_size={micro_batch_size}")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[DEBUG] Rank {rank}: use_dynamic_bsz=False, micro_batch_size={micro_batch_size}")
             micro_batches = data.split(micro_batch_size)
 
         num_micro_batches = len(micro_batches)
-        print(f"[DEBUG] Rank {rank}: Number of micro_batches: {num_micro_batches}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"[DEBUG] Rank {rank}: Number of micro_batches: {num_micro_batches}")
 
         # === ALIGN MICRO-BATCH COUNT ACROSS ALL WORKERS ===
         # Gather micro-batch counts from all workers and find the maximum
@@ -544,7 +557,8 @@ class DataParallelPPOActor(BasePPOActor):
             dist.all_gather(gathered_counts, count_tensor)
             # Find maximum count
             max_micro_batches = max([cnt.item() for cnt in gathered_counts])
-            print(f"[DEBUG] Rank {rank}: local={num_micro_batches}, max={max_micro_batches} micro-batches across {world_size} workers")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[DEBUG] Rank {rank}: local={num_micro_batches}, max={max_micro_batches} micro-batches across {world_size} workers")
 
         log_probs_lst = []
         entropy_lst = []
@@ -555,7 +569,8 @@ class DataParallelPPOActor(BasePPOActor):
             if is_dummy:
                 # === DUMMY MICRO-BATCH: ONLY FOR SYNCHRONIZATION ===
                 # Run full forward pass with dummy data to keep FSDP in sync
-                print(f"[DEBUG] Rank {rank}: Processing micro_batch {i}/{max_micro_batches} (dummy) at {time.time()}")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[DEBUG] Rank {rank}: Processing micro_batch {i}/{max_micro_batches} (dummy) at {time.time()}")
                 # Use first batch as dummy data if available
                 if num_micro_batches > 0:
                     dummy_batch = micro_batches[0]
@@ -570,20 +585,24 @@ class DataParallelPPOActor(BasePPOActor):
 
             # === REAL MICRO-BATCH ===
             micro_batch = micro_batches[i]
-            print(f"[DEBUG] Rank {rank}: Processing micro_batch {i}/{max_micro_batches} at {time.time()}")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[DEBUG] Rank {rank}: Processing micro_batch {i}/{max_micro_batches} at {time.time()}")
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
-            print(f"[DEBUG] Rank {rank}: micro_batch {i} moved to device, starting forward pass")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[DEBUG] Rank {rank}: micro_batch {i} moved to device, starting forward pass")
             with torch.no_grad():
                 entropy, log_probs = self._forward_micro_batch(
                     model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                 )
-            print(f"[DEBUG] Rank {rank}: micro_batch {i} forward pass done at {time.time()}")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[DEBUG] Rank {rank}: micro_batch {i} forward pass done at {time.time()}")
             log_probs_lst.append(log_probs)
             if calculate_entropy:
                 entropy_lst.append(entropy)
 
-        print(f"[DEBUG] Rank {rank}: All micro_batches done, starting concat at {time.time()}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"[DEBUG] Rank {rank}: All micro_batches done, starting concat at {time.time()}")
 
         log_probs = torch.concat(log_probs_lst, dim=0)
         entropys = None
@@ -595,7 +614,8 @@ class DataParallelPPOActor(BasePPOActor):
             if calculate_entropy:
                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
 
-        print(f"[DEBUG] Rank {rank}/{world_size}: compute_log_prob finished at {time.time()}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"[DEBUG] Rank {rank}/{world_size}: compute_log_prob finished at {time.time()}")
 
         return log_probs, entropys
 
@@ -685,11 +705,14 @@ class DataParallelPPOActor(BasePPOActor):
             world_size = dist.get_world_size() if dist.is_initialized() else 1
 
             if worker_segments_offsets is not None:
-                print(f"[DEBUG] [tree_segment] Worker {rank}: found worker_segments_offsets={worker_segments_offsets}")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[DEBUG] [tree_segment] Worker {rank}: found worker_segments_offsets={worker_segments_offsets}")
 
             if global_unique_segments is not None and global_leaf_segment_indices is not None:
-                print(f"[DEBUG] [tree_segment] Worker {rank}: start building local segments")
-                print(f"[DEBUG] [tree_segment] Worker {rank}: global_unique_segments={len(global_unique_segments)}, local_leaves={len(global_leaf_segment_indices)}")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[DEBUG] [tree_segment] Worker {rank}: start building local segments")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[DEBUG] [tree_segment] Worker {rank}: global_unique_segments={len(global_unique_segments)}, local_leaves={len(global_leaf_segment_indices)}")
 
                 # ==== REBUILD LOCAL SEGMENTS FROM GLOBAL ====
                 # Collect all segment indices referenced by this worker's leaves
@@ -698,7 +721,8 @@ class DataParallelPPOActor(BasePPOActor):
                     for seg_idx in path:
                         used_global_seg_indices.add(seg_idx)
                 used_global_seg_indices = sorted(used_global_seg_indices)
-                print(f"[DEBUG] [tree_segment] Worker {rank}: uses {len(used_global_seg_indices)} segments: {used_global_seg_indices[:10]}{'...' if len(used_global_seg_indices) > 10 else ''}")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[DEBUG] [tree_segment] Worker {rank}: uses {len(used_global_seg_indices)} segments: {used_global_seg_indices[:10]}{'...' if len(used_global_seg_indices) > 10 else ''}")
 
                 # Build mapping from global seg idx to local seg idx (and reverse)
                 global_to_local_seg_idx_map = {
@@ -721,13 +745,18 @@ class DataParallelPPOActor(BasePPOActor):
                 for path in global_leaf_segment_indices:
                     adjusted_path = [global_to_local_seg_idx_map[seg_idx] for seg_idx in path]
                     local_leaf_segment_indices.append(adjusted_path)
-                print(f"[DEBUG] [tree_segment] Worker {rank}: leaf_segment_indices adjusted to local")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[DEBUG] [tree_segment] Worker {rank}: leaf_segment_indices adjusted to local")
 
                 # Print detailed info on each rank (not just rank 0)
-                print(f"[DEBUG] [tree_segment] Worker {rank}: Building segment tensors:")
-                print(f"[DEBUG] [tree_segment] Worker {rank}: - Batch size (leaves): {len(data)}")
-                print(f"[DEBUG] [tree_segment] Worker {rank}: - Global unique segments: {len(global_unique_segments)}")
-                print(f"[DEBUG] [tree_segment] Worker {rank}: - Local unique segments: {len(local_unique_segments)}")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[DEBUG] [tree_segment] Worker {rank}: Building segment tensors:")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[DEBUG] [tree_segment] Worker {rank}: - Batch size (leaves): {len(data)}")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[DEBUG] [tree_segment] Worker {rank}: - Global unique segments: {len(global_unique_segments)}")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[DEBUG] [tree_segment] Worker {rank}: - Local unique segments: {len(local_unique_segments)}")
 
                 # Unpack TensorDict to plain dict so .get() works safely
                 data_inputs = {**data.batch, **data.non_tensor_batch}
@@ -751,8 +780,10 @@ class DataParallelPPOActor(BasePPOActor):
                     "local_to_global_seg_idx_map": local_to_global_seg_idx_map,
                 }
 
-                print(f"[DEBUG] [tree_segment] Worker {rank}: Local segment tensors built: seg_old_log_prob.shape={seg_old_log_prob.shape}")
-                print(f"[DEBUG] [tree_segment] Worker {rank}: seg_advantages.shape={seg_advantages.shape}, seg_response_mask.shape={seg_response_mask.shape}")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[DEBUG] [tree_segment] Worker {rank}: Local segment tensors built: seg_old_log_prob.shape={seg_old_log_prob.shape}")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[DEBUG] [tree_segment] Worker {rank}: seg_advantages.shape={seg_advantages.shape}, seg_response_mask.shape={seg_response_mask.shape}")
 
         # === New code: Check batch strategy for tree_segment loss ===
         tree_segment_batch_strategy = getattr(self.config, "tree_segment_batch_strategy", "leaf")
@@ -773,15 +804,18 @@ class DataParallelPPOActor(BasePPOActor):
             ppo_micro_batch_segments = getattr(self.config, "ppo_micro_batch_segments", None)
             total_segments = len(local_tree_seg_targets["seg_lens"])
 
-            print(f"[DEBUG] [tree_segment] Worker {rank}/{world_size}: start update_policy with segment batching")
-            print(f"[DEBUG] [tree_segment] Worker {rank}: local_batch_size={local_batch_size} leaves, total_segments={total_segments} segments")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[DEBUG] [tree_segment] Worker {rank}/{world_size}: start update_policy with segment batching")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[DEBUG] [tree_segment] Worker {rank}: local_batch_size={local_batch_size} leaves, total_segments={total_segments} segments")
 
             # === NO FILTER: PROCESS ALL LOCAL SEGMENTS ON THIS WORKER ===
             # Each worker processes ALL segments from its own rollout
             assigned_local_seg_indices = list(range(total_segments))
             num_assigned_segments = len(assigned_local_seg_indices)
 
-            print(f"[DEBUG] [tree_segment] Worker {rank}: processing ALL {num_assigned_segments} local segments (no global reallocation)")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[DEBUG] [tree_segment] Worker {rank}: processing ALL {num_assigned_segments} local segments (no global reallocation)")
 
             if ppo_micro_batch_segments is None:
                 # Default estimation: use similar ratio as leaf-based batching
@@ -818,12 +852,11 @@ class DataParallelPPOActor(BasePPOActor):
             expected_optimizer_step_count = target_optimizer_steps * self.config.ppo_epochs
 
             est_micro_batches = max(1, math.ceil(num_assigned_segments / ppo_micro_batch_segments))
-            print(
-                f"[DEBUG] [tree_segment] Worker {rank}: "
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[DEBUG] [tree_segment] Worker {rank}: "
                 f"ppo_micro_batch_segments={ppo_micro_batch_segments}, "
                 f"target_optimizer_steps={target_optimizer_steps}, "
-                f"est_micro_batches={est_micro_batches}"
-            )
+                f"est_micro_batches={est_micro_batches}")
 
             on_policy = (
                 target_optimizer_steps == 1
@@ -832,11 +865,13 @@ class DataParallelPPOActor(BasePPOActor):
             )
 
             for epoch in range(self.config.ppo_epochs):
-                print(f"[DEBUG] [tree_segment] Worker {rank}: epoch {epoch+1}/{self.config.ppo_epochs}")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[DEBUG] [tree_segment] Worker {rank}: epoch {epoch+1}/{self.config.ppo_epochs}")
                 # Shuffle all local segments
                 segment_indices = assigned_local_seg_indices.copy()
                 random.shuffle(segment_indices)
-                print(f"[DEBUG] [tree_segment] Worker {rank}: shuffled {len(segment_indices)} segments")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[DEBUG] [tree_segment] Worker {rank}: shuffled {len(segment_indices)} segments")
 
                 # First form the same number of optimizer groups as base GRPO,
                 # then split every group into segment micro-batches. Counts are
@@ -870,12 +905,11 @@ class DataParallelPPOActor(BasePPOActor):
                 num_micro_batches = sum(local_micro_counts)
                 max_micro_batches = len(segment_micro_batches)
                 fallback_seg_indices = local_optimizer_micro_batches[0][0]
-                print(
-                    f"[DEBUG] [tree_segment] Worker {rank}: "
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[DEBUG] [tree_segment] Worker {rank}: "
                     f"local_micro_counts={local_micro_counts}, "
                     f"max_micro_counts={max_micro_counts}, "
-                    f"scheduled_micro_batches={max_micro_batches}"
-                )
+                    f"scheduled_micro_batches={max_micro_batches}")
 
                 optimizer_group_idx = 0
                 optimizer_step_starts = [0, *optimizer_step_ends[:-1]]
@@ -886,11 +920,10 @@ class DataParallelPPOActor(BasePPOActor):
                         return
                     grad_norm = self._optimizer_step()
                     optimizer_step_count += 1
-                    print(
-                        f"[DEBUG] [tree_segment] Worker {rank}: optimizer step "
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"[DEBUG] [tree_segment] Worker {rank}: optimizer step "
                         f"{optimizer_group_idx + 1}/{target_optimizer_steps} done, "
-                        f"grad_norm={grad_norm.detach().item():.6f}"
-                    )
+                        f"grad_norm={grad_norm.detach().item():.6f}")
                     append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
                     optimizer_group_idx += 1
 
@@ -909,7 +942,8 @@ class DataParallelPPOActor(BasePPOActor):
                         # === DUMMY MICRO-BATCH: NO GRADIENT UPDATE ===
                         # Run full forward/backward with dummy data and 0 loss scale
                         # This ensures FSDP communication patterns match across all workers
-                        print(f"[DEBUG] [tree_segment] Worker {rank}: micro-batch {m} (dummy, no gradient update)")
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"[DEBUG] [tree_segment] Worker {rank}: micro-batch {m} (dummy, no gradient update)")
                         if num_micro_batches > 0 and local_batch_size > 0:
                             # Reuse the first batch's data for dummy computation
                             first_seg_indices = fallback_seg_indices
@@ -1014,9 +1048,12 @@ class DataParallelPPOActor(BasePPOActor):
                     seg_canonical = local_tree_seg_targets["seg_canonical"]
                     required_leaves = list({seg_canonical[i][0] for i in seg_indices})
                     if m == 0:
-                        print(f"[DEBUG] [tree_segment] Worker {rank}: micro-batch {m} has {len(seg_indices)} segments, requires {len(required_leaves)} leaves")
-                        print(f"[DEBUG] [tree_segment] Worker {rank}: seg_indices={seg_indices[:5]}{'...' if len(seg_indices) > 5 else ''}")
-                        print(f"[DEBUG] [tree_segment] Worker {rank}: required_leaves={required_leaves[:5]}{'...' if len(required_leaves) > 5 else ''}")
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"[DEBUG] [tree_segment] Worker {rank}: micro-batch {m} has {len(seg_indices)} segments, requires {len(required_leaves)} leaves")
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"[DEBUG] [tree_segment] Worker {rank}: seg_indices={seg_indices[:5]}{'...' if len(seg_indices) > 5 else ''}")
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"[DEBUG] [tree_segment] Worker {rank}: required_leaves={required_leaves[:5]}{'...' if len(required_leaves) > 5 else ''}")
 
                     # Get the data for required leaves only
                     # Note: seg_canonical uses LOCAL leaf indices within this worker's data
@@ -1029,7 +1066,8 @@ class DataParallelPPOActor(BasePPOActor):
                     loss_agg_mode = self.config.loss_agg_mode
                     loss_scale_factor = 1 / self.gradient_accumulation
                     if m == 0:
-                        print(f"[DEBUG] [tree_segment] Worker {rank}: micro-batch {m}, loss_scale_factor={loss_scale_factor:.6f} "
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"[DEBUG] [tree_segment] Worker {rank}: micro-batch {m}, loss_scale_factor={loss_scale_factor:.6f} "
                               f"(gradient_accumulation={self.gradient_accumulation})")
 
                     calculate_entropy = entropy_coeff != 0
@@ -1037,7 +1075,8 @@ class DataParallelPPOActor(BasePPOActor):
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
                     if m == 0:
-                        print(f"[DEBUG] [tree_segment] Worker {rank}: forward done, log_prob.shape={log_prob.shape}")
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"[DEBUG] [tree_segment] Worker {rank}: forward done, log_prob.shape={log_prob.shape}")
 
                     # Build leaf inverse map: from original local leaf index to local index in mini_batch
                     leaf_inverse_map = {global_idx: local_idx for local_idx, global_idx in enumerate(required_leaves)}
@@ -1074,8 +1113,10 @@ class DataParallelPPOActor(BasePPOActor):
                         seg_rollout_is_weights_local = seg_rollout_is_weights_local[seg_indices].to(log_prob.device)
 
                     if m == 0:
-                        print(f"[DEBUG] [tree_segment] Worker {rank}: seg_advantages.shape={seg_advantages_local.shape}")
-                        print(f"[DEBUG] [tree_segment] Worker {rank}: seg_advantages range: [{seg_advantages_local.min():.4f}, {seg_advantages_local.max():.4f}]")
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"[DEBUG] [tree_segment] Worker {rank}: seg_advantages.shape={seg_advantages_local.shape}")
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"[DEBUG] [tree_segment] Worker {rank}: seg_advantages range: [{seg_advantages_local.min():.4f}, {seg_advantages_local.max():.4f}]")
 
                     # Compute loss
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
@@ -1135,7 +1176,8 @@ class DataParallelPPOActor(BasePPOActor):
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
                     if m == 0:
-                        print(f"[DEBUG] [tree_segment] Worker {rank}: pg_loss={pg_loss.detach().item():.6f}, policy_loss={policy_loss.detach().item():.6f}")
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"[DEBUG] [tree_segment] Worker {rank}: pg_loss={pg_loss.detach().item():.6f}, policy_loss={policy_loss.detach().item():.6f}")
 
                     # Backward pass with gradient accumulation
                     loss = policy_loss * loss_scale_factor
@@ -1190,7 +1232,8 @@ class DataParallelPPOActor(BasePPOActor):
                         )
                         micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
                         batch_idx_list = None
-                        print(f"[DEBUG] [leaf] Worker {rank}: mini_batch_size={self.config.ppo_mini_batch_size}, "
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"[DEBUG] [leaf] Worker {rank}: mini_batch_size={self.config.ppo_mini_batch_size}, "
                               f"micro_batch_size_per_gpu={self.config.ppo_micro_batch_size_per_gpu}, "
                               f"gradient_accumulation={self.gradient_accumulation}, "
                               f"actual_micro_batches={len(micro_batches)}, "
@@ -1209,7 +1252,8 @@ class DataParallelPPOActor(BasePPOActor):
                         dist.all_gather(gathered_counts, count_tensor)
                         max_micro_batches = max([cnt.item() for cnt in gathered_counts])
                         if rank == 0:
-                            print(f"[DEBUG] [leaf] Worker {rank}: local={local_num_micro_batches}, max={max_micro_batches} micro-batches across {world_size} workers")
+                            if logger.isEnabledFor(logging.DEBUG):
+                                logger.debug(f"[DEBUG] [leaf] Worker {rank}: local={local_num_micro_batches}, max={max_micro_batches} micro-batches across {world_size} workers")
 
                     # Adjust gradient_accumulation to match actual max micro-batch count
                     self.gradient_accumulation = max_micro_batches
@@ -1227,7 +1271,8 @@ class DataParallelPPOActor(BasePPOActor):
                             # === DUMMY MICRO-BATCH: NO GRADIENT UPDATE ===
                             # This ensures FSDP communication patterns match across all workers
                             if rank == 0:
-                                print(f"[DEBUG] [leaf] Worker {rank}: micro-batch {m} (dummy, no gradient update)")
+                                if logger.isEnabledFor(logging.DEBUG):
+                                    logger.debug(f"[DEBUG] [leaf] Worker {rank}: micro-batch {m} (dummy, no gradient update)")
                             if local_num_micro_batches > 0:
                                 # Reuse the first micro-batch's data for dummy computation
                                 dummy_micro_batch = micro_batches[0]
@@ -1316,7 +1361,8 @@ class DataParallelPPOActor(BasePPOActor):
                             loss_scale_factor = 1 / self.gradient_accumulation
 
                         if m == 0:
-                            print(f"[DEBUG] [leaf] Worker {rank}: micro-batch {m}, loss_scale_factor={loss_scale_factor:.6f} "
+                            if logger.isEnabledFor(logging.DEBUG):
+                                logger.debug(f"[DEBUG] [leaf] Worker {rank}: micro-batch {m}, loss_scale_factor={loss_scale_factor:.6f} "
                                   f"(dynamic_bsz={self.config.use_dynamic_bsz})")
 
                         # all return: (bsz, response_length)
