@@ -19,7 +19,7 @@ verl_dir=/inspire/hdd/global_user/weilongxuan-253108120168/verl_data
 MODEL_PATH="${MODEL_PATH:-/inspire/hdd/global_public/public_models/Qwen/Qwen2.5-7B}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-$TASK_ROOT/verl_data}"
 PROJECT_NAME="${PROJECT_NAME:-verl_multiroot_qwen7b}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-math_${MODE}}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-math_${MODE}_new}"
 RUN_DIR="$OUTPUT_ROOT/$PROJECT_NAME/$EXPERIMENT_NAME"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 

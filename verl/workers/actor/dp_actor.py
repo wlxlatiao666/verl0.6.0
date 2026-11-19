@@ -178,19 +178,16 @@ class DataParallelPPOActor(BasePPOActor):
         old_log_prob: torch.Tensor,
         log_prob: torch.Tensor,
         process_advantages: torch.Tensor,
-        effective_advantages: torch.Tensor,
         response_mask: torch.Tensor,
         rollout_is_weights: torch.Tensor | None,
         update_index: int,
         unit: str,
         identifiers: list[str],
-        token_share_weights: torch.Tensor | None = None,
     ) -> None:
         """Print one informative tree-process PG-loss diagnostic on rank 0.
 
-        A sequence carrying shared-prefix weights is preferred for TreePR.  For
-        TreeSR, the segment with the largest mean absolute process advantage is
-        selected.  The printed loss is a standalone token-mean diagnostic.
+        Select the sequence or segment with the largest mean absolute
+        advantage. The printed loss is a standalone token-mean diagnostic.
         """
         with torch.no_grad():
             valid = response_mask > 0
@@ -204,21 +201,9 @@ class DataParallelPPOActor(BasePPOActor):
                 )
                 return
 
-            if token_share_weights is not None:
-                weights = token_share_weights.to(
-                    device=process_advantages.device,
-                    dtype=process_advantages.dtype,
-                )
-                shared = valid & (weights > 0) & (weights < 1 - 1e-6)
-                scores = shared.sum(dim=-1).to(torch.float32)
-                if not bool((scores > 0).any().item()):
-                    scores = (
-                        process_advantages.detach().abs() * valid.to(process_advantages.dtype)
-                    ).sum(dim=-1) / valid_counts.clamp_min(1)
-            else:
-                scores = (
-                    process_advantages.detach().abs() * valid.to(process_advantages.dtype)
-                ).sum(dim=-1) / valid_counts.clamp_min(1)
+            scores = (
+                process_advantages.detach().abs() * valid.to(process_advantages.dtype)
+            ).sum(dim=-1) / valid_counts.clamp_min(1)
 
             scores = scores.masked_fill(~eligible, float("-inf"))
             sample_idx = int(scores.argmax().item())
@@ -235,25 +220,11 @@ class DataParallelPPOActor(BasePPOActor):
                 self.config,
                 sample_is_weights,
             )
-            effective_pg_loss = process_pg_loss
-            if token_share_weights is not None:
-                effective_pg_loss = self._sample_pg_loss(
-                    policy_loss_fn,
-                    old_log_prob[sample_slice],
-                    log_prob[sample_slice],
-                    effective_advantages[sample_slice],
-                    response_mask[sample_slice],
-                    self.config,
-                    sample_is_weights,
-                )
-
             advantage_runs = self._format_advantage_runs(
                 process_advantages[sample_idx], response_mask[sample_idx]
             )
             identifier = identifiers[sample_idx] if sample_idx < len(identifiers) else f"item={sample_idx}"
             loss_fields = f"process_pg_loss={process_pg_loss:.8f}"
-            if token_share_weights is not None:
-                loss_fields += f" effective_pg_loss={effective_pg_loss:.8f}"
             print(
                 f"[TREE_PROCESS_LOSS] update={update_index} unit={unit} {identifier} "
                 f"{loss_fields} advantage_runs={advantage_runs}",
@@ -628,7 +599,7 @@ class DataParallelPPOActor(BasePPOActor):
 
         rank = dist.get_rank() if dist.is_initialized() else 0
         world_size = dist.get_world_size() if dist.is_initialized() else 1
-        has_tree_process_data = "token_share_weights" in data.batch.keys()
+        has_tree_process_data = "tree_leaf_weights" in data.batch.keys() or "leaf_segment_indices" in data.non_tensor_batch
         if has_tree_process_data:
             self._tree_process_update_count += 1
         tree_process_log_interval_value = self.config.get("tree_process_loss_log_interval", 10)
@@ -661,10 +632,6 @@ class DataParallelPPOActor(BasePPOActor):
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
             select_keys.append("rollout_is_weights")
-
-        # Include tree-process-reward inverse-sharing weights if present.
-        if "token_share_weights" in data.batch.keys():
-            select_keys.append("token_share_weights")
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = []
@@ -1146,7 +1113,6 @@ class DataParallelPPOActor(BasePPOActor):
                             old_log_prob=seg_old_log_prob_local,
                             log_prob=seg_log_prob_local,
                             process_advantages=seg_advantages_local,
-                            effective_advantages=seg_advantages_local,
                             response_mask=seg_response_mask_local,
                             rollout_is_weights=seg_rollout_is_weights_local,
                             update_index=self._tree_process_update_count,
@@ -1339,21 +1305,11 @@ class DataParallelPPOActor(BasePPOActor):
                         response_mask = model_inputs["response_mask"]
                         old_log_prob = model_inputs["old_log_probs"]
                         advantages = model_inputs["advantages"]
+                        # The trainer already applied TreePR leaf probability weights.
                         process_advantages = advantages
 
                         entropy_coeff = self.config.entropy_coeff
                         loss_agg_mode = self.config.loss_agg_mode
-
-                        # ------------------------------
-                        # Apply token-level inverse-sharing weight (tree process reward only).
-                        # token_share_weights[t] = 1 / descendant_count(node_that_owns_token_t).
-                        # Multiplying into advantages is mathematically equivalent to multiplying
-                        # the final per-token pg_loss by the same weight; we do it here so we don't
-                        # need to touch every policy_loss_fn signature.
-                        # ------------------------------
-                        token_share_weights = model_inputs.get("token_share_weights", None)
-                        if token_share_weights is not None:
-                            advantages = advantages * token_share_weights.to(advantages.device, dtype=advantages.dtype)
 
                         if self.config.use_dynamic_bsz:
                             loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
@@ -1505,7 +1461,6 @@ class DataParallelPPOActor(BasePPOActor):
                                             old_log_prob=seg_old_log_prob_local,
                                             log_prob=seg_log_prob_local,
                                             process_advantages=seg_advantages_local,
-                                            effective_advantages=seg_advantages_local,
                                             response_mask=seg_response_mask_local,
                                             rollout_is_weights=seg_rollout_is_weights_local,
                                             update_index=self._tree_process_update_count,
@@ -1544,13 +1499,11 @@ class DataParallelPPOActor(BasePPOActor):
                                     old_log_prob=old_log_prob,
                                     log_prob=log_prob,
                                     process_advantages=process_advantages,
-                                    effective_advantages=advantages,
                                     response_mask=response_mask,
                                     rollout_is_weights=rollout_is_weights,
                                     update_index=self._tree_process_update_count,
                                     unit="sequence",
                                     identifiers=sequence_identifiers,
-                                    token_share_weights=token_share_weights,
                                 )
                                 tree_process_loss_logged = True
 

@@ -47,7 +47,7 @@ for process in [False,True]:
     out=obj.generate_sequences(data)
     assert len(out.batch['responses'])==128
     assert np.bincount(out.non_tensor_batch['tree_prompt_indices']).tolist()==[64,64]
-    assert ('token_share_weights' in out.batch)==process
+    assert 'token_share_weights' not in out.batch
     if process:
         from verl.trainer.ppo.ray_trainer import compute_tree_process_advantage
         out.batch['response_mask']=(out.batch['responses']!=pad).long()

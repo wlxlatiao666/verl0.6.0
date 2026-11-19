@@ -74,3 +74,15 @@ def test_missing_or_invalid_probability_metadata_fails():
     data = batch([float('nan')] * 6)
     with pytest.raises(ValueError, match='finite'):
         compute(data)
+
+
+def test_shared_prefix_uses_leaf_probability_without_descendant_division():
+    data = compute(batch())
+    # Tree A root score is mean(mean(1, 0), 1) = .75.
+    # Its three leaf copies retain the same node advantage times each leaf's
+    # probability; no additional division by the three descendants is allowed.
+    rewards = torch.tensor([1., 0., 1., 0., 1., 0.])
+    root_advantage = (.75 - rewards.mean()) / (rewards.std() + 1e-6)
+    weights = torch.tensor([5/12, 1/6, 5/12])
+    torch.testing.assert_close(data.batch['advantages'][:3, 0], root_advantage * weights)
+    torch.testing.assert_close(data.batch['advantages'][:3, 0].sum(), root_advantage)

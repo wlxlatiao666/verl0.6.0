@@ -536,11 +536,6 @@ def compute_tree_process_advantage(data: DataProto, proc_agg_mode: str = "raw", 
     # Each leaf's response is the concatenation of its path segments in order.
     # We fill token positions with the advantage of the segment they belong to.
     # Segments shared across leaves use the same pre-computed advantage (no duplication).
-    seg_leaf_count = np.zeros(n_unique, dtype=np.int64)
-    for path in leaf_segment_indices:
-        for seg_idx in path:
-            seg_leaf_count[seg_idx] += 1
-
     total_response_tokens = int(response_mask.sum().item())
     mean_seg_len = total_response_tokens / max(n_unique, 1)
     if logger.isEnabledFor(logging.DEBUG):
@@ -1595,11 +1590,11 @@ class RayPPOTrainer:
                         "worker_segments_offsets",
                         "worker_leaves_offsets",
                     )
+                    gen_batch_output.batch.pop("token_share_weights", None)
                     if _tree_process_reward_enabled:
                         missing_process_fields = []
-                        if "token_share_weights" not in gen_batch_output.batch.keys():
-                            missing_process_fields.append("token_share_weights")
-                        for key in ("unique_segments", "leaf_segment_indices"):
+                        for key in ("unique_segments", "leaf_segment_indices",
+                                    "tree_leaf_logprobs", "tree_root_ids"):
                             if key not in gen_batch_output.non_tensor_batch:
                                 missing_process_fields.append(key)
                         if missing_process_fields:
@@ -1609,8 +1604,6 @@ class RayPPOTrainer:
                                 "an incompatible skip_rollout cache."
                             )
                     else:
-                        if "token_share_weights" in gen_batch_output.batch.keys():
-                            gen_batch_output.batch.pop("token_share_weights")
                         for key in _process_non_tensor_keys:
                             gen_batch_output.non_tensor_batch.pop(key, None)
                         rollout_metrics = gen_batch_output.meta_info.get("metrics", {})

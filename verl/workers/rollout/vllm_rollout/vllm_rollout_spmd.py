@@ -306,6 +306,8 @@ class vLLMRollout(BaseRollout):
         stats_params = SamplingParams(
             n=stats_n,
             temperature=float(self.sampling_params.temperature),
+            top_p=float(self.sampling_params.top_p),
+            top_k=int(self.sampling_params.top_k),
             max_tokens=_max_tokens,
             collect_threshold_stats=True,
         )
@@ -502,12 +504,9 @@ class vLLMRollout(BaseRollout):
             # Per-prompt leaf counts (tree leaves now; top-ups added later at line ~690).
             # Indexed by prompt position within `outputs`.
             _leaves_per_prompt = [0] * len(outputs)
-            # ----- Inverse-sharing weight support -----
-            # Intermediate storage for leaf records (collected in the first pass so we can
-            # compute node_descendant_count before producing per-token weights).
+            # Collect leaf paths before emitting responses and probability metadata.
             _leaf_records: list[tuple[list[tuple[int, list[int]]], list[int], int]] = []
             _global_seq_map: dict[int, object] = {}
-            token_share_weights: list[list[float]] = []
             _has_tree_by_prompt: list[bool] = []
             tree_leaf_logprobs: list[float] = []
             tree_root_ids: list[str] = []
@@ -580,19 +579,8 @@ class vLLMRollout(BaseRollout):
                         f"non-tree prompt indices={missing_tree_prompts[:8]}."
                     )
 
-            # ----- Second pass: process tree leaves (count descendants + emit records) -----
+            # Emit tree leaves; probability weights are applied by the trainer.
             if _leaf_records:
-                _node_descendant_count: dict[int, int] = {}
-                # Inverse-sharing weights are part of tree process reward, not
-                # plain tree rollout. Avoid changing the treerollout baseline's
-                # loss merely because its responses came from a tree.
-                if _tree_process_reward:
-                    for path_nodes, _, _ in _leaf_records:
-                        for seq_id, _ in path_nodes:
-                            _node_descendant_count[seq_id] = _node_descendant_count.get(seq_id, 0) + 1
-
-                # Emit each leaf's response / prompt index / rollout_log_probs.
-                # token_share_weights are emitted only for tree process reward.
                 for path_nodes, response_ids, out_idx in _leaf_records:
                     response.append(response_ids)
                     prompt_indices.append(out_idx)
@@ -622,32 +610,6 @@ class vLLMRollout(BaseRollout):
                             else:
                                 curr_log_prob.extend([0.0] * len(seg_tokens))
                         rollout_log_probs.append(curr_log_prob)
-
-                    if _tree_process_reward:
-                        # Token-level inverse-sharing weight:
-                        # 1 / descendant_count for each node's tokens.
-                        leaf_weights: list[float] = []
-                        for seg_id, seg_tokens in path_nodes:
-                            cnt = float(_node_descendant_count.get(seg_id, 1))
-                            leaf_weights.extend([1.0 / cnt] * len(seg_tokens))
-                        if len(leaf_weights) != len(response_ids):
-                            raise RuntimeError(
-                                "[token_share_weights] length mismatch: "
-                                f"leaf_weights={len(leaf_weights)} response_ids={len(response_ids)}"
-                            )
-                        token_share_weights.append(leaf_weights)
-
-                # Optional debug stats (print first 3 leaves)
-                if _tree_process_reward:
-                    for _i, (_p, r, _o) in enumerate(_leaf_records[:3]):
-                        w = token_share_weights[_i]
-                        counts = [_node_descendant_count.get(s, 0) for s, _ in _p]
-                        segs = [(s, len(t), c) for (s, t), c in zip(_p, counts)]
-                        if logger.isEnabledFor(logging.DEBUG):
-                            logger.debug(f"[DEBUG][token_share_weights] leaf {_i}: "
-                            f"resp_len={len(r)} n_segments={len(_p)} "
-                            f"segments(seg_id, seg_len, desc_count)={segs} "
-                            f"w_min={min(w):.4f} w_max={max(w):.4f} w_sum={sum(w):.4f}")
 
             # ── Step 2 (NEW): TOP-UP leaves with conventional sampling ──────
             # Target = bf ** max_depth. For every prompt whose tree produced
@@ -748,10 +710,8 @@ class vLLMRollout(BaseRollout):
                                         curr_lp.extend([0.0] * pad_n)
                                     rollout_log_probs.append(curr_lp)
 
-                                # 3) A conventional top-up has no shared
-                                # ancestors, so its process-reward weight is 1.
+                                # 3) A conventional top-up has leaf probability weight 1.
                                 if _tree_process_reward:
-                                    token_share_weights.append([1.0] * len(resp_ids))
                                     # Each conventional top-up is a separate single-leaf tree.
                                     tree_leaf_logprobs.append(0.0)
                                     tree_root_ids.append(f"{tree_batch_id}:topup:{len(response)}")
@@ -947,22 +907,10 @@ class vLLMRollout(BaseRollout):
             })
 
             if _tree_process_reward:
-                if len(token_share_weights) != len(response):
-                    raise RuntimeError(
-                        "Tree process reward must emit exactly one token_share_weights row "
-                        f"per response, got weights={len(token_share_weights)} responses={len(response)}."
-                    )
                 if len(leaf_segment_indices) != len(response):
                     raise RuntimeError(
                         "Tree process reward must emit exactly one segment path per response, "
                         f"got paths={len(leaf_segment_indices)} responses={len(response)}."
-                    )
-                if not all(
-                    len(weights) == len(tokens)
-                    for weights, tokens in zip(token_share_weights, response)
-                ):
-                    raise RuntimeError(
-                        "Tree process reward token_share_weights must align with every unpadded response."
                     )
                 invalid_segment_paths = [
                     path_idx
@@ -983,23 +931,6 @@ class vLLMRollout(BaseRollout):
                     rollout_log_probs, -1, max_length=self.config.response_length
                 ).to(idx.device)
                 rollout_log_probs = rollout_log_probs.to(torch.float32)
-            # ----- token_share_weights (inverse-sharing) -----
-            if _tree_process_reward and token_share_weights:
-                # Pad with 0.0 so that padded positions contribute 0 in the loss weighting.
-                token_share_weights_t = pad_2d_list_to_length(
-                    token_share_weights, 0.0, max_length=self.config.response_length
-                ).to(idx.device)
-                token_share_weights_t = token_share_weights_t.to(torch.float32)
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(f"[DEBUG][token_share_weights] Emitted tensor: "
-                    f"shape={tuple(token_share_weights_t.shape)} "
-                    f"nonzero_rows={int((token_share_weights_t.sum(dim=-1) > 0).sum().item())} "
-                    f"w_sum_total={float(token_share_weights_t.sum().item()):.2f} "
-                    f"w_min={float(token_share_weights_t.min().item()):.4f} "
-                    f"w_max={float(token_share_weights_t.max().item()):.4f}")
-            else:
-                token_share_weights_t = None
-
             seq = torch.cat([idx, response], dim=-1)
 
         response_length = response.size(1)
@@ -1033,10 +964,6 @@ class vLLMRollout(BaseRollout):
         if self.config.calculate_log_probs:
             # we will recompute old log prob with actor
             batch["rollout_log_probs"] = rollout_log_probs
-
-        # Write inverse-sharing weights only for tree process reward training.
-        if 'token_share_weights_t' in locals() and token_share_weights_t is not None:
-            batch["token_share_weights"] = token_share_weights_t
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info={"metrics": _tree_metrics})
 

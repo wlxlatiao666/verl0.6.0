@@ -26,6 +26,8 @@ class FakeEngine:
                 # One actual binary split, plus top-ups to per-root budget.
                 seqs = [NS(seq_id=i*10, tree_ids=[10], token_ids=[10], is_leaf=False, parent_seq_id=None, tree_depth=0)]
                 seqs += [NS(seq_id=i*10+j, tree_ids=[20+j, 2], token_ids=[20+j, 2], is_leaf=True, parent_seq_id=i*10, tree_depth=1) for j in (1,2)]
+            for seq in seqs:
+                seq.branch_path_logprob = 0.0
             result.append(NS(outputs=seqs))
         return result
 
@@ -57,7 +59,7 @@ def test_multiroot_assembly(process,roots):
     assert np.unique(out.non_tensor_batch['uid'], return_counts=True)[1].tolist() == [roots*8]*2
     assert out.meta_info['metrics']['tree/avg_leaves_per_prompt'] == roots*8
     assert get_ppo_rollout_batch_multiplier(obj.config) == roots*8
-    assert ('token_share_weights' in out.batch) == process
+    assert 'token_share_weights' not in out.batch
     assert ('leaf_segment_indices' in out.non_tensor_batch) == process
     ps=obj.inference_engine.calls[0][1]
     if roots>1:
@@ -100,17 +102,27 @@ def test_treepr_roots_share_only_global_statistics():
         response_mask=torch.ones(4,2,dtype=torch.long),
         token_level_rewards=torch.tensor([[0.,0.],[0.,0.],[1.,0.],[1.,0.]])),batch_size=4),
         non_tensor_batch={'uid':np.array(['same']*4,dtype=object),
-          'unique_segments':segments,'leaf_segment_indices':paths})
+          'unique_segments':segments,'leaf_segment_indices':paths,
+          'tree_leaf_logprobs':np.zeros(4), 'tree_root_ids':np.array(['a','a','b','b'])})
     out=compute_tree_process_advantage(data)
-    expected=.25/(torch.tensor([0.,0.,1.,1.]).std()+1e-6)
+    expected=.125/(torch.tensor([0.,0.,1.,1.]).std()+1e-6)
     assert torch.allclose(out.batch['advantages'][:2], torch.full((2,2),-expected))
     assert torch.allclose(out.batch['advantages'][2:], torch.full((2,2),expected))
 
-def test_entropy_quantile_prepass():
+@pytest.mark.parametrize("top_p,top_k", [(0.8,20), (1.0,-1), (0.9,50)])
+def test_entropy_quantile_prepass(top_p,top_k):
     obj=make_rollout(False)
     obj.config.tree_search.threshold_stats_quantile=.9
-    obj.inference_engine=NS(generate=lambda **kw:[NS(outputs=[NS(
-        entropy_list=list(range(10)),importance_list=[])])])
+    obj.sampling_params.top_p=top_p
+    obj.sampling_params.top_k=top_k
+    def generate(**kw):
+        sp=kw['sampling_params']
+        assert sp.top_p == top_p
+        assert sp.top_k == top_k
+        assert sp.temperature == obj.sampling_params.temperature
+        assert sp.tree_search_params is None
+        return [NS(outputs=[NS(entropy_list=list(range(10)),importance_list=[])])]
+    obj.inference_engine=NS(generate=generate)
     stats=obj.collect_threshold_stats(prompts())
     assert stats.meta_info['entropy_threshold_stat']==pytest.approx(8.1)
     assert stats.meta_info['entropy_p80']==pytest.approx(7.2)
